@@ -1057,7 +1057,7 @@ void startBeaconing()
 }
 
 // Add this function to stop beaconing
-void stopBeaconing()
+void stopBeaconing() // Function to stop beaconing as a beacon
 {
   if (isBeaconing && pAdvertising != nullptr)
   {
