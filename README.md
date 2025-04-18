@@ -17,4 +17,4 @@ ESP32-based GPS LoRa transmitter for pet tracking.
 - LED status indication
 
 ## 📂 Project Structure
-
+├── src/ │ └── main.cpp ├── include/ │ └── (optional headers) ├── lib/ │ └── (custom libraries if needed) ├── platformio.ini └── README.md
