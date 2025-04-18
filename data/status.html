@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cat Tracker - Status</title>
+  <link href="/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      padding-top: 20px;
+      padding-bottom: 40px;
+    }
+    .header {
+      background-color: #6f42c1;
+      color: white;
+      padding: 20px 0;
+      border-radius: 5px;
+      margin-bottom: 20px;
+    }
+    .cat-icon {
+      font-size: 3rem;
+      margin-right: 10px;
+    }
+    .card {
+      margin-bottom: 20px;
+      border-radius: 10px;
+      box-shadow: 0 4px 6px rgba(0,0,0,.1);
+    }
+    .card-header {
+      background-color: #6f42c1;
+      color: white;
+      font-weight: bold;
+      border-radius: 10px 10px 0 0 !important;
+    }
+    .status-home {
+      background-color: #28a745;
+      color: white;
+      padding: 5px 10px;
+      border-radius: 20px;
+    }
+    .status-away {
+      background-color: #ffc107;
+      color: #212529;
+      padding: 5px 10px;
+      border-radius: 20px;
+    }
+    .status-unknown {
+      background-color: #6c757d;
+      color: white;
+      padding: 5px 10px;
+      border-radius: 20px;
+    }
+    .refresh-btn {
+      margin-right: 10px;
+    }
+    .signal-strength {
+      display: inline-block;
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      margin-right: 5px;
+    }
+    .signal-strong {
+      background-color: #28a745;
+    }
+    .signal-medium {
+      background-color: #ffc107;
+    }
+    .signal-weak {
+      background-color: #dc3545;
+    }
+    .gps-indicator {
+      display: inline-flex;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header text-center">
+      <h1><span class="cat-icon">🐱</span> Cat Tracker Status</h1>
+      <p>Real-time monitoring of your cat tracker</p>
+      <div>
+        <button id="refreshBtn" class="btn btn-light refresh-btn">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-clockwise" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+            <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+          </svg>
+          Refresh
+        </button>
+        <a href="/" class="btn btn-light">Back to Home</a>
+      </div>
+    </div>
+    
+    <div class="row">
+      <!-- Device Status -->
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">
+            📊 Device Status
+          </div>
+          <div class="card-body">
+            <div class="mb-3">
+              <strong>Cat Name:</strong> <span id="catName">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Status:</strong> 
+              <span id="catStatus" class="status-unknown">Unknown</span>
+            </div>
+            <div class="mb-3">
+              <strong>Uptime:</strong> <span id="uptime">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Last LoRa Transmission:</strong> <span id="lastLoraTx">Loading...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- GPS Status -->
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">
+            📍 GPS Status
+          </div>
+          <div class="card-body">
+            <div class="gps-indicator mb-3">
+              <div id="gpsSignal" class="signal-strength signal-weak"></div>
+              <strong>GPS Signal:</strong> <span id="gpsStatus">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Current Location:</strong> <span id="location">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Distance from Home:</strong> <span id="distance">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Direction:</strong> <span id="direction">Loading...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="row mt-3">
+      <!-- BLE Status -->
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">
+            📱 BLE Status
+          </div>
+          <div class="card-body">
+            <div class="mb-3">
+              <strong>BLE Mode:</strong> <span id="bleMode">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Home Beacon Name:</strong> <span id="homeBeaconName">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Last Beacon Detection:</strong> <span id="lastBeaconDetection">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>Beacon Seen Count:</strong> <span id="beaconSeenCount">Loading...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- System Info -->
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">
+            ⚙️ System Info
+          </div>
+          <div class="card-body">
+            <div class="mb-3">
+              <strong>ESP32 Chip ID:</strong> <span id="chipId">Loading...</span>
+            </div>
+            <div class="mb-3">
+              <strong>IP Address:</strong> <span id="ipAddress">192.168.4.1</span>
+            </div>
+            <div class="mb-3">
+              <strong>Firmware Version:</strong> <span id="firmwareVersion">1.0.0</span>
+            </div>
+            <div class="mb-3">
+              <strong>Free Heap:</strong> <span id="freeHeap">Loading...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <footer class="mt-4 text-center text-muted">
+      <p>&copy; 2025 Cat Tracker Project</p>
+    </footer>
+  </div>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      fetchStatus();
+      
+      // Set up refresh button
+      document.getElementById('refreshBtn').addEventListener('click', fetchStatus);
+      
+      // Auto refresh every 10 seconds
+      setInterval(fetchStatus, 10000);
+    });
+    
+    function fetchStatus() {
+      fetch('/api/status')
+        .then(response => response.json())
+        .then(data => updateStatusDisplay(data))
+        .catch(error => console.error('Error fetching status:', error));
+    }
+    
+    function updateStatusDisplay(data) {
+      // Device Status
+      document.getElementById('catName').textContent = data.id || 'Unknown';
+      
+      const catStatusEl = document.getElementById('catStatus');
+      catStatusEl.textContent = data.isHome ? 'HOME' : 'AWAY';
+      catStatusEl.className = data.isHome ? 'status-home' : 'status-away';
+      
+      document.getElementById('uptime').textContent = formatUptime(data.uptime);
+      document.getElementById('lastLoraTx').textContent = formatTime(data.lastSendTime);
+      
+      // GPS Status
+      const gpsSignalEl = document.getElementById('gpsSignal');
+      const gpsStatusEl = document.getElementById('gpsStatus');
+      
+      if (data.gpsValid) {
+        gpsStatusEl.textContent = `FIX OK (${data.satellites} satellites)`;
+        if (data.satellites > 6) {
+          gpsSignalEl.className = 'signal-strength signal-strong';
+        } else if (data.satellites > 3) {
+          gpsSignalEl.className = 'signal-strength signal-medium';
+        } else {
+          gpsSignalEl.className = 'signal-strength signal-weak';
+        }
+      } else {
+        gpsStatusEl.textContent = 'NO FIX';
+        gpsSignalEl.className = 'signal-strength signal-weak';
+      }
+      
+      document.getElementById('location').textContent = data.gpsValid ? 
+        `${data.lat}, ${data.lon}` : 'Unknown';
+      document.getElementById('distance').textContent = data.distance !== undefined ? 
+        `${data.distance}m` : 'Unknown';
+      document.getElementById('direction').textContent = data.direction || 'Unknown';
+      
+      // BLE Status
+      document.getElementById('bleMode').textContent = data.bleMode || 'Unknown';
+      document.getElementById('homeBeaconName').textContent = data.beaconName || 'Unknown';
+      document.getElementById('lastBeaconDetection').textContent = formatTime(data.lastBeaconDetection);
+      document.getElementById('beaconSeenCount').textContent = data.beaconSeenCount || '0';
+      
+      // System Info
+      document.getElementById('chipId').textContent = data.chipId || 'Unknown';
+      document.getElementById('freeHeap').textContent = data.freeHeap ? 
+        `${formatBytes(data.freeHeap)}` : 'Unknown';
+    }
+    
+    function formatUptime(seconds) {
+      if (!seconds) return 'Unknown';
+      
+      const days = Math.floor(seconds / 86400);
+      seconds %= 86400;
+      const hours = Math.floor(seconds / 3600);
+      seconds %= 3600;
+      const minutes = Math.floor(seconds / 60);
+      seconds %= 60;
+      
+      let result = '';
+      if (days > 0) result += `${days}d `;
+      result += `${hours}h ${minutes}m ${seconds}s`;
+      return result;
+    }
+    
+    function formatTime(timestamp) {
+      if (!timestamp) return 'Unknown';
+      
+      const seconds = Math.floor((Date.now() / 1000) - timestamp);
+      if (seconds < 60) return `${seconds} seconds ago`;
+      if (seconds < 3600) return `${Math.floor(seconds/60)} minutes ago`;
+      return `${Math.floor(seconds/3600)} hours ago`;
+    }
+    
+    function formatBytes(bytes) {
+      if (!bytes) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let i = 0;
+      while (bytes >= 1024 && i < units.length - 1) {
+        bytes /= 1024;
+        i++;
+      }
+      return `${bytes.toFixed(2)} ${units[i]}`;
+    }
+  </script>
+  
+  <script src="/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

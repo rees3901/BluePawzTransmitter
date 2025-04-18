@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cat Tracker - Configuration</title>
+  <link href="/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      padding-top: 20px;
+      padding-bottom: 40px;
+    }
+    .header {
+      background-color: #6f42c1;
+      color: white;
+      padding: 20px 0;
+      border-radius: 5px;
+      margin-bottom: 20px;
+    }
+    .cat-icon {
+      font-size: 3rem;
+      margin-right: 10px;
+    }
+    .card {
+      margin-bottom: 20px;
+      border-radius: 10px;
+      box-shadow: 0 4px 6px rgba(0,0,0,.1);
+    }
+    .card-header {
+      background-color: #6f42c1;
+      color: white;
+      font-weight: bold;
+      border-radius: 10px 10px 0 0 !important;
+    }
+    .btn-primary {
+      background-color: #6f42c1;
+      border-color: #6f42c1;
+    }
+    .btn-primary:hover {
+      background-color: #5a32a3;
+      border-color: #5a32a3;
+    }
+    #statusMessage {
+      display: none;
+      margin: 15px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header text-center">
+      <h1><span class="cat-icon">🐱</span> Cat Tracker Configuration</h1>
+      <p>Configure your cat tracker settings</p>
+      <a href="/" class="btn btn-light">Back to Home</a>
+    </div>
+    
+    <div class="alert alert-success" id="statusMessage" role="alert">
+      Settings saved successfully!
+    </div>
+    
+    <form id="configForm">
+      <div class="row">
+        <!-- Cat Identity -->
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-header">
+              🐾 Cat Identity
+            </div>
+            <div class="card-body">
+              <div class="mb-3">
+                <label for="senderId" class="form-label">Cat Name</label>
+                <input type="text" class="form-control" id="senderId" name="senderId" maxlength="15" required>
+                <div class="form-text">Name to identify your cat (max 15 characters)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Home Location -->
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-header">
+              🏠 Home Location
+            </div>
+            <div class="card-body">
+              <div class="mb-3">
+                <label for="homeLat" class="form-label">Home Latitude</label>
+                <input type="number" class="form-control" id="homeLat" name="homeLat" step="0.00000001" required>
+              </div>
+              <div class="mb-3">
+                <label for="homeLon" class="form-label">Home Longitude</label>
+                <input type="number" class="form-control" id="homeLon" name="homeLon" step="0.00000001" required>
+              </div>
+              <button type="button" id="getCurrentLocation" class="btn btn-secondary">Get Current Location</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <div class="row mt-3">
+        <!-- Timing Parameters -->
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-header">
+              ⏱️ Timing Parameters
+            </div>
+            <div class="card-body">
+              <div class="mb-3">
+                <label for="sendInterval" class="form-label">LoRa Send Interval (seconds)</label>
+                <input type="number" class="form-control" id="sendInterval" name="sendInterval" min="10" max="3600" required>
+                <div class="form-text">How often to send location data (10-3600 seconds)</div>
+              </div>
+              <div class="mb-3">
+                <label for="bleScanInterval" class="form-label">BLE Scan Interval (seconds)</label>
+                <input type="number" class="form-control" id="bleScanInterval" name="bleScanInterval" min="10" max="3600" required>
+                <div class="form-text">How often to scan for BLE devices (10-3600 seconds)</div>
+              </div>
+              <div class="mb-3">
+                <label for="beaconInterval" class="form-label">Beacon Interval (seconds)</label>
+                <input type="number" class="form-control" id="beaconInterval" name="beaconInterval" min="10" max="3600" required>
+                <div class="form-text">How often to advertise as a beacon (10-3600 seconds)</div>
+              </div>
+              <div class="mb-3">
+                <label for="beaconDuration" class="form-label">Beacon Duration (seconds)</label>
+                <input type="number" class="form-control" id="beaconDuration" name="beaconDuration" min="1" max="30" required>
+                <div class="form-text">How long to advertise as a beacon (1-30 seconds)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Home Detection -->
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-header">
+              🏠 Home Detection
+            </div>
+            <div class="card-body">
+              <div class="mb-3">
+                <label for="beaconName" class="form-label">Home Beacon Name</label>
+                <input type="text" class="form-control" id="beaconName" name="beaconName" maxlength="20" required>
+                <div class="form-text">Name of the home beacon to detect</div>
+              </div>
+              <div class="mb-3">
+                <label for="bleSeenThreshold" class="form-label">Home Seen Threshold</label>
+                <input type="number" class="form-control" id="bleSeenThreshold" name="bleSeenThreshold" min="1" max="10" required>
+                <div class="form-text">How many times beacon must be seen to be considered "home"</div>
+              </div>
+              <div class="mb-3">
+                <label for="bleMissedThreshold" class="form-label">Home Missed Threshold</label>
+                <input type="number" class="form-control" id="bleMissedThreshold" name="bleMissedThreshold" min="1" max="15" required>
+                <div class="form-text">How many times beacon must be missed to be considered "away"</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-4">
+        <button type="button" id="resetBtn" class="btn btn-warning me-md-2">Reset to Defaults</button>
+        <button type="submit" class="btn btn-primary">Save Configuration</button>
+      </div>
+    </form>
+    
+    <footer class="mt-4 text-center text-muted">
+      <p>&copy; 2025 Cat Tracker Project</p>
+    </footer>
+  </div>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      // Fetch current configuration
+      fetchConfig();
+
+      // Handle form submission
+      document.getElementById('configForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        saveConfig();
+      });
+
+      // Handle reset button
+      document.getElementById('resetBtn').addEventListener('click', function() {
+        if (confirm('Are you sure you want to reset all settings to default values?')) {
+          fetch('/api/reset', {
+            method: 'POST',
+          })
+          .then(response => response.json())
+          .then(data => {
+            if (data.success) {
+              showMessage('Settings reset to defaults successfully!', 'success');
+              fetchConfig();
+            } else {
+              showMessage('Failed to reset settings: ' + data.message, 'danger');
+            }
+          })
+          .catch(error => {
+            showMessage('Error: ' + error, 'danger');
+          });
+        }
+      });
+
+      // Handle get current location button
+      document.getElementById('getCurrentLocation').addEventListener('click', function() {
+        if (navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(function(position) {
+            document.getElementById('homeLat').value = position.coords.latitude;
+            document.getElementById('homeLon').value = position.coords.longitude;
+            showMessage('Current location set!', 'success');
+          }, function() {
+            showMessage('Unable to retrieve your location', 'danger');
+          });
+        } else {
+          showMessage('Geolocation is not supported by your browser', 'danger');
+        }
+      });
+    });
+
+    function fetchConfig() {
+      fetch('/api/config')
+        .then(response => response.json())
+        .then(data => {
+          // Populate form fields with current config
+          document.getElementById('senderId').value = data.senderId || '';
+          document.getElementById('homeLat').value = data.homeLat || '';
+          document.getElementById('homeLon').value = data.homeLon || '';
+          document.getElementById('sendInterval').value = data.sendInterval ? data.sendInterval / 1000 : '';
+          document.getElementById('bleScanInterval').value = data.bleScanInterval ? data.bleScanInterval / 1000 : '';
+          document.getElementById('beaconInterval').value = data.beaconInterval ? data.beaconInterval / 1000 : '';
+          document.getElementById('beaconDuration').value = data.beaconDuration || '';
+          document.getElementById('beaconName').value = data.beaconName || '';
+          document.getElementById('bleSeenThreshold').value = data.bleSeenThreshold || '';
+          document.getElementById('bleMissedThreshold').value = data.bleMissedThreshold || '';
+        })
+        .catch(error => {
+          showMessage('Error loading configuration: ' + error, 'danger');
+        });
+    }
+
+    function saveConfig() {
+      // Convert form to JSON
+      const form = document.getElementById('configForm');
+      const formData = new FormData(form);
+      const config = {};
+      
+      for (const [key, value] of formData.entries()) {
+        // Convert certain fields from seconds to milliseconds for backend
+        if (['sendInterval', 'bleScanInterval', 'beaconInterval'].includes(key)) {
+          config[key] = parseInt(value) * 1000; // Convert to milliseconds
+        } else if (['beaconDuration', 'bleSeenThreshold', 'bleMissedThreshold'].includes(key)) {
+          config[key] = parseInt(value);
+        } else if (['homeLat', 'homeLon'].includes(key)) {
+          config[key] = parseFloat(value);
+        } else {
+          config[key] = value;
+        }
+      }
+      
+      // Send to server
+      fetch('/api/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(config)
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          showMessage('Settings saved successfully!', 'success');
+        } else {
+          showMessage('Failed to save settings: ' + data.message, 'danger');
+        }
+      })
+      .catch(error => {
+        showMessage('Error: ' + error, 'danger');
+      });
+    }
+
+    function showMessage(message, type) {
+      const statusMsg = document.getElementById('statusMessage');
+      statusMsg.textContent = message;
+      statusMsg.className = 'alert alert-' + type;
+      statusMsg.style.display = 'block';
+      
+      // Hide message after 5 seconds
+      setTimeout(() => {
+        statusMsg.style.display = 'none';
+      }, 5000);
+    }
+  </script>
+  
+  <script src="/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
