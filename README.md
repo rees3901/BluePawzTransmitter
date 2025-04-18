@@ -16,3 +16,12 @@ ESP32-based GPS LoRa transmitter for pet tracking.
 - Low-power standby modes (planned)
 - LED status indication
 
+
+## 🧪 Testing
+
+- Connect to serial monitor (115200 baud)
+- Check GPS lock and LoRa transmission status
+
+## 📡 Receiver Repo
+
+➡️ [BluePawzReceiver](https://github.com/rees3901/BluePawzReceiver)
