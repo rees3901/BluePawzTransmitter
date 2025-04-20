@@ -12,10 +12,10 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include <WiFiManager.h> // For configuration portal
-#include <EEPROM.h>      // For storing configuration
-#include "secrets.h"     // Wi-Fi credentials
-
+#include <WiFiManager.h>    // For configuration portal
+#include <EEPROM.h>         // For storing configuration
+#include "secrets.h"        // Wi-Fi credentials
+#include <SoftwareSerial.h> // For GPS module communication
 // Include web server and filesystem libraries
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
@@ -74,11 +74,11 @@ CatTrackerConfig config = {
 #define LORA_DIO1 39
 
 // GPS Pins
-#define GPS_RX D7         // RX pin for GPS module (D0 on XIAO ESP32S3)
-#define GPS_TX D6         // TX pin for GPS module (D1 on XIAO ESP32S3)
-#define GPS_BAUD 9600     // Baud rate for GPS module
-#define GPS_SLEEP_WAKE D0 // Wake pin for GPS module high is on and low is sleep
-#define GPS_RESET D10     // Reset pin for GPS module (D2 on XIAO ESP32S3)
+#define GPS_RX 44        // D7 = GPIO 44
+#define GPS_TX 43        // D6 = GPIO 43
+#define GPS_BAUD 9600    // Baud rate for GPS module
+#define GPS_SLEEP_WAKE 1 // D0 = GPIO 1 (Wake pin for GPS module)
+#define GPS_RESET 21     // D10 = GPIO 21 (Reset pin for GPS module)
 
 // #define NODE_ADDRESS 0x01      // This device's address
 // #define RECEIVER_ADDRESS 0xFF  // Base station address
@@ -113,6 +113,14 @@ const unsigned long SERIAL_TIMEOUT = 10000; // 10 seconds timeout to detect disc
 
 // Configuration flag
 bool shouldSaveConfig = false;
+
+// Add this global variable near the other globals:
+bool gpsIsAwake = true;
+
+// Add these globals for GPS wake timing
+unsigned long gpsWakeLeadTime = 20000; // 20 seconds before LoRa send
+unsigned long gpsWakeTime = 0;
+bool gpsShouldBeAwake = false;
 
 // ──────────────────────────────--
 // 🛠️ SETUP INITIALISATION
@@ -173,7 +181,7 @@ SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
 TinyGPSPlus gps;
 // Define GPS serial on UART1
-HardwareSerial gpsSerial1(1);
+SoftwareSerial gpsSerial1(GPS_RX, GPS_TX);
 
 const unsigned long sendInterval = 60000;
 const unsigned long bleScanInterval = 120000; // 2 minutes (120000ms) for BLE scan
@@ -932,7 +940,7 @@ void setup()
   pinMode(STATUS_BUTTON_PIN, INPUT_PULLUP); // Set button pin as input with pull-up
   // Set up GPS and LoRa pins
   pinMode(GPS_RESET, OUTPUT);         // Set GPS reset pin as output
-  digitalWrite(GPS_RESET, HIGH);      //   // Set GPS reset pin HIGH to disable reset
+  digitalWrite(GPS_RESET, HIGH);      // Set GPS reset pin HIGH to disable reset
   pinMode(GPS_SLEEP_WAKE, OUTPUT);    // Set GPS sleep/wake pin as output
   digitalWrite(GPS_SLEEP_WAKE, HIGH); // Set GPS wake pin as output and HIGH
   // Initialize EEPROM
@@ -962,7 +970,7 @@ void setup()
   beaconName = "CAT_TRACKER_HQ"; // Default name, can be changed in config
 
   // Initialize GPS serial first so we can check for fix during warmup
-  gpsSerial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+  gpsSerial1.begin(GPS_BAUD);
   delay(100);         // Wait for serial to initialize
   gpsSerial1.flush(); // Now flush any garbage data
 
@@ -1070,14 +1078,22 @@ void stopBeaconing() // Function to stop beaconing as a beacon
 // GPS power management functions
 void gpsWake()
 {
-  digitalWrite(GPS_SLEEP_WAKE, HIGH);
-  colorPrint("[GPS] Waking up GPS module", ANSI_YELLOW);
+  if (!gpsIsAwake)
+  {
+    digitalWrite(GPS_SLEEP_WAKE, HIGH);
+    colorPrint("[GPS] Waking up GPS module", ANSI_YELLOW);
+    gpsIsAwake = true;
+  }
 }
 
 void gpsSleep()
 {
-  digitalWrite(GPS_SLEEP_WAKE, LOW);
-  colorPrint("[GPS] Putting GPS module to sleep", ANSI_YELLOW);
+  if (gpsIsAwake)
+  {
+    digitalWrite(GPS_SLEEP_WAKE, LOW);
+    colorPrint("[GPS] Putting GPS module to sleep", ANSI_YELLOW);
+    gpsIsAwake = false;
+  }
 }
 
 // GPS power management variables
@@ -1174,6 +1190,23 @@ bool isGpsNeeded()
 // ──────────────────────────────
 void loop()
 {
+  unsigned long now = millis();
+
+  // Calculate when to wake GPS before LoRa send
+  if ((lastSendTime + config.sendInterval - gpsWakeLeadTime <= now) && !gpsShouldBeAwake)
+  {
+    gpsWake();
+    gpsShouldBeAwake = true;
+    gpsWakeTime = now;
+  }
+
+  // Only put GPS to sleep after LoRa send
+  if (gpsShouldBeAwake && (now - lastSendTime < 1000)) // Just after LoRa send
+  {
+    gpsSleep();
+    gpsShouldBeAwake = false;
+  }
+
   // Check button state for status report
   bool buttonState = digitalRead(STATUS_BUTTON_PIN);
   if (buttonState == LOW && lastButtonState == HIGH)
@@ -1186,24 +1219,11 @@ void loop()
   }
   lastButtonState = buttonState;
 
-  // GPS power management - only wake it when needed
-  if (isGpsNeeded())
-  {
-    gpsWake();
-  }
-  else
-  {
-    // GPS not needed right now, put to sleep to save power
-    gpsSleep();
-  }
-
   // Process GPS data while available
   while (gpsSerial1.available() > 0)
   {
     gps.encode(gpsSerial1.read()); // Read and decode GPS data from UART
   }
-
-  unsigned long now = millis();
 
   // 🛰️ Periodic GPS status diagnostics
   static unsigned long lastGpsDataTime = 0;
@@ -1269,66 +1289,53 @@ void loop()
   // 📤 Prepare and send LoRa payload if time interval met
   if (now - lastSendTime > config.sendInterval) // Use config value
   {
-    lastSendTime = now;
-    colorPrint("[LORA] Preparing for transmit...");
-    lora.standby();
-
-    static uint32_t messageId = 0;
-    JsonDocument doc;
-    doc["msg_id"] = messageId++;
-    doc["device_id"] = 4;
-    doc["id"] = SENDER_ID;
-
+    // Only send if GPS fix is valid
     if (gps.location.isValid())
     {
+      lastSendTime = now;
+      colorPrint("[LORA] Preparing for transmit...");
+      lora.standby();
+      static uint32_t messageId = 0;
+      JsonDocument doc;
+      doc["msg_id"] = messageId++;
+      doc["device_id"] = 4;
+      doc["id"] = SENDER_ID;
       double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon); // Use config values
       double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);     // Use config values
       String dir = String((int)bearing) + "-" + cardinalDirection(bearing);
-
       doc["lat"] = gps.location.lat();
       doc["lon"] = gps.location.lng();
       doc["time"] = gps.time.value();
       doc["dist_m"] = dist;
       doc["bearing"] = dir;
       doc["status"] = isHome ? "home" : "outanabout";
-    }
-    else
-    {
-      doc["lat"] = "GPS_Invalid";
-      doc["lon"] = "GPS_Invalid";
-      doc["time"] = gps.time.value();
-      doc["dist_m"] = -1;
-      doc["bearing"] = "unknown";
-      doc["status"] = "invalidGPSLoc";
-    }
-
-    String out;
-    serializeJson(doc, out);
-    colorPrint("Sending: " + out);
-    int txState = lora.transmit(out);
-    if (txState == RADIOLIB_ERR_NONE)
-    {
-      Serial.print("[LORA] msg [");
-      // Flash LED 5 times rapidly
-      for (int i = 0; i < 5; i++)
+      String out;
+      serializeJson(doc, out);
+      colorPrint("Sending: " + out);
+      int txState = lora.transmit(out);
+      if (txState == RADIOLIB_ERR_NONE)
       {
-        digitalWrite(48, HIGH);
-        delay(50);
-        digitalWrite(48, LOW);
-        delay(50);
+        Serial.print("[LORA] msg [");
+        for (int i = 0; i < 5; i++)
+        {
+          digitalWrite(48, HIGH);
+          delay(50);
+          digitalWrite(48, LOW);
+          delay(50);
+        }
+        Serial.print(messageId - 1);
+        colorPrint("] sent");
       }
-      Serial.print(messageId - 1);
-      colorPrint("] sent");
+      else
+      {
+        Serial.print(ANSI_RED);
+        Serial.print("[LORA] Transmit failed, code: ");
+        Serial.print(txState);
+        Serial.println(ANSI_RESET);
+      }
+      doc.clear();
     }
-    else
-    {
-      Serial.print(ANSI_RED);
-      Serial.print("[LORA] Transmit failed, code: ");
-      Serial.print(txState);
-      Serial.println(ANSI_RESET);
-    }
-
-    doc.clear(); // Clear the serialized JSON object to avoid legacy data being sent
+    // If no valid fix, skip sending and try again next interval
   }
 
   // After LoRa transmission is complete, start beaconing
