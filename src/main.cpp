@@ -29,6 +29,8 @@ void saveConfigToEEPROM();
 void startConfigPortal();
 String cardinalDirection(double bearing);
 void colorPrint(const String &message, const char *color = NULL);
+void applyProfile(const char *mode);
+void applyLoraParams();
 
 // Configuration structure to be stored in EEPROM
 struct CatTrackerConfig
@@ -127,6 +129,11 @@ bool gpsIsAwake = true;
 unsigned long gpsWakeLeadTime = 20000; // 20 seconds before LoRa send
 unsigned long gpsWakeTime = 0;
 bool gpsShouldBeAwake = false;
+
+// Add these globals for manual transmit
+bool manualTxRequested = false;
+unsigned long manualTxStartTime = 0;
+bool manualTxInProgress = false;
 
 // ──────────────────────────────--
 // 🛠️ SETUP INITIALISATION
@@ -239,7 +246,7 @@ void handleGetStatus(AsyncWebServerRequest *request)
     doc["lat"] = gps.location.lat();
     doc["lon"] = gps.location.lng();
     doc["satellites"] = gps.satellites.value();
-
+    doc["satsSeen"] = gps.satellites.value();
     // Calculate distance and direction from home
     double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);
     double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);
@@ -249,6 +256,7 @@ void handleGetStatus(AsyncWebServerRequest *request)
   else
   {
     doc["gpsValid"] = false;
+    doc["satsSeen"] = 0;
   }
 
   // BLE info
@@ -1258,17 +1266,90 @@ void loop()
     gpsShouldBeAwake = false;
   }
 
-  // Check button state for status report
+  // Check button state for status report and manual transmit
   bool buttonState = digitalRead(STATUS_BUTTON_PIN);
   if (buttonState == LOW && lastButtonState == HIGH)
   {
     // Button pressed, print status report
     printStatusReport();
-
-    // Ensure GPS is awake when status is checked
+    // Manual transmit request
+    manualTxRequested = true;
+    manualTxStartTime = now;
+    manualTxInProgress = true;
     gpsWake();
+    colorPrint("[MANUAL] Manual transmit requested via button press", ANSI_BRIGHT_CYAN);
   }
   lastButtonState = buttonState;
+
+  // Manual transmit logic
+  if (manualTxRequested && manualTxInProgress)
+  {
+    // Wait for GPS warmup (max 20s or until fix)
+    bool fixFound = false;
+    unsigned long elapsed = now - manualTxStartTime;
+    while (gpsSerial1.available() > 0)
+    {
+      gps.encode(gpsSerial1.read());
+    }
+    if (gps.location.isValid())
+    {
+      fixFound = true;
+    }
+    if (fixFound || elapsed > 20000)
+    {
+      // Send LoRa packet (same as normal send)
+      colorPrint("[MANUAL] Sending manual LoRa packet", ANSI_BRIGHT_CYAN);
+      lastSendTime = now; // Update send time to avoid double send
+      lora.standby();
+      static uint32_t messageId = 0;
+      JsonDocument doc;
+      doc["msg_id"] = messageId++;
+      doc["device_id"] = 4;
+      doc["id"] = SENDER_ID;
+      double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);
+      double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);
+      String dir = String((int)bearing) + "-" + cardinalDirection(bearing);
+      doc["lat"] = gps.location.lat();
+      doc["lon"] = gps.location.lng();
+      doc["time"] = gps.time.value();
+      doc["dist_m"] = dist;
+      doc["bearing"] = dir;
+      doc["status"] = isHome ? "home" : "outanabout";
+      String out;
+      serializeJson(doc, out);
+      colorPrint("Sending: " + out);
+      int txState = lora.transmit(out);
+      if (txState == RADIOLIB_ERR_NONE)
+      {
+        Serial.print("[LORA] msg [");
+        for (int i = 0; i < 5; i++)
+        {
+          digitalWrite(48, HIGH);
+          delay(50);
+          digitalWrite(48, LOW);
+          delay(50);
+        }
+        Serial.print(messageId - 1);
+        colorPrint("] sent");
+      }
+      else
+      {
+        Serial.print(ANSI_RED);
+        Serial.print("[LORA] Transmit failed, code: ");
+        Serial.print(txState);
+        Serial.println(ANSI_RESET);
+      }
+      doc.clear();
+      // Start BLE beaconing
+      startBeaconing();
+      // Reset manual transmit state
+      manualTxRequested = false;
+      manualTxInProgress = false;
+      // Optionally, put GPS to sleep after manual send
+      gpsSleep();
+    }
+    // else, keep waiting for fix or timeout
+  }
 
   // Process GPS data while available
   while (gpsSerial1.available() > 0)
@@ -1288,7 +1369,11 @@ void loop()
   if (now - lastStatusPrint > 60000)
   {
     lastStatusPrint = now;
-    if (now - lastGpsDataTime > 10000) // Check if no data received in the last 10 seconds
+    if (!gpsIsAwake)
+    {
+      colorPrint("[GPS] GPS is asleep", ANSI_YELLOW);
+    }
+    else if (now - lastGpsDataTime > 10000) // Check if no data received in the last 10 seconds
       colorPrint("[GPS] No data on UART", ANSI_YELLOW);
     else if (!gps.location.isValid())
       colorPrint("[GPS] Invalid fix", ANSI_YELLOW);

@@ -156,6 +156,36 @@
         </div>
       </div>
       
+      <!-- Mode and LoRa Parameters -->
+      <div class="row mt-3">
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-header">
+              ⚡ Device Mode & LoRa Parameters
+            </div>
+            <div class="card-body">
+              <div class="mb-3">
+                <label for="mode" class="form-label">Operation Mode</label>
+                <select class="form-select" id="mode" name="mode">
+                  <option value="sleepy">Sleepy (Max Battery)</option>
+                  <option value="normal">Normal</option>
+                  <option value="lost">Lost (High Performance)</option>
+                </select>
+                <div class="form-text">Choose a preset mode or customize below</div>
+              </div>
+              <div class="mb-3">
+                <label for="loraPower" class="form-label">LoRa Output Power (dBm)</label>
+                <input type="number" class="form-control" id="loraPower" name="loraPower" min="2" max="22" required>
+              </div>
+              <div class="mb-3">
+                <label for="loraPreamble" class="form-label">LoRa Preamble Length</label>
+                <input type="number" class="form-control" id="loraPreamble" name="loraPreamble" min="6" max="32" required>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
       <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-4">
         <button type="button" id="resetBtn" class="btn btn-warning me-md-2">Reset to Defaults</button>
         <button type="submit" class="btn btn-primary">Save Configuration</button>
@@ -213,6 +243,33 @@
           showMessage('Geolocation is not supported by your browser', 'danger');
         }
       });
+
+      // Mode profile auto-fill logic
+      document.getElementById('mode').addEventListener('change', function() {
+        const mode = this.value;
+        if (mode === 'sleepy') {
+          document.getElementById('sendInterval').value = 120;
+          document.getElementById('bleScanInterval').value = 240;
+          document.getElementById('beaconInterval').value = 240;
+          document.getElementById('beaconDuration').value = 2;
+          document.getElementById('loraPower').value = 10;
+          document.getElementById('loraPreamble').value = 8;
+        } else if (mode === 'normal') {
+          document.getElementById('sendInterval').value = 60;
+          document.getElementById('bleScanInterval').value = 120;
+          document.getElementById('beaconInterval').value = 120;
+          document.getElementById('beaconDuration').value = 3;
+          document.getElementById('loraPower').value = 18;
+          document.getElementById('loraPreamble').value = 8;
+        } else if (mode === 'lost') {
+          document.getElementById('sendInterval').value = 15;
+          document.getElementById('bleScanInterval').value = 30;
+          document.getElementById('beaconInterval').value = 30;
+          document.getElementById('beaconDuration').value = 5;
+          document.getElementById('loraPower').value = 22;
+          document.getElementById('loraPreamble').value = 16;
+        }
+      });
     });
 
     function fetchConfig() {
@@ -230,6 +287,9 @@
           document.getElementById('beaconName').value = data.beaconName || '';
           document.getElementById('bleSeenThreshold').value = data.bleSeenThreshold || '';
           document.getElementById('bleMissedThreshold').value = data.bleMissedThreshold || '';
+          document.getElementById('mode').value = data.mode || 'normal';
+          document.getElementById('loraPower').value = data.loraPower || '';
+          document.getElementById('loraPreamble').value = data.loraPreamble || '';
         })
         .catch(error => {
           showMessage('Error loading configuration: ' + error, 'danger');
@@ -246,7 +306,7 @@
         // Convert certain fields from seconds to milliseconds for backend
         if (['sendInterval', 'bleScanInterval', 'beaconInterval'].includes(key)) {
           config[key] = parseInt(value) * 1000; // Convert to milliseconds
-        } else if (['beaconDuration', 'bleSeenThreshold', 'bleMissedThreshold'].includes(key)) {
+        } else if (['beaconDuration', 'bleSeenThreshold', 'bleMissedThreshold', 'loraPower', 'loraPreamble'].includes(key)) {
           config[key] = parseInt(value);
         } else if (['homeLat', 'homeLon'].includes(key)) {
           config[key] = parseFloat(value);
