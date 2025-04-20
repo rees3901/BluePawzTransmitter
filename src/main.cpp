@@ -43,6 +43,9 @@ struct CatTrackerConfig
   int beaconDuration;            // Seconds to advertise as beacon
   int bleSeenThreshold;          // How many times beacon must be seen to be "home"
   int bleMissedThreshold;        // How many times beacon must be missed to be "away"
+  char mode[16];                 // "sleepy", "normal", "lost"
+  int loraPower;                 // dBm
+  int loraPreamble;              // preamble length
 };
 
 // Default configuration
@@ -56,7 +59,10 @@ CatTrackerConfig config = {
     120000,              // Default beacon interval (120 sec)
     3,                   // Default beacon duration (3 sec)
     3,                   // Default seen threshold (3 times)
-    5                    // Default missed threshold (5 times)
+    5,                   // Default missed threshold (5 times)
+    "normal",            // mode
+    18,                  // loraPower
+    8                    // loraPreamble
 };
 
 // Define old globals as references to config values for backward compatibility
@@ -270,6 +276,9 @@ void handleGetConfig(AsyncWebServerRequest *request)
   doc["beaconName"] = beaconName;
   doc["bleSeenThreshold"] = config.bleSeenThreshold;
   doc["bleMissedThreshold"] = config.bleMissedThreshold;
+  doc["mode"] = config.mode;
+  doc["loraPower"] = config.loraPower;
+  doc["loraPreamble"] = config.loraPreamble;
 
   String response;
   serializeJson(doc, response);
@@ -329,59 +338,62 @@ void handleUpdateConfig(AsyncWebServerRequest *request, uint8_t *data, size_t le
     if (!error)
     {
       // Update config with new values - use modern ArduinoJson syntax
+      if (doc["mode"].is<const char *>())
+      {
+        applyProfile(doc["mode"]);
+      }
       if (doc["senderId"].is<const char *>())
       {
         strncpy(config.senderId, doc["senderId"], sizeof(config.senderId) - 1);
       }
-
       if (doc["homeLat"].is<double>())
       {
         config.homeLat = doc["homeLat"];
       }
-
       if (doc["homeLon"].is<double>())
       {
         config.homeLon = doc["homeLon"];
       }
-
       if (doc["sendInterval"].is<unsigned long>())
       {
         config.sendInterval = doc["sendInterval"];
       }
-
       if (doc["bleScanInterval"].is<unsigned long>())
       {
         config.bleScanInterval = doc["bleScanInterval"];
       }
-
       if (doc["beaconInterval"].is<unsigned long>())
       {
         config.beaconInterval = doc["beaconInterval"];
       }
-
       if (doc["beaconDuration"].is<int>())
       {
         config.beaconDuration = doc["beaconDuration"];
       }
-
       if (doc["beaconName"].is<const char *>())
       {
         beaconName = doc["beaconName"].as<String>();
       }
-
       if (doc["bleSeenThreshold"].is<int>())
       {
         config.bleSeenThreshold = doc["bleSeenThreshold"];
       }
-
       if (doc["bleMissedThreshold"].is<int>())
       {
         config.bleMissedThreshold = doc["bleMissedThreshold"];
       }
-
+      if (doc["loraPower"].is<int>())
+      {
+        config.loraPower = doc["loraPower"];
+      }
+      if (doc["loraPreamble"].is<int>())
+      {
+        config.loraPreamble = doc["loraPreamble"];
+      }
+      // Apply LoRa parameters after config update
+      applyLoraParams();
       // Save to EEPROM
       saveConfigToEEPROM();
-
       // Send success response
       request->send(200, "application/json", "{\"success\":true}");
     }
@@ -796,6 +808,45 @@ void saveConfigCallback()
 {
   colorPrint("[CONFIG] Configuration changed - will save", ANSI_GREEN);
   shouldSaveConfig = true;
+}
+
+// Profile application function
+void applyProfile(const char *mode)
+{
+  if (strcmp(mode, "sleepy") == 0)
+  {
+    config.sendInterval = 120000;
+    config.bleScanInterval = 240000;
+    config.beaconInterval = 240000;
+    config.beaconDuration = 2;
+    config.loraPower = 10;
+    config.loraPreamble = 8;
+  }
+  else if (strcmp(mode, "normal") == 0)
+  {
+    config.sendInterval = 60000;
+    config.bleScanInterval = 120000;
+    config.beaconInterval = 120000;
+    config.beaconDuration = 3;
+    config.loraPower = 18;
+    config.loraPreamble = 8;
+  }
+  else if (strcmp(mode, "lost") == 0)
+  {
+    config.sendInterval = 15000;
+    config.bleScanInterval = 30000;
+    config.beaconInterval = 30000;
+    config.beaconDuration = 5;
+    config.loraPower = 22;
+    config.loraPreamble = 16;
+  }
+  strncpy(config.mode, mode, sizeof(config.mode) - 1);
+}
+
+void applyLoraParams()
+{
+  lora.setOutputPower(config.loraPower);
+  lora.setPreambleLength(config.loraPreamble);
 }
 
 // ──────────────────────────────
