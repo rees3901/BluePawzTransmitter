@@ -53,7 +53,7 @@ struct CatTrackerConfig
 // Default configuration
 CatTrackerConfig config = {
     CONFIG_VERSION,
-    "Podge",             // Default cat name
+    "Simba",             // Default cat name
     51.87370573411073,   // Default HOME_LAT
     -2.2396017778476716, // Default HOME_LON
     60000,               // Default send interval (60 sec)
@@ -202,12 +202,14 @@ unsigned long lastSendTime = 0;
 unsigned long lastBleScanTime = 0;
 unsigned long lastStatusPrint = 0;
 bool isHome = false;
-
-String beaconName = "CAT_TRACKER_HQ"; // Name of the beacon to look for; not transmitted
+// Update global variables from config
+// Variable for the name to advertise when beaconing
+String advertisedBeaconName = SENDER_ID;          // Use cat name/ID for beaconing
+String SearchingForBeaconName = "CAT_TRACKER_HQ"; // Name of the beacon to look for; not transmitted
 // String beaconAddress = "00:00:00:00:00:00"; // MAC address of the beacon to look for
 BLEScan *pBLEScan;
 
-const int BLE_SCAN_DURATION = 5; // BLE scan duration in seconds
+const int BLE_SCAN_DURATION = 7; // BLE scan duration in seconds
 bool bleScanning = false;
 unsigned long bleScanStartTime = 0;
 
@@ -261,7 +263,8 @@ void handleGetStatus(AsyncWebServerRequest *request)
 
   // BLE info
   doc["bleMode"] = bleScanning ? "scanning" : (isBeaconing ? "beaconing" : "idle");
-  doc["beaconName"] = beaconName;
+  doc["beaconName"] = advertisedBeaconName ? advertisedBeaconName : beaconName; // Use cat name/ID for beaconing
+  ;
   doc["beaconSeenCount"] = isHome ? config.bleSeenThreshold : 0; // Simplified - would need to expose counter from class
 
   String response;
@@ -281,7 +284,7 @@ void handleGetConfig(AsyncWebServerRequest *request)
   doc["bleScanInterval"] = config.bleScanInterval;
   doc["beaconInterval"] = config.beaconInterval;
   doc["beaconDuration"] = config.beaconDuration;
-  doc["beaconName"] = beaconName;
+  doc["beaconName"] = advertisedBeaconName;
   doc["bleSeenThreshold"] = config.bleSeenThreshold;
   doc["bleMissedThreshold"] = config.bleMissedThreshold;
   doc["mode"] = config.mode;
@@ -380,7 +383,7 @@ void handleUpdateConfig(AsyncWebServerRequest *request, uint8_t *data, size_t le
       }
       if (doc["beaconName"].is<const char *>())
       {
-        beaconName = doc["beaconName"].as<String>();
+        advertisedBeaconName = doc["beaconName"].as<String>();
       }
       if (doc["bleSeenThreshold"].is<int>())
       {
@@ -434,7 +437,7 @@ void handleResetConfig(AsyncWebServerRequest *request)
   config.bleMissedThreshold = 5;
 
   // Update global variables
-  beaconName = "CAT_TRACKER_HQ";
+  SearchingForBeaconName = "CAT_TRACKER_HQ";
 
   // Save to EEPROM
   saveConfigToEEPROM();
@@ -553,7 +556,7 @@ public:
       deviceReport += " Name: \"" + advName + "\"";
 
       // Check if this is our target beacon
-      if (advName == beaconName)
+      if (advName == SearchingForBeaconName)
       {
         beaconSeenCount++;
         beaconMissedCount = 0; // Reset missed count if beacon is seen
@@ -911,7 +914,7 @@ void startConfigPortal()
 
   // Home Detection Parameters
   WiFiManagerParameter custom_html_header_4("<h3>🏠 Home Detection</h3>");
-  WiFiManagerParameter custom_beacon_name(getParam("beacon_name", "Home Beacon Name", beaconName.c_str(), 20).c_str());
+  WiFiManagerParameter custom_beacon_name(getParam("beacon_name", "Home Beacon Name", SearchingForBeaconName.c_str(), 20).c_str());
   WiFiManagerParameter custom_ble_seen(getNumberParam("ble_seen", "Home Seen Threshold", String(config.bleSeenThreshold), "1", "10").c_str());
   WiFiManagerParameter custom_ble_missed(getNumberParam("ble_missed", "Home Missed Threshold", String(config.bleMissedThreshold), "1", "15").c_str());
 
@@ -955,7 +958,7 @@ void startConfigPortal()
     config.beaconInterval = atol(custom_beacon_interval.getValue()) * 1000;
     config.beaconDuration = atoi(custom_beacon_duration.getValue());
 
-    beaconName = custom_beacon_name.getValue();
+    SearchingForBeaconName = custom_beacon_name.getValue();
     config.bleSeenThreshold = atoi(custom_ble_seen.getValue());
     config.bleMissedThreshold = atoi(custom_ble_missed.getValue());
 
@@ -970,7 +973,7 @@ void startConfigPortal()
     colorPrint("  BLE Scan Interval: " + String(config.bleScanInterval / 1000) + "s", ANSI_BRIGHT_WHITE);
     colorPrint("  Beacon Interval: " + String(config.beaconInterval / 1000) + "s", ANSI_BRIGHT_WHITE);
     colorPrint("  Beacon Duration: " + String(config.beaconDuration) + "s", ANSI_BRIGHT_WHITE);
-    colorPrint("  Home Beacon Name: " + beaconName, ANSI_BRIGHT_WHITE);
+    colorPrint("  Home Beacon Name: " + SearchingForBeaconName, ANSI_BRIGHT_WHITE);
     colorPrint("  Seen Threshold: " + String(config.bleSeenThreshold), ANSI_BRIGHT_WHITE);
     colorPrint("  Missed Threshold: " + String(config.bleMissedThreshold), ANSI_BRIGHT_WHITE);
   }
@@ -988,12 +991,12 @@ void startConfigPortal()
   ESP.restart();
 }
 
-// ███████╗███████╗████████╗██╗   ██╗██████╗ 
+// ███████╗███████╗████████╗██╗   ██╗██████╗
 // ██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔══██╗
 // ███████╗█████╗     ██║   ██║   ██║██████╔╝
-// ╚════██║██╔══╝     ██║   ██║   ██║██╔═══╝ 
-// ███████║███████╗   ██║   ╚██████╔╝██║     
-// ╚══════╝╚══════╝   ╚═╝    ╚═════╝ ╚═╝     
+// ╚════██║██╔══╝     ██║   ██║   ██║██╔═══╝
+// ███████║███████╗   ██║   ╚██████╔╝██║
+// ╚══════╝╚══════╝   ╚═╝    ╚═════╝ ╚═╝
 // =============================================
 // 🛠️ DEVICE INITIALIZATION & CONFIGURATION 🛠️
 // =============================================
@@ -1034,9 +1037,6 @@ void setup()
 
   // Load settings from EEPROM
   loadConfigFromEEPROM();
-
-  // Update global variables from config
-  beaconName = SENDER_ID; // Use cat name/ID for beaconing
 
   //  ┌─────────────────────────────────┐
   //  │ 🛰️  GPS INITIALIZATION          │
@@ -1128,7 +1128,7 @@ void setup()
   // Initialize LittleFS and web server
   setupWebServer();
   colorPrint("[INIT] Web interface ready at http://192.168.4.1/", ANSI_BRIGHT_GREEN);
-  
+
   // ════════════════════════════════════════
   // 🚀 SETUP COMPLETE - READY TO TRACK 🐱
   // ════════════════════════════════════════
@@ -1476,55 +1476,55 @@ void loop()
   {
     // Send data regardless of GPS fix status
     // This will transmit even when GPS location is not valid
-      lastSendTime = now;
-      colorPrint("[LORA] Preparing for transmit...");
-      lora.standby(); // Put radio in standby mode before transmission
-      static uint32_t messageId = 0;
-      JsonDocument doc;
-      // Build the JSON message with tracking information
-      doc["msg_id"] = messageId++;
-      doc["device_id"] = 4;
-      doc["id"] = SENDER_ID;
-      // Calculate distance and bearing from home coordinates
-      double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon); // Use config values
-      double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);     // Use config values
-      String dir = String((int)bearing) + "-" + cardinalDirection(bearing);
-      doc["lat"] = gps.location.lat();
-      doc["lon"] = gps.location.lng();
-      doc["time"] = gps.time.value();
-      doc["dist_m"] = dist;
-      doc["bearing"] = dir;
-      doc["satellite_Count"] = gps.satellites.value(); // Add satellite count to JSON
-      // Add status with three possible states: home, outanabout, or error (if no valid GPS fix)
-      doc["status"] = !gps.location.isValid() ? "error" : (isHome ? "home" : "outanabout");
-      String out;
-      serializeJson(doc, out);
-      colorPrint("Sending: " + out);
-      // Transmit the JSON message via LoRa
-      int txState = lora.transmit(out);
-      if (txState == RADIOLIB_ERR_NONE)
+    lastSendTime = now;
+    colorPrint("[LORA] Preparing for transmit...");
+    lora.standby(); // Put radio in standby mode before transmission
+    static uint32_t messageId = 0;
+    JsonDocument doc;
+    // Build the JSON message with tracking information
+    doc["msg_id"] = messageId++;
+    doc["device_id"] = 4;
+    doc["id"] = SENDER_ID;
+    // Calculate distance and bearing from home coordinates
+    double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon); // Use config values
+    double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);     // Use config values
+    String dir = String((int)bearing) + "-" + cardinalDirection(bearing);
+    doc["lat"] = gps.location.lat();
+    doc["lon"] = gps.location.lng();
+    doc["time"] = gps.time.value();
+    doc["dist_m"] = dist;
+    doc["bearing"] = dir;
+    doc["satellite_Count"] = gps.satellites.value(); // Add satellite count to JSON
+    // Add status with three possible states: home, outanabout, or error (if no valid GPS fix)
+    doc["status"] = !gps.location.isValid() ? "error" : (isHome ? "home" : "outanabout");
+    String out;
+    serializeJson(doc, out);
+    colorPrint("Sending: " + out);
+    // Transmit the JSON message via LoRa
+    int txState = lora.transmit(out);
+    if (txState == RADIOLIB_ERR_NONE)
+    {
+      Serial.print("[LORA] msg [");
+      // Visual indication of transmission - flash LED 5 times
+      for (int i = 0; i < 5; i++)
       {
-        Serial.print("[LORA] msg [");
-        // Visual indication of transmission - flash LED 5 times
-        for (int i = 0; i < 5; i++)
-        {
-          digitalWrite(48, HIGH);
-          delay(50);
-          digitalWrite(48, LOW);
-          delay(50);
-        }
-        Serial.print(messageId - 1);
-        colorPrint("] sent");
+        digitalWrite(48, HIGH);
+        delay(50);
+        digitalWrite(48, LOW);
+        delay(50);
       }
-      else
-      {
-        Serial.print(ANSI_RED);
-        Serial.print("[LORA] Transmit failed, code: ");
-        Serial.print(txState);
-        Serial.println(ANSI_RESET);
-      }
-      doc.clear(); // Free memory used by the JSON document
+      Serial.print(messageId - 1);
+      colorPrint("] sent");
     }
+    else
+    {
+      Serial.print(ANSI_RED);
+      Serial.print("[LORA] Transmit failed, code: ");
+      Serial.print(txState);
+      Serial.println(ANSI_RESET);
+    }
+    doc.clear(); // Free memory used by the JSON document
+  }
 
   // ┌────────────────────────┐
   // │ 📱 BLE BEACON CONTROL  │
