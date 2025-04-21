@@ -263,7 +263,7 @@ void handleGetStatus(AsyncWebServerRequest *request)
 
   // BLE info
   doc["bleMode"] = bleScanning ? "scanning" : (isBeaconing ? "beaconing" : "idle");
-  doc["beaconName"] = advertisedBeaconName ? advertisedBeaconName : beaconName; // Use cat name/ID for beaconing
+  doc["beaconName"] = advertisedBeaconName ? advertisedBeaconName : SENDER_ID; // Use cat name/ID for beaconing
   ;
   doc["beaconSeenCount"] = isHome ? config.bleSeenThreshold : 0; // Simplified - would need to expose counter from class
 
