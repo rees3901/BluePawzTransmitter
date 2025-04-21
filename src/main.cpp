@@ -53,7 +53,7 @@ struct CatTrackerConfig
 // Default configuration
 CatTrackerConfig config = {
     CONFIG_VERSION,
-    "Gizmo",             // Default cat name
+    "Podge",             // Default cat name
     51.87370573411073,   // Default HOME_LAT
     -2.2396017778476716, // Default HOME_LON
     60000,               // Default send interval (60 sec)
@@ -988,6 +988,16 @@ void startConfigPortal()
   ESP.restart();
 }
 
+// ███████╗███████╗████████╗██╗   ██╗██████╗ 
+// ██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔══██╗
+// ███████╗█████╗     ██║   ██║   ██║██████╔╝
+// ╚════██║██╔══╝     ██║   ██║   ██║██╔═══╝ 
+// ███████║███████╗   ██║   ╚██████╔╝██║     
+// ╚══════╝╚══════╝   ╚═╝    ╚═════╝ ╚═╝     
+// =============================================
+// 🛠️ DEVICE INITIALIZATION & CONFIGURATION 🛠️
+// =============================================
+
 void setup()
 {
   Serial.begin(115200);
@@ -1026,8 +1036,11 @@ void setup()
   loadConfigFromEEPROM();
 
   // Update global variables from config
-  beaconName = "CAT_TRACKER_HQ"; // Default name, can be changed in config
+  beaconName = SENDER_ID; // Use cat name/ID for beaconing
 
+  //  ┌─────────────────────────────────┐
+  //  │ 🛰️  GPS INITIALIZATION          │
+  //  └─────────────────────────────────┘
   // Initialize GPS serial first so we can check for fix during warmup
   gpsSerial1.begin(GPS_BAUD);
   delay(100);         // Wait for serial to initialize
@@ -1051,7 +1064,7 @@ void setup()
     if (gps.location.isValid())
     {
       fixFound = true;
-      colorPrint("[GPS] Valid fix obtained early! Lat: " + String(gps.location.lat(), 6) +
+      colorPrint("[GPS] Valid fix obtained early ✔ Lat: " + String(gps.location.lat(), 6) +
                      ", Lon: " + String(gps.location.lng(), 6),
                  ANSI_BRIGHT_GREEN);
       break;
@@ -1064,11 +1077,14 @@ void setup()
 
   if (!fixFound)
   {
-    colorPrint("[GPS] Warmup complete without fix. Continuing anyway...", ANSI_YELLOW);
+    colorPrint("[GPS] Warmup complete without Geetting fix. (still indoors?) Continuing anyway...", ANSI_YELLOW);
   }
 
   colorPrint("[INIT] GPS initialized");
 
+  //  ┌─────────────────────────────────┐
+  //  │ 📡 LORA RADIO INITIALIZATION    │
+  //  └─────────────────────────────────┘
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   colorPrint("[INIT] SPI for LoRa initialised");
 
@@ -1093,9 +1109,9 @@ void setup()
   lora.setPreambleLength(8);
   colorPrint("[INIT] LoRa PaRams configured");
 
-  // ------------------------------------------
-  // BLE SCAN SETUP 🧿
-  // ------------------------------------------
+  //  ┌─────────────────────────────────┐
+  //  │ 📱 BLE SETUP & CONFIGURATION    │
+  //  └─────────────────────────────────┘
   colorPrint("[INIT] Starting BLE scan setup...");
   BLEDevice::init("");
   pBLEScan = BLEDevice::getScan();
@@ -1106,9 +1122,16 @@ void setup()
   // Initialize BLE advertising setup for beaconing
   setupBLEAdvertising();
 
+  //  ┌─────────────────────────────────┐
+  //  │ 🌐 WEB INTERFACE SETUP          │
+  //  └─────────────────────────────────┘
   // Initialize LittleFS and web server
   setupWebServer();
   colorPrint("[INIT] Web interface ready at http://192.168.4.1/", ANSI_BRIGHT_GREEN);
+  
+  // ════════════════════════════════════════
+  // 🚀 SETUP COMPLETE - READY TO TRACK 🐱
+  // ════════════════════════════════════════
 }
 
 // Add this function to start beaconing
@@ -1244,9 +1267,20 @@ bool isGpsNeeded()
   return needed;
 }
 
-// ──────────────────────────────
-// 🔁 MAIN LOOP
-// ──────────────────────────────
+// ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+// █                                                          █
+// █    ███╗   ███╗ █████╗ ██╗███╗   ██╗    ██╗      ██████╗  █
+// █    ████╗ ████║██╔══██╗██║████╗  ██║    ██║     ██╔═══██╗ █
+// █    ██╔████╔██║███████║██║██╔██╗ ██║    ██║     ██║   ██║ █
+// █    ██║╚██╔╝██║██╔══██║██║██║╚██╗██║    ██║     ██║   ██║ █
+// █    ██║ ╚═╝ ██║██║  ██║██║██║ ╚████║    ███████╗╚██████╔╝ █
+// █    ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝    ╚══════╝ ╚═════╝  █
+// █                                                          █
+// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+// ┌─────────────────────────────────────────────────────────────┐
+// │ 🔄 MAIN PROGRAM EXECUTION LOOP - CAT TRACKING OPERATIONS    │
+// └─────────────────────────────────────────────────────────────┘
 void loop()
 {
   unsigned long now = millis();
@@ -1314,7 +1348,8 @@ void loop()
       doc["time"] = gps.time.value();
       doc["dist_m"] = dist;
       doc["bearing"] = dir;
-      doc["status"] = isHome ? "home" : "outanabout";
+      // Add status with three possible states: home, outanabout, or error (if no valid GPS fix)
+      doc["status"] = !gps.location.isValid() ? "error" : (isHome ? "home" : "outanabout");
       String out;
       serializeJson(doc, out);
       colorPrint("Sending: " + out);
@@ -1322,6 +1357,7 @@ void loop()
       if (txState == RADIOLIB_ERR_NONE)
       {
         Serial.print("[LORA] msg [");
+        // Flash the LED five times to visually indicate LoRa packet transmission
         for (int i = 0; i < 5; i++)
         {
           digitalWrite(48, HIGH);
@@ -1340,6 +1376,7 @@ void loop()
         Serial.println(ANSI_RESET);
       }
       doc.clear();
+
       // Start BLE beaconing
       startBeaconing();
       // Reset manual transmit state
@@ -1422,20 +1459,33 @@ void loop()
     pBLEScan->clearResults(); // Free memory
   }
 
-  // 📤 Prepare and send LoRa payload if time interval met
+  // ┌─────────────────────────────────────────┐
+  // │    📡 LORA TRANSMISSION BLOCK 📡       │
+  // │                                         │
+  // │    ██╗      ██████╗ ██████╗  █████╗    │
+  // │    ██║     ██╔═══██╗██╔══██╗██╔══██╗   │
+  // │    ██║     ██║   ██║██████╔╝███████║   │
+  // │    ██║     ██║   ██║██╔══██╗██╔══██║   │
+  // │    ███████╗╚██████╔╝██║  ██║██║  ██║   │
+  // │    ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝   │
+  // │                                         │
+  // └─────────────────────────────────────────┘
+  //
+  // Check if it's time to send a LoRa transmission based on configured interval
   if (now - lastSendTime > config.sendInterval) // Use config value
   {
-    // Only send if GPS fix is valid
-    if (gps.location.isValid())
-    {
+    // Send data regardless of GPS fix status
+    // This will transmit even when GPS location is not valid
       lastSendTime = now;
       colorPrint("[LORA] Preparing for transmit...");
-      lora.standby();
+      lora.standby(); // Put radio in standby mode before transmission
       static uint32_t messageId = 0;
       JsonDocument doc;
+      // Build the JSON message with tracking information
       doc["msg_id"] = messageId++;
       doc["device_id"] = 4;
       doc["id"] = SENDER_ID;
+      // Calculate distance and bearing from home coordinates
       double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon); // Use config values
       double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);     // Use config values
       String dir = String((int)bearing) + "-" + cardinalDirection(bearing);
@@ -1444,14 +1494,18 @@ void loop()
       doc["time"] = gps.time.value();
       doc["dist_m"] = dist;
       doc["bearing"] = dir;
-      doc["status"] = isHome ? "home" : "outanabout";
+      doc["satellite_Count"] = gps.satellites.value(); // Add satellite count to JSON
+      // Add status with three possible states: home, outanabout, or error (if no valid GPS fix)
+      doc["status"] = !gps.location.isValid() ? "error" : (isHome ? "home" : "outanabout");
       String out;
       serializeJson(doc, out);
       colorPrint("Sending: " + out);
+      // Transmit the JSON message via LoRa
       int txState = lora.transmit(out);
       if (txState == RADIOLIB_ERR_NONE)
       {
         Serial.print("[LORA] msg [");
+        // Visual indication of transmission - flash LED 5 times
         for (int i = 0; i < 5; i++)
         {
           digitalWrite(48, HIGH);
@@ -1469,28 +1523,29 @@ void loop()
         Serial.print(txState);
         Serial.println(ANSI_RESET);
       }
-      doc.clear();
+      doc.clear(); // Free memory used by the JSON document
     }
-    // If no valid fix, skip sending and try again next interval
-  }
 
-  // After LoRa transmission is complete, start beaconing
+  // ┌────────────────────────┐
+  // │ 📱 BLE BEACON CONTROL  │
+  // └────────────────────────┘
+
   if (now - lastSendTime < 1000 && !isBeaconing)
   {
     // Start beaconing immediately after LoRa transmission
     startBeaconing();
   }
 
-  // Stop beaconing after beaconDuration seconds
+  // Stop beaconing after configured duration to save power
   if (isBeaconing && now - beaconStartTime > (config.beaconDuration * 1000))
   {
     stopBeaconing();
   }
 
-  // Declare static lastBeaconTime to track beacon timing
+  // Declare static lastBeaconTime to track beacon timing between loop iterations
   static unsigned long lastBeaconTime = 0;
 
-  // Periodically beacon based on interval
+  // Periodically beacon based on configured interval when not scanning or already beaconing
   if (!isBeaconing && !bleScanning && now - lastBeaconTime > config.beaconInterval)
   {
     startBeaconing();
