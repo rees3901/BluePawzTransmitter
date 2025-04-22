@@ -135,6 +135,10 @@ bool manualTxRequested = false;
 unsigned long manualTxStartTime = 0;
 bool manualTxInProgress = false;
 
+// Add these globals for BLE home detection
+int beaconSeenCount = 0;   // Counter for consecutive beacon detections
+int beaconMissedCount = 0; // Counter for consecutive missed scans
+
 // ──────────────────────────────--
 // 🛠️ SETUP INITIALISATION
 // ──────────────────────────────
@@ -430,10 +434,10 @@ void handleResetConfig(AsyncWebServerRequest *request)
   config.homeLat = 51.87370573411073;
   config.homeLon = -2.2396017778476716;
   config.sendInterval = 60000;
-  config.bleScanInterval = 120000;
-  config.beaconInterval = 120000;
+  config.bleScanInterval = 60000; // 1 minute scan interval
+  config.beaconInterval = 120000; // 2 minutes betwen beaconing
   config.beaconDuration = 3;
-  config.bleSeenThreshold = 3;
+  config.bleSeenThreshold = 2; // Default seen threshold (2 times) this should hopefully mean that if the home beacon is seen 2 or more times  then status should be set to home
   config.bleMissedThreshold = 5;
 
   // Update global variables
@@ -536,10 +540,6 @@ void setupWebServer()
 // ──────────────────────────────
 class BeaconScanner : public BLEAdvertisedDeviceCallbacks
 {
-private:
-  int beaconSeenCount = 0;   // Counter for consecutive beacon detections
-  int beaconMissedCount = 0; // Counter for consecutive missed scans
-
 public:
   void onResult(BLEAdvertisedDevice advertisedDevice) override
   {
@@ -569,6 +569,7 @@ public:
         {
           isHome = true;
           deviceReport += " - HOME DETECTED!";
+          beaconMissedCount = 0; // Reset missed count when arriving home
         }
       }
     }
@@ -585,8 +586,8 @@ public:
     // Use config value for threshold instead of hardcoded value
     if (beaconSeenCount < config.bleSeenThreshold)
     {
-      beaconMissedCount++;
-      Serial.println("[BLE] Home Beacon not seen in this scan. Missed count: " + String(beaconMissedCount));
+
+      Serial.println("[BLE] Home Beacon not seen enough time to be home. Beacon seen count: " + String(beaconSeenCount) + ", Beacon missed count: " + String(beaconMissedCount));
       // Use config value for threshold instead of hardcoded value
       if (beaconMissedCount >= config.bleMissedThreshold)
       {
@@ -1291,6 +1292,16 @@ void loop()
     gpsWake();
     gpsShouldBeAwake = true;
     gpsWakeTime = now;
+    // Start BLE scan as soon as GPS is waking up
+    if (!bleScanning)
+    {
+      colorPrint("[BLE] Starting scan during GPS warmup...");
+      pBLEScan->clearResults();
+      pBLEScan->start(BLE_SCAN_DURATION, false); // Start async scan
+      bleScanning = true;
+      bleScanStartTime = now;
+      lastBleScanTime = now;
+    }
   }
 
   // Only put GPS to sleep after LoRa send
@@ -1343,8 +1354,14 @@ void loop()
       double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);
       double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), config.homeLat, config.homeLon);
       String dir = String((int)bearing) + "-" + cardinalDirection(bearing);
-      doc["lat"] = gps.location.lat();
-      doc["lon"] = gps.location.lng();
+      // Use home coordinates when cat is at home, otherwise use GPS coordinates
+      if (isHome) {
+        doc["lat"] = config.homeLat;  // Using HOME_LAT (from config)
+        doc["lon"] = config.homeLon;  // Using HOME_LON (from config)
+      } else {
+        doc["lat"] = gps.location.lat();
+        doc["lon"] = gps.location.lng();
+      }
       doc["time"] = gps.time.value();
       doc["dist_m"] = dist;
       doc["bearing"] = dir;
@@ -1419,6 +1436,7 @@ void loop()
   }
 
   // 📱 BLE scanning logic (non-blocking)
+  /*
   if (!bleScanning && now - lastBleScanTime > config.bleScanInterval) // Use config value
   {
     // Start a new scan
@@ -1429,6 +1447,7 @@ void loop()
     bleScanStartTime = now;
     lastBleScanTime = now;
   }
+  */
 
   // Check if we need to stop scanning (scan duration elapsed)
   if (bleScanning && now - bleScanStartTime > (BLE_SCAN_DURATION * 1000))
@@ -1467,7 +1486,7 @@ void loop()
   // │    ██║     ██║   ██║██████╔╝███████║   │
   // │    ██║     ██║   ██║██╔══██╗██╔══██║   │
   // │    ███████╗╚██████╔╝██║  ██║██║  ██║   │
-  // │    ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝   │
+  // │    ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   │
   // │                                         │
   // └─────────────────────────────────────────┘
   //
