@@ -7,11 +7,6 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
-#include <BLEAdvertising.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
@@ -138,8 +133,6 @@ SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
 TinyGPSPlus gps;
 SoftwareSerial gpsSerial1(GPS_RX, GPS_TX); // Use HardwareSerial if possible for better reliability
-BLEScan *pBLEScan = nullptr;
-BLEAdvertising *pAdvertising = nullptr;
 
 // Global State Variables
 bool lastButtonState = HIGH;
@@ -147,139 +140,27 @@ bool shouldSaveConfig = false;
 bool gpsIsAwake = true;                // Assume awake initially after setup
 unsigned long gpsWakeLeadTime = 20000; // Reduced lead time (20s) - adjust as needed
 unsigned long lastSendTime = 0;
-unsigned long lastBleScanTime = 0; // Tracks start of last scan
 unsigned long lastStatusPrint = 0;
-bool isHome = false;                              // Assume out initially
-String SearchingForBeaconName = "CAT_TRACKER_HQ"; // Default, loaded from config later
-bool bleScanning = false;
-unsigned long bleScanStartTime = 0;
-const int BLE_SCAN_DURATION = 7; // Scan duration in seconds
-bool isBeaconing = false;
-unsigned long beaconStartTime = 0;
+bool isHome = true;              // Always consider "home" since we removed BLE home detection
+static uint32_t messageId = 0;   // Global message counter for LoRa
 bool manualTxRequested = false;  // Flag for button press request
 bool manualTxInProgress = false; // Flag to indicate manual sequence active
-static uint32_t messageId = 0;   // Global message counter for LoRa
-int beaconMissedCount = 0;       // Counter for consecutive missed beacon detections
 
 // Forward Declarations
 void printStatusReport();
 void colorPrint(const String &message, const char *color = ANSI_RESET);
-void setupBLEAdvertising();
-void startBeaconing();
-void stopBeaconing();
 void gpsWake();
 void gpsSleep();
 String cardinalDirection(double bearing);
 void handleManualTransmit();
 void handleRegularTransmit();
 void processGps();
-void checkBleScanComplete();
 void checkButton();
-void checkBeaconStop();
 void periodicStatusUpdate();
 void loadDefaultConfig();
 void setupConfig();
-
-// Forward declare the scanner callback class
-class BeaconScanner;
-static BeaconScanner *beaconScanner = nullptr;
-
-// ──────────────────────────────
-// 📡 BLE SCANNER CALLBACK CLASS (Modified from previous response)
-// ──────────────────────────────
-class BeaconScanner : public BLEAdvertisedDeviceCallbacks
-{
-private:
-  int seenCountThisScan = 0; // Counter for target beacon within the current scan
-
-public:
-  // Reset counter at the start of a scan
-  void resetScanCounter()
-  {
-    seenCountThisScan = 0;
-  }
-
-  void onResult(BLEAdvertisedDevice advertisedDevice) override
-  {
-    // Check specifically for the target beacon
-    if (advertisedDevice.haveName())
-    {
-      String advName = advertisedDevice.getName().c_str();
-      if (advName == SearchingForBeaconName)
-      {
-        seenCountThisScan++; // Increment count for this specific scan
-        // Log finding the target beacon immediately (optional)
-        // Serial.println("[BLE] Found Target Beacon: \"" + advName + "\" RSSI: " + String(advertisedDevice.getRSSI()) + "dBm. Count this scan: " + String(seenCountThisScan));
-      }
-    }
-    // Optional: Log every device found
-    // String deviceReport = "[BLE] Device: ";
-    // deviceReport += advertisedDevice.getAddress().toString().c_str();
-    // if (advertisedDevice.haveName()) { deviceReport += " Name: \"" + String(advertisedDevice.getName().c_str()) + "\""; }
-    // deviceReport += " RSSI: " + String(advertisedDevice.getRSSI()) + "dBm";
-    // Serial.println(deviceReport);
-  }
-
-  // This method processes the results *after* the scan duration is complete
-  void onScanComplete(BLEScanResults scanResults)
-  {
-    // Use the count accumulated during this scan (seenCountThisScan)
-    if (seenCountThisScan > 0)
-    {
-      // Target beacon was seen at least once this scan
-      beaconMissedCount = 0; // Reset consecutive missed count
-
-      // Now check if the number of times seen *in this scan* meets the threshold
-      if (seenCountThisScan >= config["bleSeenThreshold"].as<int>())
-      {
-        if (!isHome)
-        {
-          colorPrint("[BLE] Home beacon seen >= threshold (" + String(config["bleSeenThreshold"].as<int>()) + ") this scan. Count: " + String(seenCountThisScan) + ". Setting status to HOME", ANSI_GREEN);
-          isHome = true;
-        }
-        else
-        {
-          // Already home, just confirm
-          Serial.println("[BLE] Home beacon seen >= threshold (" + String(config["bleSeenThreshold"].as<int>()) + ") this scan. Count: " + String(seenCountThisScan) + ". Status remains HOME.");
-        }
-      }
-      else
-      {
-        // Seen this scan, but not enough times to meet threshold
-        // Status doesn't change to home based on this scan alone.
-        // If currently isHome, it remains home until missed threshold is hit.
-        Serial.println("[BLE] Home beacon seen this scan (" + String(seenCountThisScan) + "), but below threshold (" + String(config["bleSeenThreshold"].as<int>()) + "). Status unchanged.");
-      }
-    }
-    else
-    {
-      // Target beacon was NOT seen at all in this scan interval
-      beaconMissedCount++; // Increment consecutive missed counter
-      Serial.println("[BLE] Home beacon NOT seen this scan. Consecutive missed count: " + String(beaconMissedCount));
-
-      if (beaconMissedCount >= config["bleMissedThreshold"].as<int>())
-      {
-        if (isHome)
-        {
-          colorPrint("[BLE] Home beacon missed threshold (" + String(config["bleMissedThreshold"].as<int>()) + ") reached. Setting status to OUT", ANSI_YELLOW);
-          isHome = false;
-        }
-        else
-        {
-          // Already out, just confirm
-          // Serial.println("[BLE] Home beacon missed threshold (" + String(config["bleMissedThreshold"].as<int>()) + ") reached. Status remains OUT.");
-        }
-      }
-    }
-
-    // Reset the counter for the *next* scan
-    resetScanCounter();
-  }
-};
-
-// ... (Include setup(), printStatusReport(), colorPrint(), GPS/BLE/LoRa helpers, WebServer handlers, Config save/load etc. from your original file here)
-// Ensure all necessary functions like setupWebServer, saveConfigToEEPROM, loadConfigFromEEPROM, startConfigPortal,
-// cardinalDirection, setupBLEAdvertising, startBeaconing, stopBeaconing, gpsWake, gpsSleep are defined.
+void transmitLora(JsonDocument &doc);
+void buildJsonPayload(JsonDocument &doc);
 
 // Placeholder for setup() - ensure it initializes everything correctly
 void setup()
@@ -302,8 +183,6 @@ void setup()
 
   // Load default configuration from JSON
   loadDefaultConfig();
-  // Apply common settings
-  SearchingForBeaconName = "CAT_TRACKER_HQ";
 
   // GPS Init
   gpsSerial1.begin(GPS_BAUD);
@@ -361,18 +240,6 @@ void setup()
                ", Preamble=" + String(config["loraPreamble"].as<int>()));
   }
 
-  // BLE Init
-  colorPrint("[INIT] Starting BLE setup...");
-  BLEDevice::init(config["senderId"].as<String>()); // Use sender ID as device name
-  pBLEScan = BLEDevice::getScan();
-  beaconScanner = new BeaconScanner(); // Create scanner instance
-  pBLEScan->setAdvertisedDeviceCallbacks(beaconScanner);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->setInterval(100); // Scan interval
-  pBLEScan->setWindow(99);    // Scan window
-  colorPrint("[OK] BLE scanner ready");
-  setupBLEAdvertising(); // Setup advertising for beaconing mode
-
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
   colorPrint("🚀 SETUP COMPLETE - READY TO TRACK 🐱", ANSI_BOLD);
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
@@ -393,8 +260,6 @@ void loop()
   // --- Core Tasks ---
   checkButton();          // Handle button press for status/manual TX
   processGps();           // Process incoming GPS data if awake
-  checkBleScanComplete(); // Check if BLE scan duration is over
-  checkBeaconStop();      // Check if beaconing duration is over
   periodicStatusUpdate(); // Print status periodically
 
   // --- State Machine Logic ---
@@ -418,40 +283,6 @@ void loop()
 
     // Wake GPS
     gpsWake(); // Function handles the check if already awake
-
-    // Start BLE Scan
-    if (!bleScanning)
-    {
-      colorPrint("[BLE] Starting scan during GPS warmup...", ANSI_BLUE);
-      if (beaconScanner != nullptr)
-      {
-        beaconScanner->resetScanCounter(); // Reset counter for this specific scan
-      }
-      else
-      {
-        colorPrint("[ERROR] BeaconScanner instance is null!", ANSI_RED);
-        // Attempt to recover - this shouldn't happen if setup is correct
-        beaconScanner = new BeaconScanner();
-        pBLEScan->setAdvertisedDeviceCallbacks(beaconScanner);
-      }
-      pBLEScan->clearResults(); // Clear previous results
-      // Start scan asynchronously, false means don't block
-      if (pBLEScan->start(BLE_SCAN_DURATION, false))
-      { // Check if scan started successfully
-        bleScanning = true;
-        bleScanStartTime = now;
-        lastBleScanTime = now; // Record scan start time
-      }
-      else
-      {
-        colorPrint("[BLE] Failed to start scan!", ANSI_RED);
-        preparingToSend = false; // Abort preparation if scan fails
-      }
-    }
-    else
-    {
-      colorPrint("[WARN] Tried to start scan, but already scanning.", ANSI_YELLOW);
-    }
   }
 
   // 3. Regular Send Cycle Execution Trigger
@@ -518,43 +349,6 @@ void processGps()
   }
 }
 
-// --- Check BLE Scan Completion ---
-void checkBleScanComplete()
-{
-  if (bleScanning && (millis() - bleScanStartTime >= (BLE_SCAN_DURATION * 1000)))
-  {
-    colorPrint("[BLE] Scan complete.", ANSI_BLUE);
-    // Stop the scan explicitly if it's still running (async might not stop itself)
-    // Note: Calling stop() might trigger callbacks immediately if not already done.
-    // pBLEScan->stop(); // Let's see if it stops automatically first.
-
-    BLEScanResults results = pBLEScan->getResults(); // Get results
-    colorPrint("[BLE] Found " + String(results.getCount()) + " devices.", ANSI_BLUE);
-
-    // Call onScanComplete on our instance to process results and update isHome
-    if (beaconScanner != nullptr)
-    {
-      beaconScanner->onScanComplete(results); // This updates isHome
-    }
-    else
-    {
-      colorPrint("[ERROR] BeaconScanner instance is null during scan completion!", ANSI_RED);
-    }
-
-    bleScanning = false;      // Mark scan as done
-    pBLEScan->clearResults(); // Free memory
-  }
-}
-
-// --- Stop Beaconing After Duration ---
-void checkBeaconStop()
-{
-  if (isBeaconing && (millis() - beaconStartTime > (config["beaconDuration"].as<int>() * 1000)))
-  {
-    stopBeaconing();
-  }
-}
-
 // --- Periodic Status Update ---
 void periodicStatusUpdate()
 {
@@ -576,8 +370,6 @@ void periodicStatusUpdate()
     }
     Serial.print(" | Home: ");
     Serial.print(isHome ? "YES" : "NO");
-    Serial.print(" | BLE: ");
-    Serial.print(bleScanning ? "Scanning" : (isBeaconing ? "Beaconing" : "Idle"));
     Serial.print(" | Heap: ");
     Serial.print(ESP.getFreeHeap());
     Serial.println();
@@ -714,7 +506,7 @@ void handleManualTransmit()
     double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(),
                                                config["homeLat"].as<double>(), config["homeLon"].as<double>());
     double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(),
-                                           config["homeLat"].as<double>(), config["homeLon"].as<double>());
+                                           config["homeLat"].as<double>());
     doc["dist_m"] = dist;
     doc["bearing"] = String((int)bearing) + "-" + cardinalDirection(bearing);
   }
@@ -733,7 +525,6 @@ void handleManualTransmit()
   // 4. Post-Manual-Transmission Actions
   lastSendTime = now; // IMPORTANT: Update last send time to reset regular interval timer
   // GPS sleep decision is handled by the main loop's idle state logic
-  startBeaconing(); // Start beaconing after manual send
 
   // 5. Reset manual flags
   manualTxRequested = false;
@@ -748,7 +539,6 @@ void handleRegularTransmit()
   colorPrint("[CYCLE] Send interval reached. Executing transmit...", ANSI_MAGENTA);
 
   // Note: GPS should have been woken up earlier in the 'preparingToSend' phase.
-  // BLE scan should also have been started and potentially completed.
 
   // 1. Check GPS Fix (it had time to warm up)
   if (gpsIsAwake && !gps.location.isValid())
@@ -771,7 +561,6 @@ void handleRegularTransmit()
   // 4. Post-Transmission Actions
   lastSendTime = now; // IMPORTANT: Update last send time *after* transmission attempt
   // GPS sleep decision is handled by the main loop's idle state logic
-  startBeaconing(); // Start BLE beaconing
 
   colorPrint("[CYCLE] Regular transmit sequence complete.", ANSI_MAGENTA);
 }
@@ -817,11 +606,6 @@ void printStatusReport()
   Serial.println(gps.satellites.value());
   Serial.print("  Is Home: ");
   Serial.println(isHome ? "Yes" : "No");
-  Serial.print("  BLE State: ");
-  Serial.println(bleScanning ? "Scanning" : (isBeaconing ? "Beaconing" : "Idle"));
-  Serial.print("  Last Send: ");
-  Serial.print((millis() - lastSendTime) / 1000);
-  Serial.println("s ago");
   Serial.print("  Free Heap: ");
   Serial.println(ESP.getFreeHeap());
   Serial.println("-------------------------------------------------------");
@@ -832,72 +616,6 @@ void colorPrint(const String &message, const char *color)
   Serial.print(color);
   Serial.println(message);
   Serial.print(ANSI_RESET);
-}
-
-void setupBLEAdvertising()
-{
-  colorPrint("[INIT] Setting up BLE advertising...");
-  pAdvertising = BLEDevice::getAdvertising();
-
-  BLEAdvertisementData advData;
-  // Use config senderId from JSON
-  advData.setName(config["senderId"].as<String>());
-  advData.setFlags(0x06); // BR_EDR_NOT_SUPPORTED | LE General Discoverable Mode
-
-  BLEAdvertisementData scanResponseData; // Optional scan response
-  scanResponseData.setName(config["senderId"].as<String>());
-
-  pAdvertising->setAdvertisementData(advData);
-  pAdvertising->setScanResponseData(scanResponseData); // Set scan response
-
-  // Advertising parameters (adjust for power/discovery balance)
-  pAdvertising->setMinInterval(0x100); // e.g., 256ms interval min (160 * 0.625ms)
-  pAdvertising->setMaxInterval(0x200); // e.g., 512ms interval max (320 * 0.625ms)
-  // pAdvertising->setAdvertisementType(ADV_TYPE_IND); // General undirected advertising
-
-  colorPrint("[OK] BLE advertising setup complete for name: " + config["senderId"].as<String>());
-}
-
-void startBeaconing()
-{
-  if (!isBeaconing && pAdvertising != nullptr)
-  {
-    // Ensure advertising name is up-to-date from config
-    BLEAdvertisementData advData;
-    advData.setName(config["senderId"].as<String>());
-    advData.setFlags(0x06);
-    pAdvertising->setAdvertisementData(advData);
-    // Also update scan response if used
-    BLEAdvertisementData scanResponseData;
-    scanResponseData.setName(config["senderId"].as<String>());
-    pAdvertising->setScanResponseData(scanResponseData);
-
-    colorPrint("[BLE] Starting to beacon as '" + String(config["senderId"].as<String>()) +
-                   "' for " + String(config["beaconDuration"].as<int>()) + "s",
-               ANSI_BLUE);
-    pAdvertising->start();
-    isBeaconing = true;
-    beaconStartTime = millis();
-  }
-  else if (isBeaconing)
-  {
-    // Already beaconing, maybe reset timer? Or just ignore.
-    // colorPrint("[BLE] Already beaconing.", ANSI_BLUE);
-  }
-  else
-  {
-    colorPrint("[ERROR] Cannot start beaconing, pAdvertising is null!", ANSI_RED);
-  }
-}
-
-void stopBeaconing()
-{
-  if (isBeaconing && pAdvertising != nullptr)
-  {
-    pAdvertising->stop();
-    isBeaconing = false;
-    colorPrint("[BLE] Stopped beaconing", ANSI_BLUE);
-  }
 }
 
 void gpsWake()
