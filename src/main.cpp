@@ -8,9 +8,9 @@
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
-#include <SoftwareSerial.h>
 #include <esp_sleep.h>   // Include ESP sleep library
 #include <ArduinoJson.h> // <-- Add ArduinoJson library
+#include <stdio.h>       // <-- Add for sprintf
 
 // Define LED_BUILTIN if not already defined (common for ESP32)
 #ifndef LED_BUILTIN
@@ -37,7 +37,10 @@
 #define STATUS_BUTTON_PIN GPIO_NUM_21 // Use GPIO_NUM_x for sleep functions
 
 // Hardcoded Configuration Values (Replaces JSON config)
-#define SENDER_ID "Gizmo"
+// #define SENDER_ID "Podge"
+#define SENDER_ID "Macy"
+// #define SENDER_ID "Simba"
+// #define SENDER_ID "Gizmo"
 #define HOME_LAT 51.87370573411073
 #define HOME_LON -2.2396017778476716
 // #define SEND_INTERVAL 60000 // milliseconds (60 seconds) - Commented out, using sleep timer
@@ -46,7 +49,7 @@
 // ┌─────────────────┐
 // │ Sleep Settings  │
 // └─────────────────┘
-#define SLEEP_DURATION_US (60 * 1000000ULL) // 1  minute in microseconds
+#define SLEEP_DURATION_US (120 * 1000000ULL) // 2mins  in microseconds
 
 // ANSI Color Codes
 #define ANSI_RED "\033[31m"
@@ -71,11 +74,11 @@
 SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
 TinyGPSPlus gps;
-SoftwareSerial gpsSerial1(GPS_RX, GPS_TX); // Use HardwareSerial if possible for better reliability
+HardwareSerial gpsSerial(1); // <-- Add this line (Use UART1)
 
 // Global State Variables
 bool gpsIsAwake = true;                // Assume awake initially after setup
-unsigned long gpsWakeLeadTime = 30000; // Time to wait for GPS fix after wake (30s)
+unsigned long gpsWakeLeadTime = 60000; // Time to wait for GPS fix after wake (60s)
 // unsigned long lastSendTime = 0; // No longer needed for interval timing
 unsigned long lastStatusPrint = 0;
 static uint32_t messageId = 0; // Global message counter for LoRa
@@ -113,9 +116,11 @@ void ledFlicker(); // <-- Add forward declaration
 void setup()
 {
   Serial.begin(115200);
-  delay(50); // Wait for serial monitor
+  delay(3000);                                                                    // Wait for serial monitor
+  Serial.println("\n[BOOT] Serial connection delay complete. Starting setup..."); // Added this line
+  delay(200);                                                                     // Give some time for the serial monitor to open
   colorPrint("[BOOT] Initialising CAT TRACKER TX v2 (Sleep Enabled)...");
-
+  delay(200); // Give some time for the serial monitor to open
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   pinMode(48, OUTPUT); // Status LED
@@ -130,10 +135,33 @@ void setup()
   digitalWrite(GPS_SLEEP_WAKE, HIGH); // Start with GPS awake
   gpsIsAwake = true;
 
-  // --- GPS Init ---
-  gpsSerial1.begin(GPS_BAUD);
+  // --- GPS Init ---\
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX); // Initialize HardwareSerial
   delay(100);
-  colorPrint("[GPS] Warming up GPS...");
+  colorPrint("[GPS] Waking up GPS module(60s) for initial setup...");
+  gpsWake(); // Ensure GPS is awake (sets pin HIGH, re-initializes gpsSerial)
+
+  // --- Add check for GPS serial activity ---
+  colorPrint("[GPS] Checking for initial serial activity...", ANSI_YELLOW);
+  delay(1000); // Wait 1 second for GPS to start sending data
+
+  if (gpsSerial.available() > 0)
+  {
+    colorPrint("[GPS] Serial data detected! Module appears awake. ✔ ", ANSI_BRIGHT_GREEN);
+    // Optionally read and discard initial potentially garbled data
+    while (gpsSerial.available() > 0)
+    {
+      gpsSerial.read();
+    }
+  }
+  else
+  {
+    colorPrint("[GPS] No serial data detected after 1s. Check wiring/power.", ANSI_BRIGHT_RED);
+    // Consider halting or adding more robust error handling here if needed
+  }
+  // --- End check ---
+
+  colorPrint("[GPS] Warming up GPS (waiting for fix)..."); // Proceed with warmup/fix attempt
   unsigned long gpsWarmupStart = millis();
   bool fixFound = false;
   while (millis() - gpsWarmupStart < 60000 && !fixFound)
@@ -164,7 +192,7 @@ void setup()
   // --- LoRa Init ---
   pinMode(LORA_DIO1, INPUT); // Set DIO1 pin as input for interrupt
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
-  colorPrint("[INIT] SPI for LoRa initialised");
+  colorPrint("[INIT] setting up SPI for LoRa ...");
   int initState = lora.begin(915.0); // Use appropriate frequency
   if (initState != RADIOLIB_ERR_NONE)
   {
@@ -210,6 +238,7 @@ void setup()
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void loop()
 {
+  Serial.begin(115200);
   // --- Code execution resumes here after wake-up ---
   colorPrint("\n☀️ Woke up!", ANSI_BRIGHT_YELLOW);
 
@@ -390,9 +419,9 @@ void processGps()
   // static unsigned long lastGpsDataTime = 0; // Keep for diagnostics if needed
   if (gpsIsAwake)
   {
-    while (gpsSerial1.available() > 0)
+    while (gpsSerial.available() > 0) // <-- Change gpsSerial1 to gpsSerial
     {
-      gps.encode(gpsSerial1.read());
+      gps.encode(gpsSerial.read()); // <-- Change gpsSerial1 to gpsSerial
       // We check gps.location.isValid() where needed, encode handles sentence processing.
       // lastGpsDataTime = millis(); // Update timestamp if diagnostics are re-enabled
     }
@@ -439,7 +468,23 @@ String buildJsonPayload()
   doc["msg_id"] = messageId; // Note: messageId incremented in sendLoraPacket
   doc["device_id"] = 4;
   doc["id"] = SENDER_ID;
-  doc["time"] = gps.time.isValid() ? gps.time.value() : 0;
+
+  // --- Format Timestamp ---
+  if (gps.date.isValid() && gps.time.isValid())
+  {
+    char isoTimestamp[25]; // Buffer for "YYYY-MM-DDTHH:MM:SSZ" + null terminator
+    snprintf(isoTimestamp, sizeof(isoTimestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+    doc["time"] = isoTimestamp; // Use the formatted UTC timestamp
+    colorPrint(String("[JSON] Timestamp: ") + isoTimestamp, ANSI_CYAN);
+  }
+  else
+  {
+    doc["time"] = nullptr; // Use null for invalid time
+    colorPrint("[JSON] Timestamp: Invalid", ANSI_RED);
+  }
+
   doc["satellite_Count"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
 
   bool locationValid = gps.location.isValid();
@@ -636,16 +681,25 @@ void gpsWake()
   if (!gpsIsAwake)
   {
     digitalWrite(GPS_SLEEP_WAKE, HIGH);
-    colorPrint("[GPS] Waking up GPS module...", ANSI_YELLOW);
+    colorPrint("[GPS] Setting wake pin HIGH...", ANSI_YELLOW); // More specific message
     gpsIsAwake = true;
-    // Add a small delay for the module to stabilize after wake-up
+    // Add a small delay for the module to stabilize after wake-up pin change
     delay(100);
-    // Re-initialize serial connection? Usually not needed after light sleep, but test.
-    // gpsSerial1.begin(GPS_BAUD); // Uncomment if GPS communication fails after wake
+    // Re-initialize HardwareSerial with pins after light sleep or initial power-on
+    colorPrint("[GPS] Initializing HardwareSerial for GPS...", ANSI_YELLOW); // More specific message
+    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+    delay(50); // Short delay after begin
   }
   else
   {
     colorPrint("[GPS] Already awake.", ANSI_YELLOW);
+    // Ensure serial is initialized even if already awake (in case setup() calls it)
+    if (!gpsSerial)
+    { // Check if serial is not initialized
+      colorPrint("[GPS] Re-initializing HardwareSerial (was not active)...", ANSI_YELLOW);
+      gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+      delay(50);
+    }
   }
 }
 
@@ -655,6 +709,8 @@ void gpsSleep()
   {
     // Before sleeping, ensure any pending serial data is sent (optional but good practice)
     Serial.flush();
+    gpsSerial.end(); // <-- Add this line to properly end HardwareSerial
+
     digitalWrite(GPS_SLEEP_WAKE, LOW);
     colorPrint("[GPS] Putting GPS module to sleep 😴", ANSI_YELLOW);
     gpsIsAwake = false;
