@@ -1,12 +1,11 @@
 /*
   ┌──────────────────────────────────────────────┐
   │ 🐾 CAT TRACKER TX — LoRa GPS Collar           │
-  │ 📡 SX1262 + TinyGPSPlus + BLE home detection  │
+  │ 📡 SX1262 + TinyGPSPlus                       │ // <-- Removed BLE reference
   └──────────────────────────────────────────────┘
 */
 
 #include <Arduino.h>
-#include <ArduinoJson.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
@@ -29,11 +28,19 @@
 #define GPS_RX 44        // D7 = GPIO 44
 #define GPS_TX 43        // D6 = GPIO 43
 #define GPS_BAUD 9600    // Baud rate for GPS module
-#define GPS_SLEEP_WAKE 1 // D0 = GPIO 1 (Wake pin for GPS module)
-#define GPS_RESET 21     // D10 = GPIO 21 (Reset pin for GPS module)
+#define GPS_SLEEP_WAKE 1 // d0 = GPIO 1  - used for sleep/wake control
+#define GPS_RESET 9      // D10 = GPIO 9
 
 // Button pin for status report
-#define STATUS_BUTTON_PIN 21 // Note: Same as GPS_RESET, ensure this is intended
+#define STATUS_BUTTON_PIN 21 //
+
+// Hardcoded Configuration Values (Replaces JSON config)
+#define SENDER_ID "Gizmo"
+#define HOME_LAT 51.87370573411073
+#define HOME_LON -2.2396017778476716
+#define SEND_INTERVAL 60000 // milliseconds (60 seconds)
+#define LORA_POWER 18       // dBm
+#define LORA_PREAMBLE 8
 
 // ANSI Color Codes
 #define ANSI_RED "\033[31m"
@@ -54,80 +61,6 @@
 #define ANSI_BOLD "\033[1m"
 #define ANSI_RESET "\033[0m"
 
-// Configuration Structure
-// Configuration Structure using ArduinoJson
-#define CONFIG_VERSION "1.0"         // Version for config validation and defaults
-const size_t CONFIG_JSON_SIZE = 512; // Size for the JSON document
-
-// Default configuration as JSON
-const char *defaultConfigJson = R"({
-  "configVersion": "1.0",
-  "senderId": "Gizmo",
-  "homeLat": 51.87370573411073,
-  "homeLon": -2.2396017778476716,
-  "sendInterval": 60000,
-  "bleScanInterval": 120000,
-  "beaconInterval": 120000,
-  "beaconDuration": 3,
-  "bleSeenThreshold": 3,
-  "bleMissedThreshold": 5,
-  "mode": "normal",
-  "loraPower": 18,
-  "loraPreamble": 8
-})";
-
-// Configuration object
-StaticJsonDocument<CONFIG_JSON_SIZE> configJson;
-
-// Helper function prototypes for configuration
-void loadDefaultConfig();
-bool loadConfigFromEEPROM();
-void saveConfigToEEPROM();
-
-// Default configuration
-// Initialize configuration JSON document
-StaticJsonDocument<CONFIG_JSON_SIZE> config;
-
-// Function to load default configuration
-void loadDefaultConfig()
-{
-  deserializeJson(config, defaultConfigJson);
-
-  // Verify the key fields were loaded correctly
-  if (!config.containsKey("senderId") || !config.containsKey("homeLat"))
-  {
-    colorPrint("[CONFIG] Error loading defaults, applying hardcoded values", ANSI_RED);
-    // Apply critical defaults as a fallback
-    config["configVersion"] = CONFIG_VERSION;
-    config["senderId"] = "Gizmo";
-    config["homeLat"] = 51.87370573411073;
-    config["homeLon"] = -2.2396017778476716;
-    config["sendInterval"] = 60000;
-    config["bleScanInterval"] = 120000;
-    config["beaconInterval"] = 120000;
-    config["beaconDuration"] = 3;
-    config["bleSeenThreshold"] = 3;
-    config["bleMissedThreshold"] = 5;
-    config["mode"] = "normal";
-    config["loraPower"] = 18;
-    config["loraPreamble"] = 8;
-  }
-
-  colorPrint("[CONFIG] Default configuration loaded", ANSI_GREEN);
-}
-
-// Initialize with defaults on first run
-void setupConfig()
-{
-  loadDefaultConfig();
-  // Note: You can call loadConfigFromEEPROM() here if needed
-}
-
-// Define old globals as references to config values for backward compatibility
-#define SENDER_ID (config.senderId)
-#define HOME_LAT (config.homeLat)
-#define HOME_LON (config.homeLon)
-
 // Hardware Instances
 SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
@@ -136,12 +69,11 @@ SoftwareSerial gpsSerial1(GPS_RX, GPS_TX); // Use HardwareSerial if possible for
 
 // Global State Variables
 bool lastButtonState = HIGH;
-bool shouldSaveConfig = false;
 bool gpsIsAwake = true;                // Assume awake initially after setup
 unsigned long gpsWakeLeadTime = 20000; // Reduced lead time (20s) - adjust as needed
 unsigned long lastSendTime = 0;
 unsigned long lastStatusPrint = 0;
-bool isHome = true;              // Always consider "home" since we removed BLE home detection
+// bool isHome = true;              // Always consider "home" (BLE functionality removed)
 static uint32_t messageId = 0;   // Global message counter for LoRa
 bool manualTxRequested = false;  // Flag for button press request
 bool manualTxInProgress = false; // Flag to indicate manual sequence active
@@ -157,12 +89,19 @@ void handleRegularTransmit();
 void processGps();
 void checkButton();
 void periodicStatusUpdate();
-void loadDefaultConfig();
-void setupConfig();
-void transmitLora(JsonDocument &doc);
-void buildJsonPayload(JsonDocument &doc);
+void transmitLora(String payload); // Changed signature
+String buildJsonPayload();         // Changed signature
+void sendLoraPacket(bool isManual);
 
-// Placeholder for setup() - ensure it initializes everything correctly
+// ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+// █                                                                              █
+// █   ███████ ███████ ████████ ██    ██ ██████      ██████  ██    ██ ███    ██  █
+// █   ██      ██         ██    ██    ██ ██   ██     ██   ██ ██    ██ ████   ██  █
+// █   ███████ █████      ██    ██    ██ ██████      ██████  ██    ██ ██ ██  ██  █
+// █        ██ ██         ██    ██    ██ ██          ██   ██ ██    ██ ██  ██ ██  █
+// █   ███████ ███████    ██     ██████  ██          ██    ██  ██████  ██   ████  █
+// █                                                                              █
+// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void setup()
 {
   Serial.begin(115200);
@@ -172,7 +111,7 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   pinMode(48, OUTPUT); // Status LED
-  pinMode(STATUS_BUTTON_PIN, INPUT_PULLUP);
+  // pinMode(STATUS_BUTTON_PIN, INPUT_PULLUP);
 
   // GPS Pin Setup
   pinMode(GPS_RESET, OUTPUT);
@@ -180,9 +119,6 @@ void setup()
   pinMode(GPS_SLEEP_WAKE, OUTPUT);
   digitalWrite(GPS_SLEEP_WAKE, HIGH); // Start with GPS awake
   gpsIsAwake = true;
-
-  // Load default configuration from JSON
-  loadDefaultConfig();
 
   // GPS Init
   gpsSerial1.begin(GPS_BAUD);
@@ -211,7 +147,7 @@ void setup()
   }
   if (!fixFound)
   {
-    colorPrint("[GPS] Warmup Expired without Getting fix.", ANSI_YELLOW);
+    colorPrint("[GPS] Warmup Expired without Getting fix.", ANSI_RED);
   }
   else
   {
@@ -229,15 +165,15 @@ void setup()
   else
   {
     colorPrint("[OK] LoRa initialised successfully");
-    // Apply LoRa parameters from config
-    lora.setOutputPower(config["loraPower"].as<int>());
-    lora.setSpreadingFactor(8); // Example, adjust if needed
-    lora.setBandwidth(250.0);   // Example, adjust if needed
-    lora.setCodingRate(5);      // Example, adjust if needed
-    lora.setCRC(true);
-    lora.setPreambleLength(config["loraPreamble"].as<int>());
-    colorPrint("[INIT] LoRa Params configured: Power=" + String(config["loraPower"].as<int>()) +
-               ", Preamble=" + String(config["loraPreamble"].as<int>()));
+    // Apply LoRa parameters from hardcoded values
+    lora.setOutputPower(LORA_POWER);       // Use defined constant
+    lora.setSpreadingFactor(8);            // Sets the spreading factor to 8 (default)
+    lora.setBandwidth(250.0);              // sets the bandwidth to 250 kHz (default)
+    lora.setCodingRate(5);                 // sets the coding rate to 4/5 (default)
+    lora.setCRC(true);                     // sets the CRC to true (default)
+    lora.setPreambleLength(LORA_PREAMBLE); // Use defined constant
+    colorPrint("[INIT] LoRa Params configured: Power=" + String(LORA_POWER) +
+               ", Preamble=" + String(LORA_PREAMBLE)); // Use defined constants
   }
 
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
@@ -245,14 +181,18 @@ void setup()
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
 
   // Set initial lastSendTime to allow first send after interval
-  lastSendTime = millis() - config["sendInterval"].as<unsigned long>() + 5000; // Allow first send soon
+  lastSendTime = millis() - SEND_INTERVAL + 5000; // Use defined constant
 }
 
-// ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-// █                                                          █
-// █                         MAIN LOOP                        █
-// █                                                          █
-// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+// ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+// █                                                                              █
+// █   ███    ███  █████  ██ ███    ██     ██       ██████   ██████  ██████      █
+// █   ████  ████ ██   ██ ██ ████   ██     ██      ██    ██ ██    ██ ██   ██     █
+// █   ██ ████ ██ ███████ ██ ██ ██  ██     ██      ██    ██ ██    ██ ██████      █
+// █   ██  ██  ██ ██   ██ ██ ██  ██ ██     ██      ██    ██ ██    ██ ██          █
+// █   ██      ██ ██   ██ ██ ██   ████     ███████  ██████   ██████  ██          █
+// █                                                                              █
+// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void loop()
 {
   unsigned long now = millis();
@@ -276,7 +216,7 @@ void loop()
 
   // 2. Regular Send Cycle Preparation Trigger
   // Check if it's time to START preparing for the next send
-  if (!preparingToSend && (now >= lastSendTime + config["sendInterval"].as<unsigned long>() - gpsWakeLeadTime))
+  if (!preparingToSend && (now >= lastSendTime + SEND_INTERVAL - gpsWakeLeadTime)) // Use defined constant
   {
     colorPrint("[CYCLE] Preparing for next send...", ANSI_CYAN);
     preparingToSend = true;
@@ -287,7 +227,7 @@ void loop()
 
   // 3. Regular Send Cycle Execution Trigger
   // Check if the preparation phase is active AND the actual send interval has passed
-  if (preparingToSend && (now >= lastSendTime + config["sendInterval"].as<unsigned long>()))
+  if (preparingToSend && (now >= lastSendTime + SEND_INTERVAL)) // Use defined constant
   {
     handleRegularTransmit(); // Execute the regular transmit sequence
     preparingToSend = false; // End the preparation/send cycle state
@@ -369,7 +309,7 @@ void periodicStatusUpdate()
       Serial.print(gps.satellites.value());
     }
     Serial.print(" | Home: ");
-    Serial.print(isHome ? "YES" : "NO");
+    // Serial.print(isHome ? "YES" : "NO");
     Serial.print(" | Heap: ");
     Serial.print(ESP.getFreeHeap());
     Serial.println();
@@ -378,13 +318,16 @@ void periodicStatusUpdate()
 }
 
 // --- Build JSON Payload (Common Logic) ---
-void buildJsonPayload(JsonDocument &doc)
+// Update signature to return String, remove ArduinoJson dependency
+String buildJsonPayload()
 {
-  doc["msg_id"] = messageId++; // Increment global message counter
-  doc["device_id"] = 4;        // Assuming this is fixed
-  doc["id"] = config["senderId"].as<String>();
-  doc["time"] = gps.time.isValid() ? gps.time.value() : 0; // Use GPS time if valid
-  doc["satellite_Count"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  // Manual JSON string construction
+  String payload = "{";
+  payload += "\"msg_id\":" + String(messageId++) + ",";                             // Increment global message counter
+  payload += "\"device_id\":4,";                                                    // Assuming this is fixed
+  payload += "\"id\":\"" + String(SENDER_ID) + "\",";                               // Use defined constant
+  payload += "\"time\":" + String(gps.time.isValid() ? gps.time.value() : 0) + ","; // Use GPS time if valid
+  payload += "\"satellite_Count\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + ",";
 
   bool locationValid = gps.location.isValid();
   double currentLat = locationValid ? gps.location.lat() : 0.0;
@@ -392,51 +335,50 @@ void buildJsonPayload(JsonDocument &doc)
   double dist = 0.0;
   String bearingStr = "N/A";
 
-  if (isHome)
+  // Status depends on GPS validity
+  if (locationValid)
   {
-    colorPrint("[JSON] Status: Home. Using home coordinates.", ANSI_GREEN);
-    doc["status"] = "home";
-    doc["lat"] = config["homeLat"].as<double>();
-    doc["lon"] = config["homeLon"].as<double>();
-    doc["dist_m"] = 0.0;
-    doc["bearing"] = "N/A";
+    colorPrint("[JSON] Status: Out. Using GPS coordinates.", ANSI_YELLOW);
+    payload += "\"status\":\"outanabout\",";
+    payload += "\"lat\":" + String(currentLat, 6) + ",";
+    payload += "\"lon\":" + String(currentLon, 6) + ",";
+    dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);    // Use defined constants
+    double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON); // Use defined constants
+    bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
+    payload += "\"dist_m\":" + String(dist, 2) + ",";
+    payload += "\"bearing\":\"" + bearingStr + "\"";
   }
   else
   {
-    // Status depends on GPS validity when not home
-    if (locationValid)
-    {
-      colorPrint("[JSON] Status: Out. Using GPS coordinates.", ANSI_YELLOW);
-      doc["status"] = "outanabout";
-      doc["lat"] = currentLat;
-      doc["lon"] = currentLon;
-      dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, config["homeLat"].as<double>(), config["homeLon"].as<double>());
-      double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, config["homeLat"].as<double>(), config["homeLon"].as<double>());
-      bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
-      doc["dist_m"] = dist;
-      doc["bearing"] = bearingStr;
-    }
-    else
-    {
-      colorPrint("[JSON] Status: Out but GPS fix INVALID. Sending error status.", ANSI_YELLOW);
-      doc["status"] = "error"; // No valid GPS fix while out
-      doc["lat"] = 0.0;
-      doc["lon"] = 0.0;
-      doc["dist_m"] = 0.0;
-      doc["bearing"] = "N/A";
-    }
+    colorPrint("[JSON] Status: Out but GPS fix INVALID. Sending error status.", ANSI_YELLOW);
+    payload += "\"status\":\"error\","; // No valid GPS fix while out
+    payload += "\"lat\":0.0,";
+    payload += "\"lon\":0.0,";
+    payload += "\"dist_m\":0.0,";
+    payload += "\"bearing\":\"N/A\"";
   }
+
+  payload += "}";
+  return payload;
 }
 
+// ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+// █                                                                █
+// █   ██       ██████  ██████   █████      ████████ ██   ██       █
+// █   ██      ██    ██ ██   ██ ██   ██        ██     ██ ██        █
+// █   ██      ██    ██ ██████  ███████        ██      ███         █
+// █   ██      ██    ██ ██   ██ ██   ██        ██     ██ ██        █
+// █   ███████  ██████  ██   ██ ██   ██        ██    ██   ██       █
+// █                                                                █
+// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 // --- Transmit LoRa Packet (Common Logic) ---
-void transmitLora(JsonDocument &doc)
+// Update signature to accept String payload
+void transmitLora(String payload)
 {
-  String out;
-  serializeJson(doc, out);
-  colorPrint("[LORA] Sending: " + out, ANSI_MAGENTA);
+  colorPrint("[LORA] Sending: " + payload, ANSI_MAGENTA);
 
   lora.standby(); // Ensure radio is ready
-  int txState = lora.transmit(out);
+  int txState = lora.transmit(payload);
 
   if (txState == RADIOLIB_ERR_NONE)
   {
@@ -456,7 +398,58 @@ void transmitLora(JsonDocument &doc)
   {
     colorPrint("[LORA] Transmit failed, code: " + String(txState), ANSI_RED);
   }
-  doc.clear(); // Free JSON memory
+}
+
+// --- Build and Send LoRa Packet (Unified Function) ---
+void sendLoraPacket(bool isManual)
+{
+  String payload = ""; // Use String instead of StaticJsonDocument
+
+  if (isManual)
+  {
+    colorPrint("[LORA] Building MANUAL payload...", ANSI_BRIGHT_CYAN);
+    // Manual payload logic (manual JSON string construction)
+    payload = "{";
+    payload += "\"msg_id\":" + String(messageId++) + ","; // Increment global counter
+    payload += "\"device_id\":4,";
+    payload += "\"id\":\"" + String(SENDER_ID) + "\","; // Use defined constant
+    payload += "\"time\":" + String(gps.time.isValid() ? gps.time.value() : 0) + ",";
+    payload += "\"satellite_Count\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + ",";
+
+    if (gps.location.isValid())
+    {
+      payload += "\"status\":\"manual\","; // Indicate manual send
+      payload += "\"lat\":" + String(gps.location.lat(), 6) + ",";
+      payload += "\"lon\":" + String(gps.location.lng(), 6) + ",";
+      double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(),
+                                                 HOME_LAT, HOME_LON); // Use defined constants
+      double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(),
+                                             HOME_LAT, HOME_LON); // Use defined constants
+      payload += "\"dist_m\":" + String(dist, 2) + ",";
+      payload += "\"bearing\":\"" + String((int)bearing) + "-" + cardinalDirection(bearing) + "\"";
+    }
+    else
+    {
+      payload += "\"status\":\"manual_error\","; // Indicate manual send w/ no fix
+      payload += "\"lat\":0.0,";
+      payload += "\"lon\":0.0,";
+      payload += "\"dist_m\":0.0,";
+      payload += "\"bearing\":\"N/A\"";
+    }
+    payload += "}";
+  }
+  else
+  {
+    colorPrint("[LORA] Building REGULAR payload...", ANSI_MAGENTA);
+    // Regular payload logic (calls existing build function)
+    payload = buildJsonPayload(); // buildJsonPayload increments messageId
+  }
+
+  // Transmit
+  transmitLora(payload); // Use common transmit function
+
+  // Update last send time *after* transmission attempt
+  lastSendTime = millis();
 }
 
 // --- Manual Transmit Sequence ---
@@ -489,44 +482,13 @@ void handleManualTransmit()
     colorPrint("[MANUAL] GPS fix timeout. Sending last known or invalid data.", ANSI_YELLOW);
   }
 
-  // 2. Build Manual JSON Payload
-  // Manual send always uses current GPS data, doesn't override with home coords
-  JsonDocument doc;
-  doc["msg_id"] = messageId++; // Increment global counter
-  doc["device_id"] = 4;
-  doc["id"] = config["senderId"].as<String>();
-  doc["time"] = gps.time.isValid() ? gps.time.value() : 0;
-  doc["satellite_Count"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  // 2. Build and Transmit Manual Packet using the new function
+  sendLoraPacket(true); // Pass true for manual send
 
-  if (gps.location.isValid())
-  {
-    doc["status"] = "manual"; // Indicate manual send
-    doc["lat"] = gps.location.lat();
-    doc["lon"] = gps.location.lng();
-    double dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(),
-                                               config["homeLat"].as<double>(), config["homeLon"].as<double>());
-    double bearing = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(),
-                                           config["homeLat"].as<double>());
-    doc["dist_m"] = dist;
-    doc["bearing"] = String((int)bearing) + "-" + cardinalDirection(bearing);
-  }
-  else
-  {
-    doc["status"] = "manual_error"; // Indicate manual send w/ no fix
-    doc["lat"] = 0.0;
-    doc["lon"] = 0.0;
-    doc["dist_m"] = 0.0;
-    doc["bearing"] = "N/A";
-  }
+  // 3. Post-Manual-Transmission Actions
+  // lastSendTime is updated within sendLoraPacket()
 
-  // 3. Transmit Manual Packet
-  transmitLora(doc); // Use common transmit function
-
-  // 4. Post-Manual-Transmission Actions
-  lastSendTime = now; // IMPORTANT: Update last send time to reset regular interval timer
-  // GPS sleep decision is handled by the main loop's idle state logic
-
-  // 5. Reset manual flags
+  // 4. Reset manual flags
   manualTxRequested = false;
   manualTxInProgress = false;
   colorPrint("[MANUAL] Manual transmit sequence complete.", ANSI_BRIGHT_CYAN);
@@ -535,7 +497,7 @@ void handleManualTransmit()
 // --- Regular Transmit Sequence ---
 void handleRegularTransmit()
 {
-  unsigned long now = millis();
+  unsigned long now = millis(); // Keep 'now' for potential future use, though not strictly needed here anymore
   colorPrint("[CYCLE] Send interval reached. Executing transmit...", ANSI_MAGENTA);
 
   // Note: GPS should have been woken up earlier in the 'preparingToSend' phase.
@@ -543,53 +505,25 @@ void handleRegularTransmit()
   // 1. Check GPS Fix (it had time to warm up)
   if (gpsIsAwake && !gps.location.isValid())
   {
-    colorPrint("[CYCLE] GPS fix still invalid after warmup period.", ANSI_YELLOW);
+    colorPrint("[CYCLE] GPS fix still invalid after warmup period.", ANSI_RED);
     // Optional: Could add a brief final attempt here if desired, but likely covered by processGps()
   }
   else if (!gpsIsAwake)
   {
     colorPrint("[CYCLE] GPS is asleep during send cycle? This shouldn't happen.", ANSI_RED);
+    // Consider waking GPS here as a fallback? Or rely on the state machine logic.
   }
 
-  // 2. Build JSON Payload (Uses isHome status from BLE scan)
-  JsonDocument doc;
-  buildJsonPayload(doc); // Use common build function
+  // 2. Build and Transmit Regular Packet using the new function
+  sendLoraPacket(false); // Pass false for regular send
 
-  // 3. Transmit Packet
-  transmitLora(doc); // Use common transmit function
-
-  // 4. Post-Transmission Actions
-  lastSendTime = now; // IMPORTANT: Update last send time *after* transmission attempt
-  // GPS sleep decision is handled by the main loop's idle state logic
+  // 3. Post-Transmission Actions
+  // lastSendTime is updated within sendLoraPacket()
 
   colorPrint("[CYCLE] Regular transmit sequence complete.", ANSI_MAGENTA);
 }
 
 // --- Other Helper Functions (Placeholders - ensure these exist from original code) ---
-
-void saveConfigToEEPROM()
-{
-  // This function is no longer needed since we removed EEPROM functionality
-  colorPrint("[CONFIG] EEPROM saving disabled - using in-memory configuration only", ANSI_GREEN);
-}
-
-bool loadConfigFromEEPROM()
-{
-  // This function is no longer needed since we removed EEPROM functionality
-  colorPrint("[CONFIG] EEPROM loading disabled - using default configuration", ANSI_YELLOW);
-  loadDefaultConfig();
-  return true;
-}
-
-void startConfigPortal()
-{
-  colorPrint("[CONFIG] Entering WiFiManager Config Portal...", ANSI_BRIGHT_CYAN);
-  // ... (Full WiFiManager setup and handling code from original file) ...
-  // Make sure it calls saveConfigToEEPROM() and ESP.restart()
-  colorPrint("[CONFIG] Placeholder: Config Portal would run here.", ANSI_YELLOW);
-  delay(2000);
-  ESP.restart(); // Simulate restart after config
-}
 
 void printStatusReport()
 {
@@ -605,7 +539,7 @@ void printStatusReport()
   Serial.print("  Satellites: ");
   Serial.println(gps.satellites.value());
   Serial.print("  Is Home: ");
-  Serial.println(isHome ? "Yes" : "No");
+  // Serial.println(isHome ? "Yes" : "No");
   Serial.print("  Free Heap: ");
   Serial.println(ESP.getFreeHeap());
   Serial.println("-------------------------------------------------------");
