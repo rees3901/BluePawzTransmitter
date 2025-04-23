@@ -9,7 +9,8 @@
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
-#include <esp_sleep.h> // Include ESP sleep library
+#include <esp_sleep.h>   // Include ESP sleep library
+#include <ArduinoJson.h> // <-- Add ArduinoJson library
 
 // Define LED_BUILTIN if not already defined (common for ESP32)
 #ifndef LED_BUILTIN
@@ -42,7 +43,10 @@
 // #define SEND_INTERVAL 60000 // milliseconds (60 seconds) - Commented out, using sleep timer
 
 // Sleep Configuration
-#define SLEEP_DURATION_US (120 * 1000000ULL) // 2 minutes in microseconds
+// ┌─────────────────┐
+// │ Sleep Settings  │
+// └─────────────────┘
+#define SLEEP_DURATION_US (60 * 1000000ULL) // 1  minute in microseconds
 
 // ANSI Color Codes
 #define ANSI_RED "\033[31m"
@@ -82,28 +86,29 @@ String LoRaRxMsg = "";         // Buffer for received LoRa message
 
 // Forward Declarations
 void printStatusReport();
-void colorPrint(const String &message, const char *color = ANSI_RESET);
+void colorPrint(const String &message, const char *color = ANSI_RESET); // Ensure this matches definition
 void gpsWake();
 void gpsSleep();
 String cardinalDirection(double bearing);
 void processGps();
 void periodicStatusUpdate(); // Keep for periodic updates while awake
 void transmitLora(String payload);
-String buildJsonPayload(bool isManualTrigger); // Added flag
-void sendLoraPacket(bool isManualTrigger);     // Added flag
+String buildJsonPayload(); // Removed flag
+void sendLoraPacket();     // Removed flag
 void handleWakeupReason();
 void handleLoraReception();
-void performTransmissionSequence(bool isButtonTriggered);
+void performTransmissionSequence(); // Removed flag
 void goToLightSleep();
+void ledFlicker(); // <-- Add forward declaration
 
 // ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-// █                                                                              █
+// █                                                                             █
 // █   ███████ ███████ ████████ ██    ██ ██████      ██████  ██    ██ ███    ██  █
 // █   ██      ██         ██    ██    ██ ██   ██     ██   ██ ██    ██ ████   ██  █
 // █   ███████ █████      ██    ██    ██ ██████      ██████  ██    ██ ██ ██  ██  █
 // █        ██ ██         ██    ██    ██ ██          ██   ██ ██    ██ ██  ██ ██  █
-// █   ███████ ███████    ██     ██████  ██          ██    ██  ██████  ██   ████  █
-// █                                                                              █
+// █   ███████ ███████    ██     ██████  ██          ██    █  ██████  ██  ████   █
+// █                                                                             █
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void setup()
 {
@@ -190,7 +195,7 @@ void setup()
   // Set initial lastSendTime to allow first send after interval - No longer needed
   // lastSendTime = millis() - SEND_INTERVAL + 5000;
 
-  // Go to sleep for the first time
+  delay(1000); // Go to sleep for the first time
   goToLightSleep();
 }
 
@@ -218,7 +223,7 @@ void loop()
   // processGps(); // Process GPS only when explicitly woken/needed
   // periodicStatusUpdate(); // Print status only on button press or specific debug needs
 
-  // --- Go Back to Sleep ---
+  delay(1000); // --- Go Back to Sleep ---
   goToLightSleep();
 }
 
@@ -235,18 +240,18 @@ void handleWakeupReason()
   {
   case ESP_SLEEP_WAKEUP_TIMER:
     colorPrint("[WAKE] Reason: Timer ⏰", ANSI_CYAN);
-    performTransmissionSequence(false); // Perform standard transmission
+    performTransmissionSequence(); // Perform standard transmission (no flag)
     break;
   case ESP_SLEEP_WAKEUP_EXT0: // Connected to STATUS_BUTTON_PIN (GPIO 21)
     colorPrint("[WAKE] Reason: Button Press 👆", ANSI_BRIGHT_CYAN);
-    printStatusReport();               // Print status first
-    performTransmissionSequence(true); // Perform transmission, marked as button trigger
+    printStatusReport();           // Print status report first
+    performTransmissionSequence(); // Perform standard transmission (no flag)
+    ledFlicker();                  // Flicker LED after sequence
     break;
   case ESP_SLEEP_WAKEUP_GPIO: // Connected to LORA_DIO1 (GPIO 39)
     colorPrint("[WAKE] Reason: LoRa DIO1 Interrupt 📡", ANSI_BRIGHT_MAGENTA);
-    // DIO1 going high likely means RxDone (as configured in setup)
-    handleLoraReception();              // Read the received message
-    performTransmissionSequence(false); // Perform standard transmission after receiving
+    handleLoraReception();         // Read the received message
+    performTransmissionSequence(); // Perform standard transmission after receiving (no flag)
     break;
   default:
     colorPrint("[WAKE] Reason: Unknown (" + String(wakeup_reason) + ")", ANSI_RED);
@@ -281,9 +286,10 @@ void handleLoraReception()
   // No need to clear IRQ flags manually here if using RadioLib's ISR handling (setDio1Action)
 }
 
-void performTransmissionSequence(bool isButtonTriggered)
+// Removed isButtonTriggered parameter
+void performTransmissionSequence()
 {
-  colorPrint("[SEQUENCE] Starting Transmission Sequence...", (isButtonTriggered ? ANSI_BRIGHT_CYAN : ANSI_MAGENTA));
+  colorPrint("[SEQUENCE] Starting Transmission Sequence...", ANSI_MAGENTA); // Use standard color
 
   // 1. Wake GPS & Attempt Fix
   gpsWake(); // Ensure GPS is awake
@@ -312,13 +318,12 @@ void performTransmissionSequence(bool isButtonTriggered)
   }
 
   // 2. Build and Transmit LoRa Packet
-  // Pass the trigger type to potentially modify the payload status
-  sendLoraPacket(isButtonTriggered);
+  sendLoraPacket(); // Call simplified function (no flag)
 
   // 3. Post-Transmission: Sleep GPS
   gpsSleep();
 
-  colorPrint("[SEQUENCE] Transmission Sequence Complete.", (isButtonTriggered ? ANSI_BRIGHT_CYAN : ANSI_MAGENTA));
+  colorPrint("[SEQUENCE] Transmission Sequence Complete.", ANSI_MAGENTA); // Use standard color
 }
 
 void goToLightSleep()
@@ -423,66 +428,57 @@ void periodicStatusUpdate()
 }
 
 // --- Build JSON Payload ---
-// Added isManualTrigger flag to potentially change status
-String buildJsonPayload(bool isManualTrigger)
+// Uses ArduinoJson library
+// Removed isManualTrigger parameter
+String buildJsonPayload()
 {
-  String payload = "{";
-  payload += "\"msg_id\":" + String(messageId) + ","; // Note: messageId incremented in sendLoraPacket
-  payload += "\"device_id\":4,";
-  payload += "\"id\":\"" + String(SENDER_ID) + "\",";
-  payload += "\"time\":" + String(gps.time.isValid() ? gps.time.value() : 0) + ",";
-  payload += "\"satellite_Count\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + ",";
+  // Allocate JSON document (adjust size if needed, 256 seems reasonable)
+  StaticJsonDocument<256> doc;
+
+  // Add static fields
+  doc["msg_id"] = messageId; // Note: messageId incremented in sendLoraPacket
+  doc["device_id"] = 4;
+  doc["id"] = SENDER_ID;
+  doc["time"] = gps.time.isValid() ? gps.time.value() : 0;
+  doc["satellite_Count"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
 
   bool locationValid = gps.location.isValid();
   double currentLat = locationValid ? gps.location.lat() : 0.0;
   double currentLon = locationValid ? gps.location.lng() : 0.0;
-  double dist = 0.0;
-  String bearingStr = "N/A";
   String status = "unknown"; // Default status
 
   if (locationValid)
   {
-    dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
+    double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
     double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON);
-    bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
+    String bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
 
-    if (isManualTrigger)
-    {
-      status = "manual";
-      colorPrint("[JSON] Status: Manual (GPS Valid).", ANSI_BRIGHT_CYAN);
-    }
-    else
-    {
-      status = "outanabout"; // Standard status when GPS is valid
-      colorPrint("[JSON] Status: Out (GPS Valid).", ANSI_YELLOW);
-    }
+    // Simplified status: always "outanabout" if GPS is valid
+    status = "outanabout";
+    colorPrint("[JSON] Status: Out (GPS Valid).", ANSI_YELLOW);
 
-    payload += "\"status\":\"" + status + "\",";
-    payload += "\"lat\":" + String(currentLat, 6) + ",";
-    payload += "\"lon\":" + String(currentLon, 6) + ",";
-    payload += "\"dist_m\":" + String(dist, 2) + ",";
-    payload += "\"bearing\":\"" + bearingStr + "\"";
+    doc["status"] = status;
+    doc["lat"] = currentLat; // ArduinoJson handles precision
+    doc["lon"] = currentLon;
+    doc["dist_m"] = round(dist * 100.0) / 100.0; // Round to 2 decimal places
+    doc["bearing"] = bearingStr;
   }
   else // Location Invalid
   {
-    if (isManualTrigger)
-    {
-      status = "manual_error";
-      colorPrint("[JSON] Status: Manual (GPS Invalid).", ANSI_BRIGHT_RED);
-    }
-    else
-    {
-      status = "error"; // Standard status when GPS is invalid
-      colorPrint("[JSON] Status: Error (GPS Invalid).", ANSI_RED);
-    }
-    payload += "\"status\":\"" + status + "\",";
-    payload += "\"lat\":0.0,";
-    payload += "\"lon\":0.0,";
-    payload += "\"dist_m\":0.0,";
-    payload += "\"bearing\":\"N/A\"";
+    // Simplified status: always "error" if GPS is invalid
+    status = "error";
+    colorPrint("[JSON] Status: Error (GPS Invalid).", ANSI_RED);
+
+    doc["status"] = status;
+    doc["lat"] = 0.0;
+    doc["lon"] = 0.0;
+    doc["dist_m"] = 0.0;
+    doc["bearing"] = "N/A";
   }
 
-  payload += "}";
+  // Serialize JSON to string
+  String payload;
+  serializeJson(doc, payload);
   return payload;
 }
 
@@ -546,13 +542,13 @@ void transmitLora(String payload)
 }
 
 // --- Build and Send LoRa Packet (Unified Function) ---
-// Added isManualTrigger flag
-void sendLoraPacket(bool isManualTrigger)
+// Removed isManualTrigger flag
+void sendLoraPacket()
 {
   // Increment message ID for this packet *before* building payload
   messageId++;
 
-  String payload = buildJsonPayload(isManualTrigger); // Build payload based on trigger type
+  String payload = buildJsonPayload(); // Build payload (no longer needs trigger type)
 
   // Transmit
   transmitLora(payload); // Use common transmit function
@@ -579,6 +575,19 @@ void handleRegularTransmit()
 
 // --- Other Helper Functions ---
 
+void ledFlicker()
+{
+  colorPrint("[LED] Flickering status LED...", ANSI_BLUE);
+  pinMode(48, OUTPUT); // Ensure pin is output
+  for (int i = 0; i < 6; i++)
+  {
+    digitalWrite(48, HIGH);
+    delay(83); // ~1/12th second ON
+    digitalWrite(48, LOW);
+    delay(83); // ~1/12th second OFF (Total cycle ~1/6th sec, 6 cycles ~1 sec)
+  }
+}
+
 void printStatusReport()
 {
   colorPrint("-------------------- STATUS REPORT --------------------", ANSI_BOLD);
@@ -602,19 +611,19 @@ void printStatusReport()
     Serial.println("  Location: Invalid");
   }
   Serial.print("  Satellites: ");
-  Serial.println(gps.satellites.value());
+  Serial.println(gps.satellites.isValid() ? String(gps.satellites.value()) : "N/A"); // Check validity
   Serial.print("  HDOP: ");
-  Serial.println(gps.hdop.value());
+  Serial.println(gps.hdop.isValid() ? String(gps.hdop.value()) : "N/A"); // Check validity
   Serial.print("  Last Rx Msg: ");
   Serial.println(LoRaRxMsg.length() > 0 ? LoRaRxMsg : "None");
   Serial.print("  Free Heap: ");
   Serial.println(ESP.getFreeHeap());
   Serial.print("  Wakeup Cause: ");
-  Serial.println(esp_sleep_get_wakeup_cause());
+  Serial.println(esp_sleep_get_wakeup_cause()); // This should be fine
   colorPrint("-------------------------------------------------------", ANSI_BOLD);
 }
 
-void colorPrint(const String &message, const char *color)
+void colorPrint(const String &message, const char *color) // Match declaration
 {
   Serial.print(color);
   Serial.println(message);
