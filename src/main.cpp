@@ -97,7 +97,7 @@ void processGps();
 void periodicStatusUpdate(); // Keep for periodic updates while awake
 void transmitLora(String payload);
 String buildJsonPayload(); // Removed flag
-void sendLoraPacket();     // Removed flag
+void craftLoraPacket();    // Renamed from sendLoraPacket
 void handleWakeupReason();
 void handleLoraReception();
 void performTransmissionSequence(); // Removed flag
@@ -111,7 +111,7 @@ bool isChannelClear(); // <-- Add forward declaration for CAD function
 // █   ██      ██         ██    ██    ██ ██   ██     ██   ██ ██    ██ ████   ██  █
 // █   ███████ █████      ██    ██    ██ ██████      ██████  ██    ██ ██ ██  ██  █
 // █        ██ ██         ██    ██    ██ ██          ██   ██ ██    ██ ██  ██ ██  █
-// █   ███████ ███████    ██     ██████  ██          ██    █  ██████  ██  ████   █
+// █   ███████ ███████    ██     ██████  ██          ██    █  ██████  ██   ████  █
 // █                                                                             █
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void setup()
@@ -348,7 +348,7 @@ void performTransmissionSequence()
   }
 
   // 2. Build and Transmit LoRa Packet
-  sendLoraPacket(); // Call simplified function (no flag)
+  craftLoraPacket(); // Call renamed function
 
   // 3. Post-Transmission: Sleep GPS
   gpsSleep();
@@ -482,7 +482,7 @@ String buildJsonPayload()
   }
   else
   {
-    doc["time"] = nullptr; // Use null for invalid time
+    doc["time"] = "Error"; // Use null for invalid time
     colorPrint("[JSON] Timestamp: Invalid", ANSI_RED);
   }
 
@@ -491,7 +491,7 @@ String buildJsonPayload()
   bool locationValid = gps.location.isValid();
   double currentLat = locationValid ? gps.location.lat() : 0.0;
   double currentLon = locationValid ? gps.location.lng() : 0.0;
-  String status = "unknown"; // Default status
+  String status = "Error"; // Default status
 
   if (locationValid)
   {
@@ -569,7 +569,7 @@ void transmitLora(String payload)
   // --- Proceed with Transmission ---
   colorPrint("[LORA TX] Starting transmission...", ANSI_MAGENTA);
 
-  // Ensure radio is in standby before transmitting (might already be from CAD)
+  delay(20); // Ensure radio is in standby before transmitting (might already be from CAD)
   lora.standby();
 
   int txState = lora.transmit(payload);
@@ -612,8 +612,8 @@ void transmitLora(String payload)
 }
 
 // --- Build and Send LoRa Packet (Unified Function) ---
-// Removed isManualTrigger flag
-void sendLoraPacket()
+// Renamed from sendLoraPacket
+void craftLoraPacket()
 {
   // Increment message ID for this packet *before* building payload
   messageId++;
