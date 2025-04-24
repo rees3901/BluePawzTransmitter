@@ -102,7 +102,8 @@ void handleWakeupReason();
 void handleLoraReception();
 void performTransmissionSequence(); // Removed flag
 void goToLightSleep();
-void ledFlicker(); // <-- Add forward declaration
+void ledFlicker();     // <-- Add forward declaration
+bool isChannelClear(); // <-- Add forward declaration for CAD function
 
 // ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
 // █                                                                             █
@@ -539,16 +540,40 @@ String buildJsonPayload()
 // --- Transmit LoRa Packet (Common Logic) ---
 void transmitLora(String payload)
 {
-  colorPrint("[LORA TX] Sending: " + payload, ANSI_MAGENTA);
+  colorPrint("[LORA TX] Preparing to send: " + payload, ANSI_MAGENTA);
 
-  // Ensure LoRa is not in receive mode before transmitting
-  lora.standby(); // Go to standby mode first
+  bool channelClearToSend = false;
+  for (int attempt = 0; attempt < 5; attempt++)
+  {
+    if (isChannelClear())
+    {
+      channelClearToSend = true;
+      break; // Exit loop, channel is clear
+    }
+    else
+    {
+      // Channel busy or CAD failed
+      if (attempt < 4)
+      { // Don't wait after the last attempt
+        colorPrint("[LORA LBT] Channel busy. Waiting 2s (Attempt " + String(attempt + 1) + "/5)...", ANSI_YELLOW);
+        delay(2000);
+      }
+    }
+  }
 
-  // Potentially re-apply TX parameters if sleep affects them, though often not needed for light sleep
-  // lora.setOutputPower(22);
-  // ... other params if needed ...
+  if (!channelClearToSend)
+  {
+    colorPrint("[LORA LBT] Channel busy after 5 attempts. Transmitting anyway.", ANSI_YELLOW);
+  }
+
+  // --- Proceed with Transmission ---
+  colorPrint("[LORA TX] Starting transmission...", ANSI_MAGENTA);
+
+  // Ensure radio is in standby before transmitting (might already be from CAD)
+  lora.standby();
 
   int txState = lora.transmit(payload);
+  // ... (rest of the existing transmitLora function: error handling, LED blinking, etc.) ...
   unsigned long txStart = millis();
 
   if (txState == RADIOLIB_ERR_NONE)
@@ -730,4 +755,50 @@ String cardinalDirection(double bearing)
   bearing = fmod(bearing + 360.0, 360.0);
   int index = (int)round(bearing / 22.5) % 16;
   return String(directions[index]);
+}
+
+// --- Check LoRa Channel Activity (CAD) ---
+bool isChannelClear()
+{
+  colorPrint("[LORA CAD] Checking channel activity...", ANSI_BLUE);
+
+  // Ensure radio is in standby for CAD
+  int state = lora.standby();
+  if (state != RADIOLIB_ERR_NONE)
+  {
+    colorPrint("[LORA CAD] Failed to enter standby before CAD: " + String(state), ANSI_RED);
+    return false; // Indicate failure, maybe transmit anyway later? For now, treat as busy.
+  }
+
+  // Start CAD
+  state = lora.startChannelScan();
+  if (state != RADIOLIB_ERR_NONE)
+  {
+    colorPrint("[LORA CAD] Failed to start CAD: " + String(state), ANSI_RED);
+    return false; // Indicate failure
+  }
+
+  // Wait for CAD to complete. This duration depends on LoRa settings (BW, SF).
+  // A simple delay is used here; a more robust method might use DIO interrupts if configured.
+  // Let's estimate a generous wait time (e.g., 50ms). Adjust if needed.
+  delay(50);
+
+  // Check CAD result
+  state = lora.getChannelScanResult();
+
+  if (state == RADIOLIB_CHANNEL_FREE)
+  {
+    colorPrint("[LORA CAD] Channel is free!", ANSI_GREEN);
+    return true;
+  }
+  else if (state == RADIOLIB_LORA_DETECTED)
+  {
+    colorPrint("[LORA CAD] LoRa signal detected!", ANSI_YELLOW);
+    return false;
+  }
+  else
+  {
+    colorPrint("[LORA CAD] CAD failed or unknown result: " + String(state), ANSI_RED);
+    return false; // Treat errors or unexpected results as busy
+  }
 }
