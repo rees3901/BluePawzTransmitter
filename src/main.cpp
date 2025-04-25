@@ -12,6 +12,10 @@
 #include <ArduinoJson.h>    // <-- Add ArduinoJson library
 #include <stdio.h>          // <-- Add for sprintf
 #include <HardwareSerial.h> // <-- ADD THIS LINE
+#include <BLEDevice.h>      // <-- Add BLE headers
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
 // Define LED_BUILTIN if not already defined (common for ESP32)
 #ifndef LED_BUILTIN
@@ -37,7 +41,6 @@
 // Button pin for status report and manual wake/transmit
 #define STATUS_BUTTON_PIN GPIO_NUM_21 // Use GPIO_NUM_x for sleep functions
 
-
 // #define SENDER_ID "Podge"
 #define SENDER_ID "Macy"
 // #define SENDER_ID "Simba"
@@ -51,11 +54,12 @@
 // │ Sleep Settings  │
 // └─────────────────┘
 
-
 #define SLEEP_DURATION_US (30 * 1000000ULL) // 30 seconds in microseconds
 
-
-
+// BLE Configuration
+const char *targetDeviceName = "CAT_TRACKER_HQ";
+BLEScan *pBLEScan = nullptr;  // Initialize to nullptr
+volatile bool isHome = false; // Flag to indicate if home beacon is detected
 
 // ANSI Color Codes
 #define ANSI_RED "\033[31m"
@@ -110,24 +114,42 @@ void handleWakeupReason();
 void handleLoraReception();
 void performTransmissionSequence(); // Removed flag
 void goToLightSleep();
-void ledFlicker();     // <-- Add forward declaration
-bool isChannelClear(); // <-- Add forward declaration for CAD function
+bool scanForHomeBeacon(uint32_t scanDurationSeconds); // <-- Add forward declaration for BLE scan function
+void ledFlicker();                                    // <-- Add forward declaration
+bool isChannelClear();                                // <-- Add forward declaration for CAD function
 
-// ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-// █                                                                             █
-// █   ███████ ███████ ████████ ██    ██ ██████      ██████  ██    ██ ███    ██  █
-// █   ██      ██         ██    ██    ██ ██   ██     ██   ██ ██    ██ ████   ██  █
-// █   ███████ █████      ██    ██    ██ ███████     ██████  ██    ██ ██ ██  ██  █
-// █        ██ ██         ██    ██    ██ ██          ██   ██ ██    ██ ██  ██ ██  █
-// █   ███████ ███████    ██     ██████  ██          ██    █  ██████  ██   ████  █
-// █                                                                             █
-// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+// --- BLE Callback Class ---
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+{
+  void onResult(BLEAdvertisedDevice advertisedDevice)
+  {
+    // Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str()); // Debug: Print all found devices
+    if (advertisedDevice.haveName() && advertisedDevice.getName() == targetDeviceName)
+    {
+      colorPrint("[BLE] Found Home Beacon! (" + String(targetDeviceName) + ")", ANSI_BRIGHT_GREEN);
+      isHome = true;
+      // Stop scan early if target is found
+      // Check if pBLEScan is initialized before using
+      if (pBLEScan != nullptr) // Simplified check
+      {                        // Check if scanning before stopping
+        // No need to check isScanning() if stop() is idempotent (safe to call multiple times)
+        pBLEScan->stop();
+        colorPrint("[BLE] Scan stopped early.", ANSI_BLUE);
+      }
+    }
+  }
+};
+
+// --- SETUP ---
+// ┌─────────────────┐
+// │   Setup Loop    │
+// └─────────────────┘
 void setup()
 {
-  Serial.begin(115200);
-  delay(1000);                                                                    // Wait for serial monitor
-  Serial.println("\n[BOOT] Serial connection delay complete. Starting setup..."); // Added this line
-  delay(200);                                                                     // Give some time for the serial monitor to open
+  delay(1000);                                                                 // Wait for serial monitor
+  Serial.begin(115200);                                                        // <-- Initialize Serial communication first
+  Serial.println("\n[BOOT] Serial connection established. Starting setup..."); // Adjusted message
+  delay(200);                                                                  // Give some time for the serial monitor to open
   colorPrint("[BOOT] Initialising CAT TRACKER TX v2 (Sleep Enabled)...");
   delay(200); // Give some time for the serial monitor to open
   pinMode(LED_BUILTIN, OUTPUT);
@@ -174,7 +196,7 @@ void setup()
   colorPrint("[GPS] Warming up GPS (waiting for fix)..."); // Proceed with warmup/fix attempt
   unsigned long gpsWarmupStart = millis();
   bool fixFound = false;
-  bool firstFixDetectedSetup = false; // Flag for first fix detection in setup
+  bool firstFixDetectedSetup = false;       // Flag for first fix detection in setup
   unsigned long firstFixTimestampSetup = 0; // Timestamp for first fix in setup
 
   while (millis() - gpsWarmupStart < 120000) // 2 min timeout
@@ -248,6 +270,24 @@ void setup()
     colorPrint("[INIT] LoRa Params configured.");
   }
 
+  // --- BLE Init ---
+  colorPrint("[INIT] Initializing BLE...", ANSI_BLUE);
+  BLEDevice::init("");             // Initialize BLE device with no name (scanner role)
+  pBLEScan = BLEDevice::getScan(); // Get the scanner instance
+  if (pBLEScan == nullptr)
+  {
+    colorPrint("[INIT ERROR] Failed to get BLE Scanner instance!", ANSI_RED);
+    // Handle error appropriately - maybe halt or disable BLE feature
+  }
+  else
+  {
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true); // Active scan uses more power but is needed to get device names
+    pBLEScan->setInterval(100);    // Scan interval (milliseconds)
+    pBLEScan->setWindow(99);       // Scan window (milliseconds), must be <= interval
+    colorPrint("[INIT] BLE Scanner Initialized.", ANSI_BLUE);
+  }
+
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
   colorPrint("🚀 SETUP COMPLETE - Entering initial sleep cycle 😴", ANSI_BOLD);
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
@@ -272,7 +312,7 @@ void setup()
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void loop()
 {
-  Serial.begin(115200);
+  // Serial.begin(115200); // <-- REMOVE Serial.begin from loop, it should only be in setup
   // --- Code execution resumes here after wake-up ---
   colorPrint("\n☀️ Woke up!", ANSI_BRIGHT_YELLOW);
 
@@ -354,66 +394,84 @@ void performTransmissionSequence()
 {
   colorPrint("[SEQUENCE] Starting Transmission Sequence...", ANSI_MAGENTA); // Use standard color
 
-  // 1. Wake GPS & Attempt Fix/Update
-  gpsWake(); // Ensure GPS is awake and serial is initialized
-  colorPrint("[SEQUENCE] Attempting GPS fix/update (Max Wait: 60s)...", ANSI_YELLOW);
-  unsigned long fixAttemptStart = millis();
-  bool fixObtainedDuringWait = false; // Flag to track if we completed the stabilization wait
-  bool firstFixDetected = false;      // Flag to track if we've seen the *first* fix
-  unsigned long firstFixTimestamp = 0; // Timestamp of the first fix detection
+  // --- 1. Attempt BLE Home Beacon Scan (First 10 seconds) ---
+  colorPrint("[SEQUENCE] Scanning for Home Beacon (10s)...", ANSI_YELLOW);
+  bool foundHome = scanForHomeBeacon(10); // Scan for 10 seconds, returns true if home found
 
-  // Wait for up to 60 seconds total, processing GPS data
-  while (millis() - fixAttemptStart < 60000)
-  {
-    processGps(); // Continuously process GPS data
+  // --- 2. GPS Fix Attempt (Only if Home Beacon NOT Found) ---
+  if (!foundHome)
+  { // Use the return value from the scan function
+    colorPrint("[SEQUENCE] Home Beacon not found. Proceeding with GPS fix attempt...", ANSI_YELLOW);
+    // Wake GPS & Attempt Fix/Update
+    gpsWake(); // Ensure GPS is awake and serial is initialized
+    colorPrint("[SEQUENCE] Attempting GPS fix/update (Max Wait: 60s)...", ANSI_YELLOW);
+    unsigned long fixAttemptStart = millis();
+    bool fixObtainedDuringWait = false;  // Flag to track if we completed the stabilization wait
+    bool firstFixDetected = false;       // Flag to track if we've seen the *first* fix
+    unsigned long firstFixTimestamp = 0; // Timestamp of the first fix detection
 
-    // Check if a valid fix is obtained and we haven't detected one before
-    if (!firstFixDetected && gps.location.isValid() && gps.location.age() < 5000)
+    // Wait for up to 60 seconds total, processing GPS data
+    while (millis() - fixAttemptStart < 60000)
     {
-      // This is the first time we've detected a valid, recent fix in this sequence
-      firstFixDetected = true;
-      firstFixTimestamp = millis();
-      colorPrint("[SEQUENCE] Initial GPS fix detected! Waiting 10s for stability...", ANSI_GREEN);
-      // Do not break yet, continue processing in the loop
+      processGps(); // Continuously process GPS data
+
+      // Check if a valid fix is obtained and we haven't detected one before
+      if (!firstFixDetected && gps.location.isValid() && gps.location.age() < 5000)
+      {
+        // This is the first time we've detected a valid, recent fix in this sequence
+        firstFixDetected = true;
+        firstFixTimestamp = millis();
+        colorPrint("[SEQUENCE] Initial GPS fix detected! Waiting 10s for stability...", ANSI_GREEN);
+        // Do not break yet, continue processing in the loop
+      }
+
+      // If we have detected a fix, check if 10 seconds have passed since then
+      if (firstFixDetected && (millis() - firstFixTimestamp >= 10000))
+      {
+        colorPrint("[SEQUENCE] 10s stabilization period complete.", ANSI_GREEN);
+        fixObtainedDuringWait = true; // Mark that we successfully waited the stabilization period
+        break;                        // Exit the loop now, we have waited enough
+      }
+
+      delay(1); // Minimal delay to yield, allowing other tasks if any (mostly processes serial)
     }
 
-    // If we have detected a fix, check if 10 seconds have passed since then
-    if (firstFixDetected && (millis() - firstFixTimestamp >= 10000))
+    // After the loop (either 60s timeout, or 10s stabilization finished)
+    if (fixObtainedDuringWait)
     {
-      colorPrint("[SEQUENCE] 10s stabilization period complete.", ANSI_GREEN);
-      fixObtainedDuringWait = true; // Mark that we successfully waited the stabilization period
-      break;                        // Exit the loop now, we have waited enough
+      // We successfully detected a fix and waited 10 seconds
+      colorPrint("[SEQUENCE] Proceeding with stabilized GPS fix.", ANSI_GREEN);
+      processGps(); // Process one last time to ensure latest data is encoded
     }
+    else if (firstFixDetected)
+    {
+      // We detected a fix, but the 60s timeout occurred before the 10s stabilization finished
+      colorPrint("[SEQUENCE] Proceeding with initial GPS fix (stabilization incomplete).", ANSI_YELLOW);
+      processGps(); // Process one last time
+    }
+    else
+    {
+      // 60s timeout occurred without ever detecting a valid fix
+      colorPrint("[SEQUENCE] GPS fix timeout after 60s. Proceeding without valid fix.", ANSI_YELLOW);
+      // No need to processGps() here as there was no valid data
+    }
+    // Proceed to build and transmit LoRa packet regardless of fix status (buildJsonPayload handles invalid data)
 
-    delay(1); // Minimal delay to yield, allowing other tasks if any (mostly processes serial)
-  }
-
-  // After the loop (either 60s timeout, or 10s stabilization finished)
-  if (fixObtainedDuringWait)
-  {
-    // We successfully detected a fix and waited 10 seconds
-    colorPrint("[SEQUENCE] Proceeding with stabilized GPS fix.", ANSI_GREEN);
-    processGps(); // Process one last time to ensure latest data is encoded
-  }
-  else if (firstFixDetected)
-  {
-    // We detected a fix, but the 60s timeout occurred before the 10s stabilization finished
-    colorPrint("[SEQUENCE] Proceeding with initial GPS fix (stabilization incomplete).", ANSI_YELLOW);
-    processGps(); // Process one last time
+    // Put GPS to sleep AFTER potential fix attempt
+    gpsSleep();
   }
   else
   {
-    // 60s timeout occurred without ever detecting a valid fix
-    colorPrint("[SEQUENCE] GPS fix timeout after 60s. Proceeding without valid fix.", ANSI_YELLOW);
-    // No need to processGps() here as there was no valid data
+    // Home beacon WAS found
+    colorPrint("[SEQUENCE] Home Beacon detected. Skipping GPS fix attempt.", ANSI_BRIGHT_GREEN);
+    gpsSleep(); // Ensure GPS is put back to sleep if it wasn't already
   }
-  // Proceed to build and transmit LoRa packet regardless of fix status (buildJsonPayload handles invalid data)
 
-  // 2. Build and Transmit LoRa Packet
+  // --- 3. Build and Transmit LoRa Packet ---
   craftLoraPacket(); // Call renamed function
 
-  // 3. Post-Transmission: Sleep GPS
-  gpsSleep();
+  // --- 4. Post-Transmission ---
+  // GPS is already put to sleep either after successful scan or after GPS attempt.
 
   colorPrint("[SEQUENCE] Transmission Sequence Complete.", ANSI_MAGENTA); // Use standard color
 }
@@ -424,6 +482,13 @@ void goToLightSleep()
 
   // Clear received message buffer before sleeping
   LoRaRxMsg = "";
+
+  // Reset isHome flag before sleeping
+  if (isHome)
+  { // Only print if it was true
+    colorPrint("[SLEEP] Resetting Home Beacon flag.", ANSI_BLUE);
+    isHome = false;
+  }
 
   // Put LoRa into receive mode to listen for wake-up messages
   colorPrint("[SLEEP] Setting LoRa to receive mode...", ANSI_BLUE);
@@ -439,7 +504,7 @@ void goToLightSleep()
   }
 
   // Configure wake-up sources
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL); // Disable all first, then will renable 
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL); // Disable all first, then will renable
 
   // Timer Wakeup
   esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
@@ -457,7 +522,27 @@ void goToLightSleep()
 
   colorPrint("😴 Entering light sleep...", ANSI_BOLD);
   Serial.flush(); // Ensure all serial messages are sent before sleeping
-  gpsSleep(); // Ensure GPS is in sleep mode before going to light sleep
+  gpsSleep();     // Ensure GPS is in sleep mode before going to light sleep
+
+  // --- Optional: Stop BLE Scan explicitly before sleep ---
+  // Although the scan started in scanForHomeBeacon should have stopped,
+  // it's safer to ensure it's stopped before sleeping.
+  // if (pBLEScan != nullptr && pBLEScan->isScanning()) // <-- Commenting out potentially problematic check
+  if (pBLEScan != nullptr) // Simplified check: just ensure pBLEScan is not null before stopping
+  {
+    // Check if it *was* scanning before stopping (optional, for logging)
+    // bool was_scanning = pBLEScan->isScanning(); // Assuming isScanning() doesn't exist or is unreliable
+    // if(was_scanning) { // Log only if it was scanning
+    colorPrint("[SLEEP] Stopping any active BLE scan...", ANSI_BLUE);
+    pBLEScan->stop();
+    // }
+  }
+  // --- Optional: Deinitialize BLE to save more power ---
+  // BLEDevice::deinit(true); // Set to true to release memory
+  // colorPrint("[SLEEP] BLE Deinitialized.", ANSI_BLUE);
+  // Note: If deinitialized, BLEDevice::init() must be called again after wake-up if needed.
+  // For simplicity now, let's not deinit unless power saving is critical.
+
   // Enter light sleep
   esp_light_sleep_start();
 
@@ -508,56 +593,74 @@ String buildJsonPayload()
   doc["device_id"] = 4; // Or use a variable if needed
   doc["id"] = SENDER_ID;
 
-  // --- Core GPS Data ---
-  bool loc_valid = gps.location.isValid();
-  unsigned long loc_age = gps.location.age(); // Keep age to determine staleness
-  bool sat_valid = gps.satellites.isValid();
-  unsigned long sat_value = gps.satellites.value();
-  bool time_valid = gps.time.isValid();
-  unsigned long time_age = gps.time.age();
-
-  // --- Determine Status based on Validity and Age ---
-  // Consider location stale if valid but age is > 60 seconds (adjust as needed)
-  bool isStale = loc_valid && loc_age > 60000;
-
-  if (loc_valid && !isStale)
+  // --- Check if Home Beacon was detected ---
+  if (isHome)
   {
-    double currentLat = gps.location.lat();
-    double currentLon = gps.location.lng();
-
-    doc["status"] = "outanabout"; // Changed status back
-    doc["lat"] = currentLat;
-    doc["lon"] = currentLon;
-    doc["sats"] = sat_valid ? sat_value : 0; // Include satellite count
-
-    // Calculate distance/bearing
-    double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
-    double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON);
-    String bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
-    doc["dist_m"] = round(dist * 100.0) / 100.0; // Restore distance
-    doc["bearing"] = bearingStr;                 // Restore bearing
-  }
-  else // Location Invalid or Stale
-  {
-    doc["status"] = "error"; // Simplified error status
-    doc["lat"] = 0.0;
-    doc["lon"] = 0.0;
-    doc["sats"] = sat_valid ? sat_value : 0; // Still report sats if available
+    doc["status"] = "Home";
+    doc["lat"] = HOME_LAT; // Use predefined Home coordinates
+    doc["lon"] = HOME_LON;
+    doc["sats"] = -1; // Indicate N/A for satellites
     doc["dist_m"] = 0.0;
     doc["bearing"] = "N/A";
+    doc["time"] = "N/A";                                           // Indicate N/A for time
+    colorPrint("[JSON] Building payload: Status=Home", ANSI_CYAN); // Added log
   }
+  else
+  {
+    // --- Home Beacon NOT detected, use GPS Data ---
+    bool loc_valid = gps.location.isValid();
+    unsigned long loc_age = gps.location.age(); // Keep age to determine staleness
+    bool sat_valid = gps.satellites.isValid();
+    unsigned long sat_value = gps.satellites.value();
+    bool time_valid = gps.time.isValid();
+    unsigned long time_age = gps.time.age();
 
-  // --- Add Timestamp if valid and recent ---
-  if (time_valid && time_age < 60000) { // Check age too
-    char isoTimestamp[25];
-    snprintf(isoTimestamp, sizeof(isoTimestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             gps.date.year(), gps.date.month(), gps.date.day(),
-             gps.time.hour(), gps.time.minute(), gps.time.second());
-    doc["time"] = isoTimestamp; // Restore timestamp
-  } else {
-    doc["time"] = "error"; // Indicate if time is invalid/stale
-  }
+    // Consider location stale if valid but age is > 60 seconds
+    bool isStale = loc_valid && loc_age > 60000;
 
+    if (loc_valid && !isStale)
+    {
+      double currentLat = gps.location.lat();
+      double currentLon = gps.location.lng();
+
+      doc["status"] = "outanabout"; // Changed status back
+      doc["lat"] = currentLat;
+      doc["lon"] = currentLon;
+      doc["sats"] = sat_valid ? sat_value : 0; // Include satellite count
+
+      // Calculate distance/bearing
+      double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
+      double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON);
+      String bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
+      doc["dist_m"] = round(dist * 100.0) / 100.0;                                     // Restore distance
+      doc["bearing"] = bearingStr;                                                     // Restore bearing
+      colorPrint("[JSON] Building payload: Status=outanabout (Valid GPS)", ANSI_CYAN); // Added log
+    }
+    else // Location Invalid or Stale
+    {
+      doc["status"] = "error"; // Simplified error status
+      doc["lat"] = 0.0;
+      doc["lon"] = 0.0;
+      doc["sats"] = sat_valid ? sat_value : 0; // Still report sats if available
+      doc["dist_m"] = 0.0;
+      doc["bearing"] = "N/A";
+      colorPrint("[JSON] Building payload: Status=error (Invalid/Stale GPS)", ANSI_YELLOW); // Added log
+    }
+
+    // --- Add Timestamp if valid and recent ---
+    if (time_valid && time_age < 60000)
+    { // Check age too
+      char isoTimestamp[25];
+      snprintf(isoTimestamp, sizeof(isoTimestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+               gps.date.year(), gps.date.month(), gps.date.day(),
+               gps.time.hour(), gps.time.minute(), gps.time.second());
+      doc["time"] = isoTimestamp; // Restore timestamp
+    }
+    else
+    {
+      doc["time"] = "error"; // Indicate if time is invalid/stale
+    }
+  } // End of else (isHome == false)
 
   String payload;
   serializeJson(doc, payload);
@@ -577,90 +680,6 @@ String buildJsonPayload()
 // █   ██      ██    ██ ██   ██ ██   ██        ██     ██ ██        █
 // █   ███████  ██████  ██   ██ ██   ██        ██    ██   ██       █
 // █                                                                █
-// ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-// --- Transmit LoRa Packet (Common Logic) ---
-void transmitLora(String payload)
-{
-  colorPrint("[LORA TX] Preparing to send: " + payload, ANSI_MAGENTA);
-
-  bool channelClearToSend = false;
-  for (int attempt = 0; attempt < 5; attempt++)
-  {
-    if (isChannelClear())
-    {
-      channelClearToSend = true;
-      break; // Exit loop, channel is clear
-    }
-    else
-    {
-      // Channel busy or CAD failed
-      if (attempt < 4)
-      { // Don't wait after the last attempt
-        colorPrint("[LORA LBT] Channel busy. Waiting 2s (Attempt " + String(attempt + 1) + "/5)...", ANSI_YELLOW);
-        delay(2000);
-      }
-    }
-  }
-
-  if (!channelClearToSend)
-  {
-    colorPrint("[LORA LBT] Channel busy after 5 attempts. Transmitting anyway.", ANSI_YELLOW);
-  }
-
-  // --- Proceed with Transmission ---
-  colorPrint("[LORA TX] Starting transmission...", ANSI_MAGENTA);
-
-  delay(20); // Ensure radio is in standby before transmitting (might already be from CAD)
-  lora.standby();
-
-  int txState = lora.transmit(payload);
-  // ... (rest of the existing transmitLora function: error handling, LED blinking, etc.) ...
-  unsigned long txStart = millis();
-
-  if (txState == RADIOLIB_ERR_NONE)
-  {
-    // Wait for TX to complete - monitor DIO1 or use timeout
-    // Note: SX1262 doesn't typically use DIO1 for TxDone by default with RadioLib's basic transmit.
-    // We'll rely on the blocking nature or add a calculated delay if needed.
-    // For now, assume transmit() blocks or finishes quickly enough.
-    // A more robust method would involve checking BUSY pin or using TxDone interrupt on DIOx.
-    colorPrint("[LORA TX] Transmission started...", ANSI_GREEN);
-
-    // Simple visual indicator while transmitting
-    digitalWrite(48, HIGH); // Turn on status LED
-    // No delay here, assume transmit handles timing or is fast
-
-    Serial.print("[LORA TX] msg [");
-    Serial.print(messageId); // Print the ID that was just sent
-    colorPrint("] sent successfully!", ANSI_GREEN);
-    digitalWrite(48, LOW); // Turn off status LED
-
-    // Add specific success blink using built-in LED
-    for (int i = 0; i < 3; i++) {
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(60);
-        digitalWrite(LED_BUILTIN, LOW);
-        delay(120);
-    }
-  }
-  else
-  {
-    colorPrint("[LORA TX] Transmit failed, code: " + String(txState), ANSI_RED);
-    // Flash status LED (pin 48) rapidly 20 times for error
-    for (int i = 0; i < 20; i++) // Changed loop count to 20
-    {
-      digitalWrite(48, HIGH);
-      delay(50); // Short delay for rapid blink
-      digitalWrite(48, LOW);
-      delay(50); // Short delay for rapid blink
-    }
-  }
-
-  // It's good practice to return to standby after TX attempt
-  lora.standby();
-}
-
-// --- Build and Send LoRa Packet (Unified Function) ---
 // Renamed from sendLoraPacket
 void craftLoraPacket()
 {
@@ -715,9 +734,11 @@ void printStatusReport()
     Serial.println("  Location: Invalid");
   }
   Serial.print("  Satellites: ");
-  Serial.println(gps.satellites.value()); // Check validity
+  // Check validity before printing value
+  Serial.println(gps.satellites.isValid() ? String(gps.satellites.value()) : "Invalid");
   Serial.print("  HDOP: ");
-  Serial.println(gps.hdop.value()); // Check validity
+  // Check validity before printing value
+  Serial.println(gps.hdop.isValid() ? String(gps.hdop.value() / 100.0) : "Invalid"); // HDOP is often scaled by 100
   Serial.print("  Last Rx Msg: ");
   Serial.println(LoRaRxMsg.length() > 0 ? LoRaRxMsg : "None");
   Serial.print("  Free Heap: ");
@@ -727,7 +748,7 @@ void printStatusReport()
   colorPrint("-------------------------------------------------------", ANSI_BOLD);
 }
 
-void colorPrint(const String &message, const char *color) // Match declaration
+void colorPrint(const String &message, const char *color = ANSI_RESET) // <-- ADDED default argument back
 {
   Serial.print(color);
   Serial.println(message);
@@ -786,6 +807,65 @@ String cardinalDirection(double bearing)
   return String(directions[index]);
 }
 
+// --- BLE Scan for Home Beacon ---
+bool scanForHomeBeacon(uint32_t scanDurationSeconds)
+{
+  if (pBLEScan == nullptr)
+  {
+    colorPrint("[BLE ERROR] Scanner not initialized! Cannot scan.", ANSI_RED);
+    return false;
+  }
+
+  colorPrint("[BLE] Starting scan for \"" + String(targetDeviceName) + "\" (" + String(scanDurationSeconds) + "s)...", ANSI_BLUE);
+  isHome = false; // Reset flag before each scan
+
+  // Ensure BLE is initialized (might be needed if deinitialized during sleep)
+  // BLEDevice::init(""); // Re-init if deinitialized
+  // pBLEScan = BLEDevice::getScan(); // Re-get scanner if re-initialized
+  // pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  // pBLEScan->setActiveScan(true);
+  // pBLEScan->setInterval(100);
+  // pBLEScan->setWindow(99);
+
+  // Start the scan. The scan runs for scanDurationSeconds.
+  // The callback (MyAdvertisedDeviceCallbacks::onResult) will set isHome = true
+  // and call pBLEScan->stop() if the target device is found.
+  // The 'false' argument means the scan is non-blocking.
+  pBLEScan->start(scanDurationSeconds, false);
+
+  // We need to wait here for the scan to complete or be stopped by the callback.
+  // Since the scan runs in the background, we can use a simple delay loop.
+  // Check isHome periodically to allow early exit if the beacon is found quickly.
+  unsigned long scanStartTime = millis();
+  while (millis() - scanStartTime < (scanDurationSeconds * 1000))
+  {
+    if (isHome)
+    {
+      // Beacon found by callback, which should have also stopped the scan.
+      break; // Exit the wait loop early
+    }
+    delay(100); // Wait a bit before checking again
+  }
+
+  // After scan duration or early exit, check the flag
+  if (isHome)
+  {
+    colorPrint("[BLE] Scan complete. Home Beacon FOUND!", ANSI_BRIGHT_GREEN);
+  }
+  else
+  {
+    colorPrint("[BLE] Scan complete. Home Beacon NOT found.", ANSI_YELLOW);
+    // Ensure scan is stopped if timeout occurred before finding the device
+    colorPrint("[BLE] Stopping scan after timeout (if running).", ANSI_BLUE);
+    pBLEScan->stop(); // Stop scan regardless of current state
+  }
+
+  // Optional: Deinitialize BLE here if deep power saving is needed between scans
+  // BLEDevice::deinit(true);
+
+  return isHome;
+}
+
 // --- Check LoRa Channel Activity (CAD) ---
 bool isChannelClear()
 {
@@ -810,26 +890,92 @@ bool isChannelClear()
   // Wait for CAD to complete. This duration depends on LoRa settings (BW, SF).
   // A simple delay is used here; a more robust method might use DIO interrupts if configured.
   // This delay might be too short or too long depending on settings. Increased slightly.
-  delay(100); // Adjusted fixed delay for CAD completion
+  // RadioLib example uses a loop checking digitalRead(LORA_DIO1) == HIGH for CAD completion.
+  // Let's try a slightly longer fixed delay for now.
+  delay(20); // Adjusted fixed delay for CAD completion (might need tuning based on SF/BW)
 
   // Check CAD result
-  state = lora.getChannelScanResult();
+  // According to RadioLib docs, getChannelScanResult() returns RADIOLIB_ERR_NONE if channel is free,
+  // RADIOLIB_PREAMBLE_DETECTED if preamble detected (channel busy), or other error codes.
+  // Let's adjust the logic based on documentation.
+  bool cadDetected = lora.isChannelBusy(); // Use the simpler isChannelBusy() method after startChannelScan()
 
-  if (state == RADIOLIB_CHANNEL_FREE)
+  if (!cadDetected) // isChannelBusy returns true if preamble detected, false otherwise (or on error)
   {
-    colorPrint("[LORA CAD] Channel is free!", ANSI_GREEN);
-    return true;
+    // We need to check the internal state for errors vs. free channel
+    int cadResultState = lora.getCADResult(); // Check the actual result code
+    if (cadResultState == RADIOLIB_ERR_NONE)
+    {
+      colorPrint("[LORA CAD] Channel is free!", ANSI_GREEN);
+      return true;
+    }
+    else
+    {
+      colorPrint("[LORA CAD] CAD failed or unknown result: " + String(cadResultState), ANSI_RED);
+      return false; // Treat errors as busy
+    }
   }
-  else if (state == RADIOLIB_LORA_DETECTED)
+  else // isChannelBusy returned true
   {
-    colorPrint("[LORA CAD] LoRa signal detected!", ANSI_YELLOW);
+    colorPrint("[LORA CAD] LoRa signal detected (Channel Busy)!", ANSI_YELLOW);
     return false;
+  }
+}
+
+// ... existing transmitLora function ...
+// Add the transmitLora function definition if it's missing or update it
+void transmitLora(String payload)
+{
+  colorPrint("[LORA TX] Preparing to transmit...", ANSI_BLUE);
+
+  // 1. Check Channel Activity (CAD) before transmitting
+  if (!isChannelClear())
+  {
+    colorPrint("[LORA TX] Channel busy! Transmission aborted.", ANSI_YELLOW);
+    // Optional: Implement backoff strategy here (e.g., wait random time and retry)
+    // For now, just skip transmission
+    return; // Exit the function, do not transmit
+  }
+
+  // 2. Channel is clear, proceed with transmission
+  colorPrint("[LORA TX] Channel clear. Transmitting packet (" + String(payload.length()) + " bytes)...", ANSI_BLUE);
+  colorPrint("  Payload: " + payload, ANSI_CYAN); // Print payload being sent
+
+  // Put LoRa into standby mode before transmitting
+  int state = lora.standby();
+  if (state != RADIOLIB_ERR_NONE)
+  {
+    colorPrint("[LORA TX ERROR] Failed to enter standby before transmit: " + String(state), ANSI_RED);
+    // Decide how to handle: maybe still try to transmit? Or abort?
+    // For now, let's try to continue.
+  }
+
+  // Transmit the packet
+  state = lora.transmit(payload);
+
+  // Handle transmission result
+  if (state == RADIOLIB_ERR_NONE)
+  {
+    colorPrint("[LORA TX] Transmission successful!", ANSI_BRIGHT_GREEN);
+    ledFlicker(); // Flicker LED on successful transmission
+  }
+  else if (state == RADIOLIB_ERR_PACKET_TOO_LONG)
+  {
+    colorPrint("[LORA TX ERROR] Packet too long!", ANSI_RED);
+  }
+  else if (state == RADIOLIB_ERR_TX_TIMEOUT)
+  {
+    colorPrint("[LORA TX ERROR] Transmission timeout!", ANSI_RED);
   }
   else
   {
-    colorPrint("[LORA CAD] CAD failed or unknown result: " + String(state), ANSI_RED);
-    return false; // Treat errors or unexpected results as busy
+    colorPrint("[LORA TX ERROR] Transmission failed, code: " + String(state), ANSI_RED);
   }
+
+  // 3. Put LoRa back into a low-power state or receive mode after transmission
+  // For this application, we usually go back to sleep, which sets receive mode.
+  // If not sleeping immediately, explicitly set standby or receive here.
+  // lora.standby(); // Or lora.startReceive() if needed immediately
 }
 // ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
 // █                                                                             █
