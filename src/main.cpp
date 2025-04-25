@@ -876,7 +876,7 @@ bool isChannelClear()
   if (state != RADIOLIB_ERR_NONE)
   {
     colorPrint("[LORA CAD] Failed to enter standby before CAD: " + String(state), ANSI_RED);
-    return false; // Indicate failure, maybe transmit anyway later? For now, treat as busy.
+    return false; // Indicate failure, treat as busy.
   }
 
   // Start CAD
@@ -887,39 +887,34 @@ bool isChannelClear()
     return false; // Indicate failure
   }
 
-  // Wait for CAD to complete. This duration depends on LoRa settings (BW, SF).
-  // A simple delay is used here; a more robust method might use DIO interrupts if configured.
-  // This delay might be too short or too long depending on settings. Increased slightly.
-  // RadioLib example uses a loop checking digitalRead(LORA_DIO1) == HIGH for CAD completion.
-  // Let's try a slightly longer fixed delay for now.
-  delay(20); // Adjusted fixed delay for CAD completion (might need tuning based on SF/BW)
+  // Wait for CAD to complete.
+  // A simple delay is used here. A more robust method might use DIO interrupts.
+  // This delay might need tuning based on LoRa settings (SF/BW).
+  delay(20); // Adjusted fixed delay for CAD completion
 
-  // Check CAD result
-  // According to RadioLib docs, getChannelScanResult() returns RADIOLIB_ERR_NONE if channel is free,
-  // RADIOLIB_PREAMBLE_DETECTED if preamble detected (channel busy), or other error codes.
-  // Let's adjust the logic based on documentation.
-  bool cadDetected = lora.isChannelBusy(); // Use the simpler isChannelBusy() method after startChannelScan()
+  // Check CAD result using getChannelScanResult()
+  int cadResultState = lora.getChannelScanResult(); // <-- Use getChannelScanResult()
 
-  if (!cadDetected) // isChannelBusy returns true if preamble detected, false otherwise (or on error)
+  // Interpret the result
+  if (cadResultState == RADIOLIB_CHANNEL_FREE) // <-- Check against RADIOLIB_CHANNEL_FREE
   {
-    // We need to check the internal state for errors vs. free channel
-    int cadResultState = lora.getCADResult(); // Check the actual result code
-    if (cadResultState == RADIOLIB_ERR_NONE)
-    {
-      colorPrint("[LORA CAD] Channel is free!", ANSI_GREEN);
-      return true;
-    }
-    else
-    {
-      colorPrint("[LORA CAD] CAD failed or unknown result: " + String(cadResultState), ANSI_RED);
-      return false; // Treat errors as busy
-    }
+    // Channel is clear
+    colorPrint("[LORA CAD] Channel is free!", ANSI_GREEN);
+    return true;
   }
-  else // isChannelBusy returned true
+  else if (cadResultState == RADIOLIB_PREAMBLE_DETECTED) // <-- Check against RADIOLIB_PREAMBLE_DETECTED
   {
+    // Channel is busy (preamble detected)
     colorPrint("[LORA CAD] LoRa signal detected (Channel Busy)!", ANSI_YELLOW);
     return false;
   }
+  else
+  {
+    // CAD failed or returned an unexpected error code
+    colorPrint("[LORA CAD] CAD failed or unknown result: " + String(cadResultState), ANSI_RED);
+    return false; // Treat errors as busy for safety
+  }
+  // Note: Removed the previous incorrect logic using isChannelBusy() and duplicated checks.
 }
 
 // ... existing transmitLora function ...
