@@ -49,6 +49,9 @@
 #define HOME_LON -2.2396017778476716
 // #define SEND_INTERVAL 60000 // milliseconds (60 seconds) - Commented out, using sleep timer
 
+// --- Device ID Mapping ---
+uint16_t DEVICE_ID_HEX = 0x0000; // Default/Unknown ID
+
 // Sleep Configuration
 // ┌─────────────────┐
 // │ Sleep Settings  │
@@ -158,6 +161,39 @@ void setup()
 
   // --- Button Pin Setup ---
   pinMode(STATUS_BUTTON_PIN, INPUT_PULLUP); // Configure button pin
+
+  // --- Determine Device ID based on SENDER_ID ---
+  String sender = SENDER_ID; // Convert macro to String for comparison
+  if (sender == "Podge")
+  {
+    DEVICE_ID_HEX = 0x1111;
+  }
+  else if (sender == "Macy")
+  {
+    DEVICE_ID_HEX = 0x2222;
+  }
+  else if (sender == "Gizmo")
+  {
+    DEVICE_ID_HEX = 0x3333;
+  }
+  else if (sender == "Simba")
+  {
+    DEVICE_ID_HEX = 0x4444;
+  }
+  else if (sender == "Carrie")
+  {
+    DEVICE_ID_HEX = 0x5555;
+  }
+  else if (sender == "Chloe")
+  {
+    DEVICE_ID_HEX = 0x6666;
+  }
+  else
+  {
+    DEVICE_ID_HEX = 0xFFFF; // Indicate an unknown/unmapped ID
+    colorPrint("[WARN] Unknown SENDER_ID: " + sender + ". Using default hex ID.", ANSI_YELLOW);
+  }
+  colorPrint("[INIT] Device ID set to: 0x" + String(DEVICE_ID_HEX, HEX), ANSI_BLUE);
 
   // --- GPS Pin Setup ---
   pinMode(GPS_RESET, OUTPUT);
@@ -588,21 +624,24 @@ String buildJsonPayload()
   // Increased size slightly to accommodate timestamp, distance, bearing
   StaticJsonDocument<300> doc; // Adjusted size
 
-  // Add static fields
-  doc["msg_id"] = messageId;
-  doc["device_id"] = 4; // Or use a variable if needed
-  doc["id"] = SENDER_ID;
+  // Add static fields with shorter keys
+  doc["mid"] = messageId;                         // msg_id -> mid
+  doc["did"] = "0x" + String(DEVICE_ID_HEX, HEX); // device_id -> did
+  doc["id"] = SENDER_ID;                          // id remains id
 
   // --- Check if Home Beacon was detected ---
   if (isHome)
   {
-    doc["status"] = "Home";
-    doc["lat"] = HOME_LAT; // Use predefined Home coordinates
-    doc["lon"] = HOME_LON;
-    doc["sats"] = -1; // Indicate N/A for satellites
-    doc["dist_m"] = 0.0;
-    doc["bearing"] = "N/A";
-    doc["time"] = "N/A";                                           // Indicate N/A for time
+    doc["stat"] = "H"; // status -> stat, "Home" -> "H"
+    // Truncate home coordinates before assigning
+    double truncatedHomeLat = round(HOME_LAT * 100000.0) / 100000.0;
+    double truncatedHomeLon = round(HOME_LON * 100000.0) / 100000.0;
+    doc["lat"] = truncatedHomeLat;                                 // Assign truncated value
+    doc["lon"] = truncatedHomeLon;                                 // Assign truncated value
+    doc["sat"] = -1;                                               // sats -> sat
+    doc["dst"] = 0.0;                                              // dist_m -> dst
+    doc["dir"] = "NA";                                             // bearing -> dir, "N/A" -> "NA"
+    doc["ts"] = "NA";                                              // time -> ts, "N/A" -> "NA"
     colorPrint("[JSON] Building payload: Status=Home", ANSI_CYAN); // Added log
   }
   else
@@ -623,27 +662,31 @@ String buildJsonPayload()
       double currentLat = gps.location.lat();
       double currentLon = gps.location.lng();
 
-      doc["status"] = "outanabout"; // Changed status back
-      doc["lat"] = currentLat;
-      doc["lon"] = currentLon;
-      doc["sats"] = sat_valid ? sat_value : 0; // Include satellite count
+      doc["stat"] = "O"; // status -> stat, "outanabout" -> "O"
+      // Truncate current coordinates before assigning
+      double truncatedCurrentLat = round(currentLat * 100000.0) / 100000.0;
+      double truncatedCurrentLon = round(currentLon * 100000.0) / 100000.0;
+      doc["lat"] = truncatedCurrentLat;       // Assign truncated value
+      doc["lon"] = truncatedCurrentLon;       // Assign truncated value
+      doc["sat"] = sat_valid ? sat_value : 0; // sats -> sat
 
       // Calculate distance/bearing
       double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
       double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON);
+      // Keep bearing calculation, but use shorter key and value
       String bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
-      doc["dist_m"] = round(dist * 100.0) / 100.0;                                     // Restore distance
-      doc["bearing"] = bearingStr;                                                     // Restore bearing
+      doc["dst"] = round(dist * 100.0) / 100.0;                                        // dist_m -> dst
+      doc["dir"] = bearingStr;                                                         // bearing -> dir
       colorPrint("[JSON] Building payload: Status=outanabout (Valid GPS)", ANSI_CYAN); // Added log
     }
     else // Location Invalid or Stale
     {
-      doc["status"] = "error"; // Simplified error status
-      doc["lat"] = 0.0;
+      doc["stat"] = "E"; // status -> stat, "error" -> "E"
+      doc["lat"] = 0.0;  // No truncation needed for 0.0
       doc["lon"] = 0.0;
-      doc["sats"] = sat_valid ? sat_value : 0; // Still report sats if available
-      doc["dist_m"] = 0.0;
-      doc["bearing"] = "N/A";
+      doc["sat"] = sat_valid ? sat_value : 0;                                               // sats -> sat
+      doc["dst"] = 0.0;                                                                     // dist_m -> dst
+      doc["dir"] = "NA";                                                                    // bearing -> dir, "N/A" -> "NA"
       colorPrint("[JSON] Building payload: Status=error (Invalid/Stale GPS)", ANSI_YELLOW); // Added log
     }
 
@@ -654,11 +697,11 @@ String buildJsonPayload()
       snprintf(isoTimestamp, sizeof(isoTimestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                gps.date.year(), gps.date.month(), gps.date.day(),
                gps.time.hour(), gps.time.minute(), gps.time.second());
-      doc["time"] = isoTimestamp; // Restore timestamp
+      doc["ts"] = isoTimestamp; // time -> ts
     }
     else
     {
-      doc["time"] = "error"; // Indicate if time is invalid/stale
+      doc["ts"] = "E"; // time -> ts, "error" -> "E"
     }
   } // End of else (isHome == false)
 
@@ -707,7 +750,7 @@ void ledFlicker()
     digitalWrite(48, HIGH);
     delay(50); // ~1/12th second ON
     digitalWrite(48, LOW);
-    delay(50); // ~1/12th second OFF (Total cycle ~1/6th sec, 6 cycles ~1 sec)
+    delay(50); // ~1/12th second OFF (Total cycle ~1 sec, 6 cycles ~1 sec)
   }
 }
 
