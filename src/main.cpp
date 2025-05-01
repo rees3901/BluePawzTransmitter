@@ -57,7 +57,10 @@ uint16_t DEVICE_ID_HEX = 0x0000; // Default/Unknown ID
 // │ Sleep Settings  │
 // └─────────────────┘
 
-#define SLEEP_DURATION_US (30 * 1000000ULL) // 30 seconds in microseconds
+// #define SLEEP_DURATION_US (30 * 1000000ULL) // 30 seconds in microseconds <-- REMOVE OLD DEFINE
+#define SLEEP_DURATION_AWAY_US (30 * 1000000ULL)                   // 30 seconds when away
+#define SLEEP_DURATION_HOME_US (120 * 1000000ULL)                  // 120 seconds (2 minutes) when home
+volatile uint64_t currentSleepDurationUs = SLEEP_DURATION_AWAY_US; // Variable to hold current sleep duration, default to away
 
 // BLE Configuration
 const char *targetDeviceName = "CAT_TRACKER_HQ";
@@ -434,6 +437,18 @@ void performTransmissionSequence()
   colorPrint("[SEQUENCE] Scanning for Home Beacon (10s)...", ANSI_YELLOW);
   bool foundHome = scanForHomeBeacon(10); // Scan for 10 seconds, returns true if home found
 
+  // --- Adjust Sleep Duration based on BLE Scan ---
+  if (foundHome)
+  {
+    currentSleepDurationUs = SLEEP_DURATION_HOME_US;
+    colorPrint("[SEQUENCE] Home detected. Setting sleep duration to " + String(currentSleepDurationUs / 1000000ULL) + "s.", ANSI_BRIGHT_GREEN);
+  }
+  else
+  {
+    currentSleepDurationUs = SLEEP_DURATION_AWAY_US;
+    colorPrint("[SEQUENCE] Home not detected. Setting sleep duration to " + String(currentSleepDurationUs / 1000000ULL) + "s.", ANSI_YELLOW);
+  }
+
   // --- 2. GPS Fix Attempt (Only if Home Beacon NOT Found) ---
   if (!foundHome)
   { // Use the return value from the scan function
@@ -520,6 +535,8 @@ void goToLightSleep()
   LoRaRxMsg = "";
 
   // Reset isHome flag before sleeping
+  // Note: The decision on sleep duration is already made in performTransmissionSequence based on the scan result.
+  // We still reset the flag here for the next cycle's scan logic.
   if (isHome)
   { // Only print if it was true
     colorPrint("[SLEEP] Resetting Home Beacon flag.", ANSI_BLUE);
@@ -542,9 +559,9 @@ void goToLightSleep()
   // Configure wake-up sources
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL); // Disable all first, then will renable
 
-  // Timer Wakeup
-  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
-  colorPrint("[SLEEP] Wakeup enabled: Timer (" + String(SLEEP_DURATION_US / 1000000ULL) + "s)", ANSI_BLUE);
+  // Timer Wakeup - Use the dynamically set duration
+  esp_sleep_enable_timer_wakeup(currentSleepDurationUs);
+  colorPrint("[SLEEP] Wakeup enabled: Timer (" + String(currentSleepDurationUs / 1000000ULL) + "s)", ANSI_BLUE); // Use variable here
 
   // Button Wakeup (EXT0) - Requires the pin number and level (0 for LOW)
   esp_sleep_enable_ext0_wakeup(STATUS_BUTTON_PIN, 0);
