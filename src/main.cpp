@@ -40,6 +40,7 @@
 
 // Button pin for status report and manual wake/transmit
 #define STATUS_BUTTON_PIN GPIO_NUM_21 // Use GPIO_NUM_x for sleep functions
+#define STATUS_LED_PIN 48             // Pin for the status LED used in ledFlicker
 
 // #define SENDER_ID "Podge"
 #define SENDER_ID "Macy"
@@ -86,12 +87,38 @@ volatile bool isHome = false; // Flag to indicate if home beacon is detected
 #define ANSI_BOLD "\033[1m"
 #define ANSI_RESET "\033[0m"
 
+// --- BLE Callback Class ---
+// Moved definition before first use
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+{
+  void onResult(BLEAdvertisedDevice advertisedDevice)
+  {
+    // Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str()); // Debug: Print all found devices
+    if (advertisedDevice.haveName() && advertisedDevice.getName() == targetDeviceName)
+    {
+      colorPrint("[BLE] Found Home Beacon! (" + String(targetDeviceName) + ")", ANSI_BRIGHT_GREEN);
+      isHome = true;
+      // Stop scan early if target is found
+      // Check if pBLEScan is initialized before using
+      if (pBLEScan != nullptr) // Simplified check
+      {                        // Check if scanning before stopping
+        // No need to check isScanning() if stop() is idempotent (safe to call multiple times)
+        pBLEScan->stop();
+        colorPrint("[BLE] Scan stopped early.", ANSI_BLUE);
+      }
+    }
+  }
+};
+
 // Hardware Instances
 SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1); // Use UART peripheral 1 (adjust if needed)
 // HardwareSerial gpsSerial(44, 43); // <-- Constructor doesn't take pins
+
+// --- Create single BLE Callback instance ---
+MyAdvertisedDeviceCallbacks bleCallbacks; // Create one instance globally
 
 // Global State Variables
 bool gpsIsAwake = true; // Assume awake initially after setup
@@ -124,28 +151,6 @@ bool scanForHomeBeacon(uint32_t scanDurationSeconds); // <-- Add forward declara
 void ledFlicker();                                    // <-- Add forward declaration
 bool isChannelClear();                                // <-- Add forward declaration for CAD function
 
-// --- BLE Callback Class ---
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
-{
-  void onResult(BLEAdvertisedDevice advertisedDevice)
-  {
-    // Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str()); // Debug: Print all found devices
-    if (advertisedDevice.haveName() && advertisedDevice.getName() == targetDeviceName)
-    {
-      colorPrint("[BLE] Found Home Beacon! (" + String(targetDeviceName) + ")", ANSI_BRIGHT_GREEN);
-      isHome = true;
-      // Stop scan early if target is found
-      // Check if pBLEScan is initialized before using
-      if (pBLEScan != nullptr) // Simplified check
-      {                        // Check if scanning before stopping
-        // No need to check isScanning() if stop() is idempotent (safe to call multiple times)
-        pBLEScan->stop();
-        colorPrint("[BLE] Scan stopped early.", ANSI_BLUE);
-      }
-    }
-  }
-};
-
 // --- SETUP ---
 // ┌─────────────────┐
 // │   Setup Loop    │
@@ -160,7 +165,7 @@ void setup()
   delay(200); // Give some time for the serial monitor to open
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
-  pinMode(48, OUTPUT); // Status LED
+  pinMode(STATUS_LED_PIN, OUTPUT); // Status LED
 
   // --- Button Pin Setup ---
   pinMode(STATUS_BUTTON_PIN, INPUT_PULLUP); // Configure button pin
@@ -320,10 +325,10 @@ void setup()
   }
   else
   {
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setActiveScan(true); // Active scan uses more power but is needed to get device names
-    pBLEScan->setInterval(100);    // Scan interval (milliseconds)
-    pBLEScan->setWindow(99);       // Scan window (milliseconds), must be <= interval
+    pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks); // Use address of the global instance
+    pBLEScan->setActiveScan(true);                         // Active scan uses more power but is needed to get device names
+    pBLEScan->setInterval(100);                            // Scan interval (milliseconds)
+    pBLEScan->setWindow(99);                               // Scan window (milliseconds), must be <= interval
     colorPrint("[INIT] BLE Scanner Initialized.", ANSI_BLUE);
   }
 
@@ -591,8 +596,8 @@ void goToLightSleep()
     // }
   }
   // --- Optional: Deinitialize BLE to save more power ---
-  // BLEDevice::deinit(true); // Set to true to release memory
-  // colorPrint("[SLEEP] BLE Deinitialized.", ANSI_BLUE);
+  BLEDevice::deinit(true);                             // Set to true to release memory
+  colorPrint("[SLEEP] BLE Deinitialized.", ANSI_BLUE); // <-- Add log message
   // Note: If deinitialized, BLEDevice::init() must be called again after wake-up if needed.
   // For simplicity now, let's not deinit unless power saving is critical.
 
@@ -601,18 +606,6 @@ void goToLightSleep()
 
   // --- Execution resumes in loop() after wake-up ---
 }
-
-// ──────────────────────────────
-// │  HELPER FUNCTIONS          │
-// ──────────────────────────────
-
-// --- Button Handling (Now handled by wake-up interrupt) ---
-/*
-void checkButton()
-{
-  // This function is no longer needed as button press triggers EXT0 wake-up
-}
-*/
 
 // --- Process GPS Data ---
 void processGps()
@@ -761,13 +754,13 @@ void craftLoraPacket()
 void ledFlicker()
 {
   colorPrint("[LED] Flickering status LED...", ANSI_BLUE);
-  pinMode(48, OUTPUT); // Ensure pin is output
+  pinMode(STATUS_LED_PIN, OUTPUT); // Ensure pin is output - Use defined pin
   for (int i = 0; i < 6; i++)
   {
-    digitalWrite(48, HIGH);
-    delay(50); // ~1/12th second ON
-    digitalWrite(48, LOW);
-    delay(50); // ~1/12th second OFF (Total cycle ~1 sec, 6 cycles ~1 sec)
+    digitalWrite(STATUS_LED_PIN, HIGH); // Use defined pin
+    delay(50);                          // ~1/12th second ON
+    digitalWrite(STATUS_LED_PIN, LOW);  // Use defined pin
+    delay(50);                          // ~1/12th second OFF (Total cycle ~1 sec, 6 cycles ~1 sec)
   }
 }
 
@@ -870,18 +863,38 @@ String cardinalDirection(double bearing)
 // --- BLE Scan for Home Beacon ---
 bool scanForHomeBeacon(uint32_t scanDurationSeconds)
 {
+  // --- Re-initialize BLE after waking from sleep (if deinitialized) ---
+  colorPrint("[BLE] Initializing BLE for scan...", ANSI_BLUE);
+  BLEDevice::init("");             // Initialize BLE device
+  pBLEScan = BLEDevice::getScan(); // Get the scanner instance
   if (pBLEScan == nullptr)
   {
-    colorPrint("[BLE ERROR] Scanner not initialized! Cannot scan.", ANSI_RED);
-    return false;
+    colorPrint("[BLE ERROR] Failed to get BLE Scanner instance after re-init!", ANSI_RED);
+    return false; // Cannot proceed without scanner
   }
+  // Re-apply callbacks and scan parameters
+  // Note: If BLEDevice::deinit() is NOT used in goToLightSleep, some of this re-init might be skippable.
+  // However, re-applying ensures a known state after wake-up.
+  pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks); // Use address of the global instance
+  pBLEScan->setActiveScan(true);                         // Active scan uses more power but is needed to get device names
+  pBLEScan->setInterval(100);                            // Scan interval (milliseconds)
+  pBLEScan->setWindow(99);                               // Scan window (milliseconds), must be <= interval
+  colorPrint("[BLE] BLE Scanner Re-initialized.", ANSI_BLUE);
+  // --- End Re-initialization ---
+
+  // No need for the null check here again as it's done after re-init
+  // if (pBLEScan == nullptr)
+  // {
+  //   colorPrint("[BLE ERROR] Scanner not initialized! Cannot scan.", ANSI_RED);
+  //   return false;
+  // }
 
   colorPrint("[BLE] Starting scan for \"" + String(targetDeviceName) + "\" (" + String(scanDurationSeconds) + "s)...", ANSI_BLUE);
   isHome = false; // Reset flag before each scan
 
-  // Ensure BLE is initialized (might be needed if deinitialized during sleep)
-  // BLEDevice::init(""); // Re-init if deinitialized
-  // pBLEScan = BLEDevice::getScan(); // Re-get scanner if re-initialized
+  // REMOVE Redundant/Partial Re-init lines:
+  // BLEDevice::init("");
+  // pBLEScan = BLEDevice::getScan();
   // pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   // pBLEScan->setActiveScan(true);
   // pBLEScan->setInterval(100);
@@ -948,8 +961,8 @@ bool isChannelClear()
   }
 
   // Wait for CAD to complete.
-  // A simple delay is used here. A more robust method might use DIO interrupts.
-  // This delay might need tuning based on LoRa settings (SF/BW).
+  // NOTE: This fixed delay might need tuning based on LoRa settings (SF/BW).
+  // A more robust method might use DIO interrupts if available/configured.
   delay(20); // Adjusted fixed delay for CAD completion
 
   // Check CAD result using getChannelScanResult()
