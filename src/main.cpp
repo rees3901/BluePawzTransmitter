@@ -356,7 +356,10 @@ void setup()
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void loop()
 {
-  // Serial.begin(115200); // <-- REMOVE Serial.begin from loop, it should only be in setup
+  // Reinitialize Serial after waking up
+  Serial.begin(115200);                                        // Reopen the serial port
+  Serial.println("\n[WAKE] Serial connection reestablished."); // Log wake-up
+
   // --- Code execution resumes here after wake-up ---
   colorPrint("\n☀️ Woke up!", ANSI_BRIGHT_YELLOW);
 
@@ -580,6 +583,7 @@ void goToLightSleep()
 
   colorPrint("😴 Entering light sleep...", ANSI_BOLD);
   Serial.flush(); // Ensure all serial messages are sent before sleeping
+  Serial.end();   // Properly close the serial port before sleep
   gpsSleep();     // Ensure GPS is in sleep mode before going to light sleep
 
   // --- Optional: Stop BLE Scan explicitly before sleep ---
@@ -732,7 +736,7 @@ String buildJsonPayload()
 // █   ██      ██    ██ ██████  ███████        ██      ███         █
 // █   ██      ██    ██ ██   ██ ██   ██        ██     ██ ██        █
 // █   ███████  ██████  ██   ██ ██   ██        ██    ██   ██       █
-// █                                                                █
+// ██ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █                                                                 █
 // Renamed from sendLoraPacket
 void craftLoraPacket()
 {
