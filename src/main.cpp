@@ -16,6 +16,10 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <esp_attr.h> // For RTC_DATA_ATTR
+
+// Remove FlickerType enum and ledFlicker(FlickerType)
+// Add three simple flicker functions
 
 // Define LED_BUILTIN if not already defined (common for ESP32)
 #ifndef LED_BUILTIN
@@ -59,8 +63,8 @@ uint16_t DEVICE_ID_HEX = 0x0000; // Default/Unknown ID
 // └─────────────────┘
 
 // #define SLEEP_DURATION_US (30 * 1000000ULL) // 30 seconds in microseconds <-- REMOVE OLD DEFINE
-#define SLEEP_DURATION_AWAY_US (30 * 1000000ULL)                   // 30 seconds when away
-#define SLEEP_DURATION_HOME_US (120 * 1000000ULL)                  // 120 seconds (2 minutes) when home
+#define SLEEP_DURATION_AWAY_US (10 * 1000000ULL)                   // 10 seconds when away
+#define SLEEP_DURATION_HOME_US (10 * 1000000ULL)                   // 10 seconds when home
 volatile uint64_t currentSleepDurationUs = SLEEP_DURATION_AWAY_US; // Variable to hold current sleep duration, default to away
 
 // BLE Configuration
@@ -87,8 +91,64 @@ volatile bool isHome = false; // Flag to indicate if home beacon is detected
 #define ANSI_BOLD "\033[1m"
 #define ANSI_RESET "\033[0m"
 
+// Forward Declarations
+void colorPrint(const String &message, const char *color = ANSI_RESET); // Moved earlier
+void printStatusReport();
+void gpsWake();
+void gpsSleep();
+String cardinalDirection(double bearing);
+void processGps();
+void periodicStatusUpdate();
+void transmitLora(String payload);
+String buildJsonPayload();
+void craftLoraPacket();
+void handleWakeupReason();
+void handleLoraReception();
+void performTransmissionSequence();
+void goToLightSleep();
+bool scanForHomeBeacon(uint32_t scanDurationSeconds);
+
+void flickerShort()
+{
+  colorPrint("[LED] Flickering status LED (short)...", ANSI_BLUE);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  for (int i = 0; i < 3; i++)
+  {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    delay(30);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    delay(30);
+  }
+}
+void flickerMedium()
+{
+  colorPrint("[LED] Flickering status LED (medium)...", ANSI_BLUE);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  for (int i = 0; i < 6; i++)
+  {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    delay(50);
+  }
+}
+void flickerLong()
+{
+  colorPrint("[LED] Flickering status LED (long)...", ANSI_BLUE);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  for (int i = 0; i < 12; i++)
+  {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    delay(80);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    delay(80);
+  }
+}
+
+// --- RTC Memory Flag ---
+RTC_DATA_ATTR int bootFlag = 0; // 0 = cold boot, 1 = woke from sleep
+
 // --- BLE Callback Class ---
-// Moved definition before first use
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
 {
   void onResult(BLEAdvertisedDevice advertisedDevice)
@@ -132,37 +192,32 @@ String LoRaRxMsg = "";         // Buffer for received LoRa message
 // bool manualTxInProgress = false; // Replaced by button wake-up logic
 // bool lastButtonState = HIGH; // Replaced by interrupt wake-up
 
-// Forward Declarations
-void printStatusReport();
-void colorPrint(const String &message, const char *color = ANSI_RESET); // Ensure this matches definition
-void gpsWake();
-void gpsSleep();
-String cardinalDirection(double bearing);
-void processGps();
-void periodicStatusUpdate(); // Keep for periodic updates while awake
-void transmitLora(String payload);
-String buildJsonPayload(); // Removed flag
-void craftLoraPacket();    // Renamed from sendLoraPacket
-void handleWakeupReason();
-void handleLoraReception();
-void performTransmissionSequence(); // Removed flag
-void goToLightSleep();
-bool scanForHomeBeacon(uint32_t scanDurationSeconds); // <-- Add forward declaration for BLE scan function
-void ledFlicker();                                    // <-- Add forward declaration
-bool isChannelClear();                                // <-- Add forward declaration for CAD function
-
 // --- SETUP ---
 // ┌─────────────────┐
 // │   Setup Loop    │
 // └─────────────────┘
 void setup()
 {
+  // --- Check RTC flag and wakeup reason ---
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (bootFlag == 1 && (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_GPIO))
+  {
+    // Woke from sleep, skip full setup
+    Serial.begin(115200);
+    colorPrint("[WAKE] Skipping full setup, resuming from sleep...", ANSI_BRIGHT_YELLOW);
+    // Reset flag for next sleep cycle
+    bootFlag = 0;
+    return;
+  }
+  bootFlag = 0; // Ensure flag is cleared on cold boot
+
   delay(1000);                                                                 // Wait for serial monitor
   Serial.begin(115200);                                                        // <-- Initialize Serial communication first
   Serial.println("\n[BOOT] Serial connection established. Starting setup..."); // Adjusted message
   delay(200);                                                                  // Give some time for the serial monitor to open
   colorPrint("[BOOT] Initialising CAT TRACKER TX v2 (Sleep Enabled)...");
-  delay(200); // Give some time for the serial monitor to open
+  flickerShort(); // Flicker short on initial startup
+  delay(200);     // Give some time for the serial monitor to open
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   pinMode(STATUS_LED_PIN, OUTPUT); // Status LED
@@ -243,7 +298,7 @@ void setup()
   bool firstFixDetectedSetup = false;       // Flag for first fix detection in setup
   unsigned long firstFixTimestampSetup = 0; // Timestamp for first fix in setup
 
-  while (millis() - gpsWarmupStart < 120000) // 2 min timeout
+  while (millis() - gpsWarmupStart < 60000) // Wait for 60 seconds
   {
     processGps(); // Process data during warmup
 
@@ -295,6 +350,7 @@ void setup()
   if (initState != RADIOLIB_ERR_NONE)
   {
     colorPrint("[ERROR] LoRa failed to initialise. Code: " + String(initState), ANSI_RED);
+    flickerLong(); // Flicker long for error
     while (true)
       ; // Halt on critical error
   }
@@ -302,7 +358,7 @@ void setup()
   {
     colorPrint("[OK] LoRa initialised successfully");
     // Apply LoRa parameters
-    lora.setOutputPower(22);
+    lora.setOutputPower(18); // Set output power (dBm)
     lora.setSpreadingFactor(8);
     lora.setBandwidth(250.0);
     lora.setCodingRate(5);
@@ -321,6 +377,7 @@ void setup()
   if (pBLEScan == nullptr)
   {
     colorPrint("[INIT ERROR] Failed to get BLE Scanner instance!", ANSI_RED);
+    flickerLong(); // Flicker long for error
     // Handle error appropriately - maybe halt or disable BLE feature
   }
   else
@@ -341,7 +398,8 @@ void setup()
   gpsSleep();
   delay(1000);
   lora.standby();
-  ledFlicker(); // Go to sleep for the first time
+  // flickerMedium(); // Go to sleep for the first time
+  bootFlag = 1;
   goToLightSleep();
 }
 
@@ -357,7 +415,7 @@ void setup()
 void loop()
 {
   // Reinitialize Serial after waking up
-  Serial.begin(115200);                                        // Reopen the serial port
+  // Serial.begin(115200);                                        // Reopen the serial port
   Serial.println("\n[WAKE] Serial connection reestablished."); // Log wake-up
 
   // --- Code execution resumes here after wake-up ---
@@ -396,7 +454,7 @@ void handleWakeupReason()
     colorPrint("[WAKE] Reason: Button Press 👆", ANSI_BRIGHT_CYAN);
     printStatusReport();           // Print status report first
     performTransmissionSequence(); // Perform standard transmission (no flag)
-    ledFlicker();                  // Flicker LED after sequence
+    flickerShort();                // Flicker LED after sequence
     break;
   case ESP_SLEEP_WAKEUP_GPIO: // Connected to LORA_DIO1 (GPIO 39)
     colorPrint("[WAKE] Reason: LoRa DIO1 Interrupt 📡", ANSI_BRIGHT_MAGENTA);
@@ -583,8 +641,8 @@ void goToLightSleep()
 
   colorPrint("😴 Entering light sleep...", ANSI_BOLD);
   Serial.flush(); // Ensure all serial messages are sent before sleeping
-  Serial.end();   // Properly close the serial port before sleep
-  gpsSleep();     // Ensure GPS is in sleep mode before going to light sleep
+  // Serial.end();   // Removed to prevent boot loop
+  gpsSleep(); // Ensure GPS is in sleep mode before going to light sleep
 
   // --- Optional: Stop BLE Scan explicitly before sleep ---
   // Although the scan started in scanForHomeBeacon should have stopped,
@@ -605,6 +663,7 @@ void goToLightSleep()
   // Note: If deinitialized, BLEDevice::init() must be called again after wake-up if needed.
   // For simplicity now, let's not deinit unless power saving is critical.
 
+  bootFlag = 1; // Set RTC flag before sleeping
   // Enter light sleep
   esp_light_sleep_start();
 
@@ -636,7 +695,7 @@ void processGps()
 String buildJsonPayload()
 {
   // Increased size slightly to accommodate timestamp, distance, bearing
-  StaticJsonDocument<300> doc; // Adjusted size
+  StaticJsonDocument<300> doc; // Corrected for ArduinoJson v7: specify capacity as template argument
 
   // Add static fields with shorter keys
   doc["mid"] = messageId;                         // msg_id -> mid
@@ -719,14 +778,14 @@ String buildJsonPayload()
     }
   } // End of else (isHome == false)
 
-  String payload;
-  serializeJson(doc, payload);
+  char payload[256];
+  serializeJson(doc, payload, sizeof(payload));
   doc.clear(); // Clear JSON doc memory
 
   // --- Debug Print (only if Serial is somehow available) ---
-  // colorPrint("[JSON] Payload (" + String(payload.length()) + " bytes): " + payload, ANSI_CYAN);
+  // colorPrint("[JSON] Payload (" + String(strlen(payload)) + " bytes): " + String(payload), ANSI_CYAN);
 
-  return payload;
+  return String(payload);
 }
 
 // ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
@@ -753,19 +812,6 @@ void craftLoraPacket()
 
   // lastSendTime update is no longer needed as we use sleep timer
   // lastSendTime = millis();
-}
-
-void ledFlicker()
-{
-  colorPrint("[LED] Flickering status LED...", ANSI_BLUE);
-  pinMode(STATUS_LED_PIN, OUTPUT); // Ensure pin is output - Use defined pin
-  for (int i = 0; i < 6; i++)
-  {
-    digitalWrite(STATUS_LED_PIN, HIGH); // Use defined pin
-    delay(50);                          // ~1/12th second ON
-    digitalWrite(STATUS_LED_PIN, LOW);  // Use defined pin
-    delay(50);                          // ~1/12th second OFF (Total cycle ~1 sec, 6 cycles ~1 sec)
-  }
 }
 
 void printStatusReport()
@@ -805,7 +851,7 @@ void printStatusReport()
   colorPrint("-------------------------------------------------------", ANSI_BOLD);
 }
 
-void colorPrint(const String &message, const char *color = ANSI_RESET) // <-- ADDED default argument back
+void colorPrint(const String &message, const char *color)
 {
   Serial.print(color);
   Serial.println(message);
@@ -923,7 +969,6 @@ bool scanForHomeBeacon(uint32_t scanDurationSeconds)
     }
     delay(100); // Wait a bit before checking again
   }
-
   // After scan duration or early exit, check the flag
   if (isHome)
   {
@@ -932,9 +977,26 @@ bool scanForHomeBeacon(uint32_t scanDurationSeconds)
   else
   {
     colorPrint("[BLE] Scan complete. Home Beacon NOT found.", ANSI_YELLOW);
-    // Ensure scan is stopped if timeout occurred before finding the device
-    colorPrint("[BLE] Stopping scan after timeout (if running).", ANSI_BLUE);
-    pBLEScan->stop(); // Stop scan regardless of current state
+
+    // Try to gracefully stop the scan
+    try
+    {
+      // Add a short delay to allow any pending BLE operations to complete
+      delay(50);
+
+      colorPrint("[BLE] Attempting to stop scan...", ANSI_BLUE);
+      // Try to stop the scan but handle any errors that might occur
+      if (pBLEScan != nullptr)
+      {
+        pBLEScan->stop();
+        colorPrint("[BLE] Scan stopped (no error code available)", ANSI_GREEN);
+      }
+    }
+    catch (...)
+    {
+      // In case of any unexpected exception, just log it and continue
+      colorPrint("[BLE] Exception while stopping scan - continuing anyway", ANSI_RED);
+    }
   }
 
   // Optional: Deinitialize BLE here if deep power saving is needed between scans
@@ -943,105 +1005,41 @@ bool scanForHomeBeacon(uint32_t scanDurationSeconds)
   return isHome;
 }
 
-// --- Check LoRa Channel Activity (CAD) ---
-bool isChannelClear()
-{
-  colorPrint("[LORA CAD] Checking channel activity...", ANSI_BLUE);
-
-  // Ensure radio is in standby for CAD
-  int state = lora.standby();
-  if (state != RADIOLIB_ERR_NONE)
-  {
-    colorPrint("[LORA CAD] Failed to enter standby before CAD: " + String(state), ANSI_RED);
-    return false; // Indicate failure, treat as busy.
-  }
-
-  // Start CAD
-  state = lora.startChannelScan();
-  if (state != RADIOLIB_ERR_NONE)
-  {
-    colorPrint("[LORA CAD] Failed to start CAD: " + String(state), ANSI_RED);
-    return false; // Indicate failure
-  }
-
-  // Wait for CAD to complete.
-  // NOTE: This fixed delay might need tuning based on LoRa settings (SF/BW).
-  // A more robust method might use DIO interrupts if available/configured.
-  delay(20); // Adjusted fixed delay for CAD completion
-
-  // Check CAD result using getChannelScanResult()
-  int cadResultState = lora.getChannelScanResult(); // <-- Use getChannelScanResult()
-
-  // Interpret the result
-  if (cadResultState == RADIOLIB_CHANNEL_FREE) // <-- Check against RADIOLIB_CHANNEL_FREE
-  {
-    // Channel is clear
-    colorPrint("[LORA CAD] Channel is free!", ANSI_GREEN);
-    return true;
-  }
-  else if (cadResultState == RADIOLIB_PREAMBLE_DETECTED) // <-- Check against RADIOLIB_PREAMBLE_DETECTED
-  {
-    // Channel is busy (preamble detected)
-    colorPrint("[LORA CAD] LoRa signal detected (Channel Busy)!", ANSI_YELLOW);
-    return false;
-  }
-  else
-  {
-    // CAD failed or returned an unexpected error code
-    colorPrint("[LORA CAD] CAD failed or unknown result: " + String(cadResultState), ANSI_RED);
-    return false; // Treat errors as busy for safety
-  }
-  // Note: Removed the previous incorrect logic using isChannelBusy() and duplicated checks.
-}
-
-// ... existing transmitLora function ...
-// Add the transmitLora function definition if it's missing or update it
+// ...existing code...
+// --- transmitLora function ---
 void transmitLora(String payload)
 {
   colorPrint("[LORA TX] Preparing to transmit...", ANSI_BLUE);
-
-  // 1. Check Channel Activity (CAD) before transmitting
-  if (!isChannelClear())
-  {
-    colorPrint("[LORA TX] Channel busy! Transmission aborted.", ANSI_YELLOW);
-    // Optional: Implement backoff strategy here (e.g., wait random time and retry)
-    // For now, just skip transmission
-    return; // Exit the function, do not transmit
-  }
-
-  // 2. Channel is clear, proceed with transmission
-  colorPrint("[LORA TX] Channel clear. Transmitting packet (" + String(payload.length()) + " bytes)...", ANSI_BLUE);
-  colorPrint("  Payload: " + payload, ANSI_CYAN); // Print payload being sent
-
-  // Put LoRa into standby mode before transmitting
+  // --- TRANSMIT MARKER ---
+  colorPrint("=== TRANSMITTING PAYLOAD OVER LORA ===", "\033[38;5;208m"); // ORANGE, CAPS
+  colorPrint("[LORA TX] Transmitting packet (" + String(payload.length()) + " bytes)...", ANSI_BLUE);
+  colorPrint("  Payload: " + payload, ANSI_CYAN);
   int state = lora.standby();
   if (state != RADIOLIB_ERR_NONE)
   {
     colorPrint("[LORA TX ERROR] Failed to enter standby before transmit: " + String(state), ANSI_RED);
-    // Decide how to handle: maybe still try to transmit? Or abort?
-    // For now, let's try to continue.
+    flickerLong(); // Flicker long for error
   }
-
-  // Transmit the packet
   state = lora.transmit(payload);
-
-  // Handle transmission result
   if (state == RADIOLIB_ERR_NONE)
   {
     colorPrint("[LORA TX] Transmission successful!", ANSI_BRIGHT_GREEN);
-    ledFlicker(); // Flicker LED on successful transmission
+    flickerMedium(); // Flicker medium on successful transmission
   }
   else if (state == RADIOLIB_ERR_PACKET_TOO_LONG)
   {
     colorPrint("[LORA TX ERROR] Packet too long!", ANSI_RED);
+    flickerLong(); // Flicker long for error
   }
   else if (state == RADIOLIB_ERR_TX_TIMEOUT)
   {
     colorPrint("[LORA TX ERROR] Transmission timeout!", ANSI_RED);
+    flickerLong(); // Flicker long for error
   }
   else
   {
     colorPrint("[LORA TX ERROR] Transmission failed, code: " + String(state), ANSI_RED);
+    flickerLong(); // Flicker long for error
   }
 
   // 3. Put LoRa back into a low-power state or receive mode after transmission
