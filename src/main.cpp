@@ -17,26 +17,26 @@
 #endif
 
 #ifndef PIN_SPI_SS
-#define PIN_SPI_SS 10
+#define PIN_SPI_SS D4
 #endif
 #ifndef PIN_SPI_SCK
-#define PIN_SPI_SCK 13
+#define PIN_SPI_SCK D8
 #endif
 #ifndef PIN_SPI_MOSI
-#define PIN_SPI_MOSI 11
+#define PIN_SPI_MOSI D10
 #endif
 #ifndef PIN_SPI_MISO
-#define PIN_SPI_MISO 12
+#define PIN_SPI_MISO D9
 #endif
 
-#define LORA_NSS 4 // D4 per Wio-SX1262 header
+#define LORA_NSS PIN_SPI_SS // D4 per Wio-SX1262 header
 #define LORA_SCK PIN_SPI_SCK
 #define LORA_MOSI PIN_SPI_MOSI
 #define LORA_MISO PIN_SPI_MISO
-#define LORA_RST 2   // D2 from blue digital header
-#define LORA_BUSY 3  // D3 from blue digital header
-#define LORA_DIO1 1  // D1 matches DIO1 pad
-#define LORA_RF_SW 5 // D5 drives RF switch
+#define LORA_RST D2   // D2 from blue digital header
+#define LORA_BUSY D3  // D3 from blue digital header
+#define LORA_DIO1 D1  // D1 matches DIO1 pad
+#define LORA_RF_SW D5 // D5 drives RF switch
 
 #ifdef PIN_SERIAL1_RX
 #define GPS_RX PIN_SERIAL1_RX
