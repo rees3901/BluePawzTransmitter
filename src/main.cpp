@@ -52,7 +52,7 @@
 // #define SENDER_ID "Gizmo"
 #define HOME_LAT 51.87370573411073
 #define HOME_LON -2.2396017778476716
-// #define SEND_INTERVAL 60000 // milliseconds (60 seconds) - Commented out, using sleep timer
+#define SEND_INTERVAL 30000 // milliseconds (30 seconds) - Re-enabled for non-sleep mode
 
 // --- Device ID Mapping ---
 uint16_t DEVICE_ID_HEX = 0x0000; // Default/Unknown ID
@@ -184,7 +184,7 @@ MyAdvertisedDeviceCallbacks bleCallbacks; // Create one instance globally
 bool gpsIsAwake = true; // Assume awake initially after setup
 unsigned long gpsWakeLeadTime = 60000;
 unsigned long InitialgpsWakeLeadTime = 120000; // Time to wait for GPS fix after wake (60s)
-// unsigned long lastSendTime = 0; // No longer needed for interval timing
+unsigned long lastSendTime = 0; // Re-enabled for interval timing (non-sleep mode)
 unsigned long lastStatusPrint = 0;
 static uint32_t messageId = 0; // Global message counter for LoRa
 String LoRaRxMsg = "";         // Buffer for received LoRa message
@@ -390,17 +390,18 @@ void setup()
   }
 
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
-  colorPrint("🚀 SETUP COMPLETE - Entering initial sleep cycle 😴", ANSI_BOLD);
+  colorPrint("🚀 SETUP COMPLETE - Entering timed loop mode (sleep disabled) �", ANSI_BOLD);
   colorPrint("════════════════════════════════════════", ANSI_BOLD);
 
-  // Set initial lastSendTime to allow first send after interval - No longer needed
-  // lastSendTime = millis() - SEND_INTERVAL + 5000;
-  gpsSleep();
+  // Set initial lastSendTime to allow first send after interval
+  lastSendTime = millis() - SEND_INTERVAL + 5000; // First transmission in 5 seconds
+  // GPS SLEEP DISABLED - Keep GPS awake for continuous debugging
+  // gpsSleep(); // COMMENTED OUT: GPS stays awake for debugging
   delay(1000);
   lora.standby();
   // flickerMedium(); // Go to sleep for the first time
   bootFlag = 1;
-  goToLightSleep();
+  // goToLightSleep(); // COMMENTED OUT - Sleep disabled for debugging
 }
 
 // ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
@@ -414,6 +415,40 @@ void setup()
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void loop()
 {
+  // ===== SIMPLE TIMED LOOP MODE (SLEEP DISABLED) =====
+  // This replaces the sleep-based wake-up system with a simple timer
+  
+  static unsigned long lastHeartbeat = 0;
+  unsigned long currentTime = millis();
+  
+  // Heartbeat every 5 seconds to show we're alive
+  if (currentTime - lastHeartbeat >= 5000) {
+    colorPrint("💓 Heartbeat - Device active, next transmission in " + 
+               String((SEND_INTERVAL - (currentTime - lastSendTime)) / 1000) + "s", ANSI_BLUE);
+    lastHeartbeat = currentTime;
+  }
+  
+  // Check if it's time to send a packet
+  if (currentTime - lastSendTime >= SEND_INTERVAL) {
+    colorPrint("\n🚀 === TRANSMISSION CYCLE START ===", ANSI_BRIGHT_GREEN);
+    
+    // Perform the same transmission sequence as before, but without sleep-based logic
+    performTransmissionSequence();
+    
+    // Update the last send time
+    lastSendTime = currentTime;
+    
+    colorPrint("✅ === TRANSMISSION CYCLE COMPLETE ===\n", ANSI_BRIGHT_GREEN);
+  }
+  
+  // Process any GPS data that might be available
+  processGps();
+  
+  // Small delay to prevent overwhelming the CPU
+  delay(100);
+  
+  // Original sleep-based loop code (COMMENTED OUT):
+  /*
   // Ensure Serial is active after waking up
   if (!Serial)
   {
@@ -437,6 +472,7 @@ void loop()
 
   delay(1000); // --- Go Back to Sleep ---
   goToLightSleep();
+  */
 }
 
 // ──────────────────────────────
@@ -502,6 +538,11 @@ void handleLoraReception()
 void performTransmissionSequence()
 {
   colorPrint("[SEQUENCE] Starting Transmission Sequence...", ANSI_MAGENTA); // Use standard color
+
+  // --- RESET HOME STATUS FOR FRESH SCAN ---
+  // Ensure we start each transmission cycle with a clean slate
+  isHome = false;
+  colorPrint("[SEQUENCE] Resetting home beacon status for fresh scan...", ANSI_BLUE);
 
   // --- 1. Attempt BLE Home Beacon Scan (First 10 seconds) ---
   colorPrint("[SEQUENCE] Scanning for Home Beacon (10s)...", ANSI_YELLOW);
@@ -578,14 +619,15 @@ void performTransmissionSequence()
     }
     // Proceed to build and transmit LoRa packet regardless of fix status (buildJsonPayload handles invalid data)
 
-    // Put GPS to sleep AFTER potential fix attempt
-    gpsSleep();
+    // GPS SLEEP DISABLED - Keep GPS awake for continuous debugging
+    // gpsSleep(); // COMMENTED OUT: GPS stays awake for debugging
   }
   else
   {
     // Home beacon WAS found
     colorPrint("[SEQUENCE] Home Beacon detected. Skipping GPS fix attempt.", ANSI_BRIGHT_GREEN);
-    gpsSleep(); // Ensure GPS is put back to sleep if it wasn't already
+    // GPS SLEEP DISABLED - Keep GPS awake for continuous debugging  
+    // gpsSleep(); // COMMENTED OUT: GPS stays awake for debugging
   }
 
   // --- 3. Build and Transmit LoRa Packet ---
@@ -646,7 +688,8 @@ void goToLightSleep()
   colorPrint("😴 Entering light sleep...", ANSI_BOLD);
   Serial.flush(); // Ensure all serial messages are sent before sleeping
   // Serial.end();   // Removed to prevent boot loop
-  gpsSleep(); // Ensure GPS is in sleep mode before going to light sleep
+  // GPS SLEEP DISABLED - Keep GPS awake for continuous debugging
+  // gpsSleep(); // COMMENTED OUT: GPS stays awake for debugging
 
   // --- Optional: Stop BLE Scan explicitly before sleep ---
   // Although the scan started in scanForHomeBeacon should have stopped,
@@ -696,23 +739,46 @@ String buildJsonPayload()
 
   // Add static fields with full descriptive names
   doc["message_id"] = messageId;                        // mid -> message_id
-  doc["device_id"] = "0x" + String(DEVICE_ID_HEX, HEX); // did -> device_id
-  doc["sender_name"] = SENDER_ID;                       // id -> sender_name
+  doc["device_id"] = ("0x" + String(DEVICE_ID_HEX, HEX)).c_str(); // did -> device_id
+  doc["sender_name"] = (const char*)SENDER_ID;                       // id -> sender_name
 
   // --- Check if Home Beacon was detected ---
+  colorPrint("[JSON] Final isHome flag status: " + String(isHome ? "TRUE (Home)" : "FALSE (Away)"), ANSI_MAGENTA);
+  
   if (isHome)
   {
-    doc["status"] = "Home"; // stat -> status, "H" -> "Home"
-    // Truncate home coordinates before assigning
+    doc["status"] = (const char*)"Home"; // BLE beacon detected - at home
+    // Use home coordinates for location
     double truncatedHomeLat = round(HOME_LAT * 100000.0) / 100000.0;
     double truncatedHomeLon = round(HOME_LON * 100000.0) / 100000.0;
     doc["latitude"] = truncatedHomeLat;                            // lat -> latitude
     doc["longitude"] = truncatedHomeLon;                           // lon -> longitude
-    doc["satellites"] = -1;                                        // sat -> satellites
-    doc["distance_meters"] = 0.0;                                  // dst -> distance_meters
-    doc["direction"] = "Not Applicable";                           // dir -> direction, "NA" -> "Not Applicable"
-    doc["timestamp"] = "Not Applicable";                           // ts -> timestamp, "NA" -> "Not Applicable"
-    colorPrint("[JSON] Building payload: Status=Home", ANSI_CYAN); // Added log
+    
+    // Still populate GPS data fields when at home
+    bool sat_valid = gps.satellites.isValid();
+    unsigned long sat_value = gps.satellites.value();
+    bool time_valid = gps.time.isValid();
+    unsigned long time_age = gps.time.age();
+    
+    doc["satellites"] = sat_valid ? sat_value : 0;                 // Use actual satellite count
+    doc["distance_meters"] = 0.0;                                  // Distance is 0 when at home
+    doc["direction"] = (const char*)"At Home";                                  // More descriptive than "Not Applicable"
+    
+    // Add current GPS timestamp if available
+    if (time_valid && time_age < 60000)
+    {
+      char isoTimestamp[25];
+      snprintf(isoTimestamp, sizeof(isoTimestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+               gps.date.year(), gps.date.month(), gps.date.day(),
+               gps.time.hour(), gps.time.minute(), gps.time.second());
+      doc["timestamp"] = isoTimestamp;
+    }
+    else
+    {
+      doc["timestamp"] = (const char*)"GPS Time Error"; // Use actual GPS time status
+    }
+    
+    colorPrint("[JSON] Building payload: Status=Home (BLE beacon detected)", ANSI_CYAN);
   }
   else
   {
@@ -732,7 +798,19 @@ String buildJsonPayload()
       double currentLat = gps.location.lat();
       double currentLon = gps.location.lng();
 
-      doc["status"] = "Out and About"; // stat -> status, "O" -> "Out and About"
+      // Calculate distance from home to determine status
+      double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
+      
+      // Status based on distance: Home if within 20m, Out if further
+      if (dist <= 20.0)
+      {
+        doc["status"] = (const char*)"Home"; // Close to home (within 20m)
+      }
+      else
+      {
+        doc["status"] = (const char*)"Out"; // Away from home (beyond 20m)
+      }
+      
       // Truncate current coordinates before assigning
       double truncatedCurrentLat = round(currentLat * 100000.0) / 100000.0;
       double truncatedCurrentLon = round(currentLon * 100000.0) / 100000.0;
@@ -740,24 +818,33 @@ String buildJsonPayload()
       doc["longitude"] = truncatedCurrentLon;        // lon -> longitude
       doc["satellites"] = sat_valid ? sat_value : 0; // sat -> satellites
 
-      // Calculate distance/bearing
-      double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
+      // Calculate bearing
       double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON);
-      // Keep bearing calculation, but use full descriptive format
       String bearingStr = String((int)bearing) + " degrees " + cardinalDirection(bearing);
       doc["distance_meters"] = round(dist * 100.0) / 100.0;                               // dst -> distance_meters
-      doc["direction"] = bearingStr;                                                      // dir -> direction
-      colorPrint("[JSON] Building payload: Status=Out and About (Valid GPS)", ANSI_CYAN); // Added log
+      doc["direction"] = bearingStr.c_str();                                                      // dir -> direction
+      colorPrint("[JSON] Building payload: Status=" + String(doc["status"].as<const char*>()) + " (Valid GPS, " + String(dist, 1) + "m from home)", ANSI_CYAN);
     }
-    else // Location Invalid or Stale
+    else if (loc_valid && isStale)
     {
-      doc["status"] = "GPS Error";                                                              // stat -> status, "E" -> "GPS Error"
-      doc["latitude"] = 0.0;                                                                    // lat -> latitude
-      doc["longitude"] = 0.0;                                                                   // lon -> longitude
-      doc["satellites"] = sat_valid ? sat_value : 0;                                            // sat -> satellites
-      doc["distance_meters"] = 0.0;                                                             // dst -> distance_meters
-      doc["direction"] = "Not Applicable";                                                      // dir -> direction, "NA" -> "Not Applicable"
-      colorPrint("[JSON] Building payload: Status=GPS Error (Invalid/Stale GPS)", ANSI_YELLOW); // Added log
+      // Location is valid but stale (old data)
+      doc["status"] = (const char*)"Offline";                                                              // Stale GPS data
+      doc["latitude"] = 0.0;                                                                  
+      doc["longitude"] = 0.0;                                                                 
+      doc["satellites"] = sat_valid ? sat_value : 0;                                          
+      doc["distance_meters"] = 0.0;                                                           
+      doc["direction"] = (const char*)"Not Applicable";                                                    
+      colorPrint("[JSON] Building payload: Status=Offline (Stale GPS data)", ANSI_YELLOW);
+    }
+    else // Location Invalid
+    {
+      doc["status"] = (const char*)"Error";                                                              // GPS not working
+      doc["latitude"] = 0.0;                                                                    
+      doc["longitude"] = 0.0;                                                                   
+      doc["satellites"] = sat_valid ? sat_value : 0;                                            
+      doc["distance_meters"] = 0.0;                                                             
+      doc["direction"] = (const char*)"Not Applicable";                                                      
+      colorPrint("[JSON] Building payload: Status=Error (Invalid GPS)", ANSI_YELLOW);
     }
 
     // --- Add Timestamp if valid and recent ---
@@ -771,7 +858,7 @@ String buildJsonPayload()
     }
     else
     {
-      doc["timestamp"] = "GPS Time Error"; // ts -> timestamp, "E" -> "GPS Time Error"
+      doc["timestamp"] = (const char*)"GPS Time Error"; // GPS time not available
     }
   } // End of else (isHome == false)
 
@@ -918,6 +1005,7 @@ bool scanForHomeBeacon(uint32_t scanDurationSeconds)
 
   colorPrint("[BLE] Starting scan for \"" + String(targetDeviceName) + "\" (" + String(scanDurationSeconds) + "s)...", ANSI_BLUE);
   isHome = false; // Reset flag before each scan
+  colorPrint("[BLE] Home beacon flag reset to FALSE - fresh scan starting", ANSI_YELLOW);
 
   // REMOVE Redundant/Partial Re-init lines:
   // BLEDevice::init("");
@@ -1014,8 +1102,9 @@ void transmitLora(String payload)
   }
   else if (state == RADIOLIB_ERR_TX_TIMEOUT)
   {
-    colorPrint("[LORA TX ERROR] Transmission timeout!", ANSI_RED);
-    flickerLong(); // Flicker long for error
+    // RadioLib timeout error is often falsely reported even when transmission succeeds
+    colorPrint("[LORA TX WARN] Library reports timeout (often false positive - check receiver)", ANSI_YELLOW);
+    flickerShort(); // Flicker short instead of long - less alarming for false positive
   }
   else
   {
