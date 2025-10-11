@@ -209,11 +209,9 @@ void setup()
     // Woke from sleep, skip full setup but continue to loop()
     colorPrint("[WAKE] Woke from sleep, skipping full setup...", ANSI_BRIGHT_YELLOW);
     bootFlag = 0; // Reset flag for next sleep cycle
-    // DON'T return here - let setup() complete so loop() can execute
+    // Don't return here - continue to loop() so serial debugging works
     return;
-  }
-
-  // Cold boot - perform full initialization
+  } // Cold boot - perform full initialization
   bootFlag = 0;                                                                // Ensure flag is cleared on cold boot
   Serial.println("\n[BOOT] Serial connection established. Starting setup..."); // Adjusted message
   delay(200);                                                                  // Give some time for the serial monitor to open
@@ -416,8 +414,12 @@ void setup()
 // ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void loop()
 {
-  // Reinitialize Serial after waking up
-  // Serial.begin(115200);                                        // Reopen the serial port
+  // Ensure Serial is active after waking up
+  if (!Serial)
+  {
+    Serial.begin(115200);
+    delay(100);
+  }
   Serial.println("\n[WAKE] Serial connection reestablished."); // Log wake-up
 
   // --- Code execution resumes here after wake-up ---
@@ -689,27 +691,27 @@ void processGps()
 // --- Build JSON Payload ---
 String buildJsonPayload()
 {
-  // Increased size slightly to accommodate timestamp, distance, bearing
+  // Increased size to accommodate longer field names and content
   JsonDocument doc; // Updated for ArduinoJson v7: use JsonDocument instead of StaticJsonDocument
 
-  // Add static fields with shorter keys
-  doc["mid"] = messageId;                         // msg_id -> mid
-  doc["did"] = "0x" + String(DEVICE_ID_HEX, HEX); // device_id -> did
-  doc["id"] = SENDER_ID;                          // id remains id
+  // Add static fields with full descriptive names
+  doc["message_id"] = messageId;                        // mid -> message_id
+  doc["device_id"] = "0x" + String(DEVICE_ID_HEX, HEX); // did -> device_id
+  doc["sender_name"] = SENDER_ID;                       // id -> sender_name
 
   // --- Check if Home Beacon was detected ---
   if (isHome)
   {
-    doc["stat"] = "H"; // status -> stat, "Home" -> "H"
+    doc["status"] = "Home"; // stat -> status, "H" -> "Home"
     // Truncate home coordinates before assigning
     double truncatedHomeLat = round(HOME_LAT * 100000.0) / 100000.0;
     double truncatedHomeLon = round(HOME_LON * 100000.0) / 100000.0;
-    doc["lat"] = truncatedHomeLat;                                 // Assign truncated value
-    doc["lon"] = truncatedHomeLon;                                 // Assign truncated value
-    doc["sat"] = -1;                                               // sats -> sat
-    doc["dst"] = 0.0;                                              // dist_m -> dst
-    doc["dir"] = "NA";                                             // bearing -> dir, "N/A" -> "NA"
-    doc["ts"] = "NA";                                              // time -> ts, "N/A" -> "NA"
+    doc["latitude"] = truncatedHomeLat;                            // lat -> latitude
+    doc["longitude"] = truncatedHomeLon;                           // lon -> longitude
+    doc["satellites"] = -1;                                        // sat -> satellites
+    doc["distance_meters"] = 0.0;                                  // dst -> distance_meters
+    doc["direction"] = "Not Applicable";                           // dir -> direction, "NA" -> "Not Applicable"
+    doc["timestamp"] = "Not Applicable";                           // ts -> timestamp, "NA" -> "Not Applicable"
     colorPrint("[JSON] Building payload: Status=Home", ANSI_CYAN); // Added log
   }
   else
@@ -730,32 +732,32 @@ String buildJsonPayload()
       double currentLat = gps.location.lat();
       double currentLon = gps.location.lng();
 
-      doc["stat"] = "O"; // status -> stat, "outanabout" -> "O"
+      doc["status"] = "Out and About"; // stat -> status, "O" -> "Out and About"
       // Truncate current coordinates before assigning
       double truncatedCurrentLat = round(currentLat * 100000.0) / 100000.0;
       double truncatedCurrentLon = round(currentLon * 100000.0) / 100000.0;
-      doc["lat"] = truncatedCurrentLat;       // Assign truncated value
-      doc["lon"] = truncatedCurrentLon;       // Assign truncated value
-      doc["sat"] = sat_valid ? sat_value : 0; // sats -> sat
+      doc["latitude"] = truncatedCurrentLat;         // lat -> latitude
+      doc["longitude"] = truncatedCurrentLon;        // lon -> longitude
+      doc["satellites"] = sat_valid ? sat_value : 0; // sat -> satellites
 
       // Calculate distance/bearing
       double dist = TinyGPSPlus::distanceBetween(currentLat, currentLon, HOME_LAT, HOME_LON);
       double bearing = TinyGPSPlus::courseTo(currentLat, currentLon, HOME_LAT, HOME_LON);
-      // Keep bearing calculation, but use shorter key and value
-      String bearingStr = String((int)bearing) + "-" + cardinalDirection(bearing);
-      doc["dst"] = round(dist * 100.0) / 100.0;                                        // dist_m -> dst
-      doc["dir"] = bearingStr;                                                         // bearing -> dir
-      colorPrint("[JSON] Building payload: Status=outanabout (Valid GPS)", ANSI_CYAN); // Added log
+      // Keep bearing calculation, but use full descriptive format
+      String bearingStr = String((int)bearing) + " degrees " + cardinalDirection(bearing);
+      doc["distance_meters"] = round(dist * 100.0) / 100.0;                               // dst -> distance_meters
+      doc["direction"] = bearingStr;                                                      // dir -> direction
+      colorPrint("[JSON] Building payload: Status=Out and About (Valid GPS)", ANSI_CYAN); // Added log
     }
     else // Location Invalid or Stale
     {
-      doc["stat"] = "E"; // status -> stat, "error" -> "E"
-      doc["lat"] = 0.0;  // No truncation needed for 0.0
-      doc["lon"] = 0.0;
-      doc["sat"] = sat_valid ? sat_value : 0;                                               // sats -> sat
-      doc["dst"] = 0.0;                                                                     // dist_m -> dst
-      doc["dir"] = "NA";                                                                    // bearing -> dir, "N/A" -> "NA"
-      colorPrint("[JSON] Building payload: Status=error (Invalid/Stale GPS)", ANSI_YELLOW); // Added log
+      doc["status"] = "GPS Error";                                                              // stat -> status, "E" -> "GPS Error"
+      doc["latitude"] = 0.0;                                                                    // lat -> latitude
+      doc["longitude"] = 0.0;                                                                   // lon -> longitude
+      doc["satellites"] = sat_valid ? sat_value : 0;                                            // sat -> satellites
+      doc["distance_meters"] = 0.0;                                                             // dst -> distance_meters
+      doc["direction"] = "Not Applicable";                                                      // dir -> direction, "NA" -> "Not Applicable"
+      colorPrint("[JSON] Building payload: Status=GPS Error (Invalid/Stale GPS)", ANSI_YELLOW); // Added log
     }
 
     // --- Add Timestamp if valid and recent ---
@@ -765,15 +767,15 @@ String buildJsonPayload()
       snprintf(isoTimestamp, sizeof(isoTimestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                gps.date.year(), gps.date.month(), gps.date.day(),
                gps.time.hour(), gps.time.minute(), gps.time.second());
-      doc["ts"] = isoTimestamp; // time -> ts
+      doc["timestamp"] = isoTimestamp; // ts -> timestamp
     }
     else
     {
-      doc["ts"] = "E"; // time -> ts, "error" -> "E"
+      doc["timestamp"] = "GPS Time Error"; // ts -> timestamp, "E" -> "GPS Time Error"
     }
   } // End of else (isHome == false)
 
-  char payload[256];
+  char payload[512]; // Increased buffer size for longer field names
   serializeJson(doc, payload, sizeof(payload));
   doc.clear(); // Clear JSON doc memory
 
@@ -989,12 +991,16 @@ void transmitLora(String payload)
   colorPrint("=== TRANSMITTING PAYLOAD OVER LORA ===", "\033[38;5;208m"); // ORANGE, CAPS
   colorPrint("[LORA TX] Transmitting packet (" + String(payload.length()) + " bytes)...", ANSI_BLUE);
   colorPrint("  Payload: " + payload, ANSI_CYAN);
+
+  // Try to enter standby mode - but don't treat this as critical error
   int state = lora.standby();
   if (state != RADIOLIB_ERR_NONE)
   {
-    colorPrint("[LORA TX ERROR] Failed to enter standby before transmit: " + String(state), ANSI_RED);
-    flickerLong(); // Flicker long for error
+    colorPrint("[LORA TX WARN] Failed to enter standby before transmit: " + String(state) + " (continuing anyway)", ANSI_YELLOW);
+    // Don't flicker for standby issues - not critical
   }
+
+  // Attempt transmission
   state = lora.transmit(payload);
   if (state == RADIOLIB_ERR_NONE)
   {
