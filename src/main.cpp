@@ -39,8 +39,8 @@
 #define GPS_RX 44        // D7 = GPIO 44
 #define GPS_TX 43        // D6 = GPIO 43
 #define GPS_BAUD 9600    // Baud rate for GPS module
-#define GPS_SLEEP_WAKE 1 // d0 = GPIO 1  - used for sleep/wake control
-#define GPS_RESET 9      // D10 = GPIO 9
+#define GPS_SLEEP_WAKE 1 // d0 = GPIO 1  - used for sleep/wake control low/0 is sleep
+#define GPS_RESET 3      // Changed from GPIO 9 to GPIO 3 to avoid conflict with LORA_MOSI
 
 // Button pin for status report and manual wake/transmit
 #define STATUS_BUTTON_PIN GPIO_NUM_21 // Use GPIO_NUM_x for sleep functions
@@ -198,21 +198,23 @@ String LoRaRxMsg = "";         // Buffer for received LoRa message
 // └─────────────────┘
 void setup()
 {
+  // --- Initialize Serial first ---
+  Serial.begin(115200);
+  delay(1000); // Wait for serial monitor
+
   // --- Check RTC flag and wakeup reason ---
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   if (bootFlag == 1 && (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_GPIO))
   {
-    // Woke from sleep, skip full setup
-    Serial.begin(115200);
-    colorPrint("[WAKE] Skipping full setup, resuming from sleep...", ANSI_BRIGHT_YELLOW);
-    // Reset flag for next sleep cycle
-    bootFlag = 0;
+    // Woke from sleep, skip full setup but continue to loop()
+    colorPrint("[WAKE] Woke from sleep, skipping full setup...", ANSI_BRIGHT_YELLOW);
+    bootFlag = 0; // Reset flag for next sleep cycle
+    // DON'T return here - let setup() complete so loop() can execute
     return;
   }
-  bootFlag = 0; // Ensure flag is cleared on cold boot
 
-  delay(1000);                                                                 // Wait for serial monitor
-  Serial.begin(115200);                                                        // <-- Initialize Serial communication first
+  // Cold boot - perform full initialization
+  bootFlag = 0;                                                                // Ensure flag is cleared on cold boot
   Serial.println("\n[BOOT] Serial connection established. Starting setup..."); // Adjusted message
   delay(200);                                                                  // Give some time for the serial monitor to open
   colorPrint("[BOOT] Initialising CAT TRACKER TX v2 (Sleep Enabled)...");
@@ -647,21 +649,14 @@ void goToLightSleep()
   // --- Optional: Stop BLE Scan explicitly before sleep ---
   // Although the scan started in scanForHomeBeacon should have stopped,
   // it's safer to ensure it's stopped before sleeping.
-  // if (pBLEScan != nullptr && pBLEScan->isScanning()) // <-- Commenting out potentially problematic check
   if (pBLEScan != nullptr) // Simplified check: just ensure pBLEScan is not null before stopping
   {
-    // Check if it *was* scanning before stopping (optional, for logging)
-    // bool was_scanning = pBLEScan->isScanning(); // Assuming isScanning() doesn't exist or is unreliable
-    // if(was_scanning) { // Log only if it was scanning
     colorPrint("[SLEEP] Stopping any active BLE scan...", ANSI_BLUE);
     pBLEScan->stop();
-    // }
   }
-  // --- Optional: Deinitialize BLE to save more power ---
-  BLEDevice::deinit(true);                             // Set to true to release memory
-  colorPrint("[SLEEP] BLE Deinitialized.", ANSI_BLUE); // <-- Add log message
-  // Note: If deinitialized, BLEDevice::init() must be called again after wake-up if needed.
-  // For simplicity now, let's not deinit unless power saving is critical.
+  // --- Keep BLE initialized to avoid deinit/reinit issues ---
+  // BLEDevice::deinit(true); // REMOVED: Causes potential issues on reinit
+  // colorPrint("[SLEEP] BLE Deinitialized.", ANSI_BLUE); // REMOVED
 
   bootFlag = 1; // Set RTC flag before sleeping
   // Enter light sleep
@@ -695,7 +690,7 @@ void processGps()
 String buildJsonPayload()
 {
   // Increased size slightly to accommodate timestamp, distance, bearing
-  StaticJsonDocument<300> doc; // Corrected for ArduinoJson v7: specify capacity as template argument
+  JsonDocument doc; // Updated for ArduinoJson v7: use JsonDocument instead of StaticJsonDocument
 
   // Add static fields with shorter keys
   doc["mid"] = messageId;                         // msg_id -> mid
@@ -868,16 +863,14 @@ void gpsWake()
     gpsIsAwake = true;
     delay(100); // Small delay for wake pin stabilization
 
-    colorPrint("[GPS] Initializing HardwareSerial for GPS...", ANSI_YELLOW);
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-    delay(500); // Increased delay AFTER serial begin to allow GPS UART to stabilize
+    // Note: Serial connection should already be open (not closed in gpsSleep)
+    // Only reinitialize if absolutely necessary
+    colorPrint("[GPS] GPS awakened (serial connection maintained)...", ANSI_YELLOW);
+    delay(500); // Delay to allow GPS to stabilize after wake
   }
   else
   {
     colorPrint("[GPS] Already awake.", ANSI_YELLOW);
-    colorPrint("[GPS] Re-initializing HardwareSerial (just in case)...", ANSI_YELLOW);
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-    delay(100); // Shorter delay if already awake is likely fine
   }
 }
 
@@ -887,10 +880,11 @@ void gpsSleep()
   {
     // Before sleeping, ensure any pending serial data is sent (optional but good practice)
     Serial.flush();
-    gpsSerial.end(); // <-- Keep this, SoftwareSerial has an end() method
+    // gpsSerial.end(); // <-- COMMENTED OUT: Keep serial connection open for stability
+    // TODO: If issues arise, uncomment this line to revert back
 
     digitalWrite(GPS_SLEEP_WAKE, LOW);
-    colorPrint("[GPS] Putting GPS module to sleep 😴", ANSI_YELLOW);
+    colorPrint("[GPS] Putting GPS module to sleep 😴 (keeping serial open)", ANSI_YELLOW);
     gpsIsAwake = false;
     // gpsSerial1.end(); // Optional: formally close serial, may save minuscule power
   }
@@ -913,31 +907,12 @@ String cardinalDirection(double bearing)
 // --- BLE Scan for Home Beacon ---
 bool scanForHomeBeacon(uint32_t scanDurationSeconds)
 {
-  // --- Re-initialize BLE after waking from sleep (if deinitialized) ---
-  colorPrint("[BLE] Initializing BLE for scan...", ANSI_BLUE);
-  BLEDevice::init("");             // Initialize BLE device
-  pBLEScan = BLEDevice::getScan(); // Get the scanner instance
+  // --- BLE should already be initialized from setup() ---
   if (pBLEScan == nullptr)
   {
-    colorPrint("[BLE ERROR] Failed to get BLE Scanner instance after re-init!", ANSI_RED);
+    colorPrint("[BLE ERROR] Scanner not initialized! Cannot scan.", ANSI_RED);
     return false; // Cannot proceed without scanner
   }
-  // Re-apply callbacks and scan parameters
-  // Note: If BLEDevice::deinit() is NOT used in goToLightSleep, some of this re-init might be skippable.
-  // However, re-applying ensures a known state after wake-up.
-  pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks); // Use address of the global instance
-  pBLEScan->setActiveScan(true);                         // Active scan uses more power but is needed to get device names
-  pBLEScan->setInterval(100);                            // Scan interval (milliseconds)
-  pBLEScan->setWindow(99);                               // Scan window (milliseconds), must be <= interval
-  colorPrint("[BLE] BLE Scanner Re-initialized.", ANSI_BLUE);
-  // --- End Re-initialization ---
-
-  // No need for the null check here again as it's done after re-init
-  // if (pBLEScan == nullptr)
-  // {
-  //   colorPrint("[BLE ERROR] Scanner not initialized! Cannot scan.", ANSI_RED);
-  //   return false;
-  // }
 
   colorPrint("[BLE] Starting scan for \"" + String(targetDeviceName) + "\" (" + String(scanDurationSeconds) + "s)...", ANSI_BLUE);
   isHome = false; // Reset flag before each scan
