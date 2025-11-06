@@ -1,6 +1,7 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x4000,
-otadata,  data, ota,     0xd000,  0x2000,
-app0,     app,  ota_0,   0x10000, 0x2C0000,
-app1,     app,  ota_1,   0x2D0000,0x2C0000,
-spiffs,   data, spiffs,  0x590000,0x270000,
+# ESP32-S3 8MB Flash - Optimized for data logging + config storage
+nvs,      data, nvs,     0x9000,  0x6000,
+otadata,  data, ota,     0xf000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x200000,
+app1,     app,  ota_1,   0x210000,0x200000,
+littlefs, data, spiffs,  0x410000,0x3F0000,
