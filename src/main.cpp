@@ -83,7 +83,7 @@ struct GpsFix
   double lat = 0;
   double lon = 0;
   bool valid = false;
-  uint32_t unixTime = 0; // TinyGPSPlus time.value()
+  char dateTime[24] = ""; // Format: "YYYY-MM-DD HH:MM:SS"
 };
 
 struct TxReq
@@ -142,9 +142,9 @@ void setup()
   Serial.println("[BOOT] CatTracker TX (RTOS)");
 
   // Queues & events
-  gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)  
-  txReqQ = xQueueCreate(4, sizeof(TxReq)); // TX requests
-  evBits = xEventGroupCreate(); // state flags (EV_FIX, EV_HOME, EV_TXDONE)  
+  gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)
+  txReqQ = xQueueCreate(4, sizeof(TxReq));   // TX requests
+  evBits = xEventGroupCreate();              // state flags (EV_FIX, EV_HOME, EV_TXDONE)
 
   // GPS UART (independent from USB CDC)
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
@@ -159,8 +159,8 @@ void setup()
   Serial.println("[BLE] stack init done");
 
   // Create tasks
-  xTaskCreatePinnedToCore(TaskGPS, "gps", 4096, nullptr, 2, &hGPS, APP_CPU_NUM);  // GPS on APP CPU 
-  xTaskCreatePinnedToCore(TaskBLE, "ble", 4096, nullptr, 1, &hBLE, APP_CPU_NUM); // BLE on APP CPU 
+  xTaskCreatePinnedToCore(TaskGPS, "gps", 4096, nullptr, 2, &hGPS, APP_CPU_NUM); // GPS on APP CPU
+  xTaskCreatePinnedToCore(TaskBLE, "ble", 4096, nullptr, 1, &hBLE, APP_CPU_NUM); // BLE on APP CPU
   xTaskCreatePinnedToCore(TaskLoRa, "lora", 4096, nullptr, 2, &hLoRa, PRO_CPU_NUM);
   xTaskCreatePinnedToCore(TaskPower, "power", 4096, nullptr, 3, &hPower, PRO_CPU_NUM);
 
@@ -231,7 +231,19 @@ void TaskGPS(void *)
       fix.lat = gps.location.lat();
       fix.lon = gps.location.lng();
       fix.valid = gps.location.isValid();
-      fix.unixTime = gps.time.isValid() ? gps.time.value() : 0;
+
+      // Format date/time as human-readable string
+      if (gps.date.isValid() && gps.time.isValid())
+      {
+        snprintf(fix.dateTime, sizeof(fix.dateTime),
+                 "%04d-%02d-%02d %02d:%02d:%02d",
+                 gps.date.year(), gps.date.month(), gps.date.day(),
+                 gps.time.hour(), gps.time.minute(), gps.time.second());
+      }
+      else
+      {
+        fix.dateTime[0] = '\0'; // Empty if invalid
+      }
 
       if (fix.valid)
       {
@@ -303,7 +315,7 @@ void TaskLoRa(void *)
   for (;;)
   {
     TxReq req;
-    if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE) // 
+    if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE) //
     {
       lora.standby();
       int ts = lora.transmit(req.json);
@@ -377,7 +389,10 @@ void TaskPower(void *)
     {
       doc["lat"] = fix.lat;
       doc["lon"] = fix.lon;
-      doc["time"] = fix.unixTime;
+      if (fix.dateTime[0] != '\0')
+      {
+        doc["time"] = fix.dateTime;
+      }
     }
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));
@@ -412,7 +427,10 @@ void TaskPower(void *)
       doc["status"] = (xEventGroupGetBits(evBits) & EV_HOME) ? "home" : "outanabout";
       doc["lat"] = fix.lat;
       doc["lon"] = fix.lon;
-      doc["time"] = fix.unixTime;
+      if (fix.dateTime[0] != '\0')
+      {
+        doc["time"] = fix.dateTime;
+      }
       // Distance & bearing (TinyGPSPlus helpers are static)
       double dist = TinyGPSPlus::distanceBetween(fix.lat, fix.lon, HOME_LAT, HOME_LON);
       double brng = TinyGPSPlus::courseTo(fix.lat, fix.lon, HOME_LAT, HOME_LON);
