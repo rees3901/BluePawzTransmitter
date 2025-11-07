@@ -42,11 +42,13 @@
 #define LORA_PREAMBLE 16
 #define LORA_USE_CRC 1
 
-#define SLEEP_SECONDS 30          // Deep sleep interval after each cycle
-#define GPS_STABILISE_MS 10000    // Extra wait after first valid fix
-#define GPS_ACQUIRE_TIMEOUT 30000 // Max wait for first valid fix
-#define BLE_SCAN_WINDOW_S 3       // Active scan seconds per cycle
-#define BEACON_NAME "Home"        // BLE device name that means "at home"
+#define SLEEP_SECONDS 30             // Deep sleep interval after each cycle
+#define GPS_COLD_START_TIMEOUT 60000 // 60s for initial cold start acquisition
+#define GPS_WARM_START_TIMEOUT 20000 // 20s for subsequent warm starts
+#define GPS_VALID_COUNT_REQUIRED 5   // Number of consecutive valid fixes to confirm lock
+#define GPS_STABILISE_MS 5000        // Extra wait after achieving required valid count
+#define BLE_SCAN_WINDOW_S 3          // Active scan seconds per cycle
+#define BEACON_NAME "Home"           // BLE device name that means "at home"
 
 // Home location (for distance/bearing when available)
 const double HOME_LAT = 51.87370573411073;
@@ -63,8 +65,9 @@ const double HOME_LON = -2.2396017778476716;
 #define LORA_BUSY 40
 #define LORA_DIO1 39
 
-#define GPS_RX 0 // D0 → GPS TX
-#define GPS_TX 1 // D1 → GPS RX
+#define GPS_RX D7
+#define GPS_TX D6
+#define GPS_EN 1 // D2 → GPS Enable (HIGH = ON)
 #define LED_PIN 48
 
 // ─────────────────────────────────────────────
@@ -99,8 +102,9 @@ static EventGroupHandle_t evBits; // state flags
 #define EV_HOME (1 << 1)   // BLE beacon seen this cycle
 #define EV_TXDONE (1 << 2) // LoRa TX finished
 
-// Persisted counters across deep sleep
+// Persisted counters and state across deep sleep
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
+RTC_DATA_ATTR bool g_gpsWarmedUp = false; // Tracks if GPS has achieved initial lock
 
 // ─────────────────────────────────────────────
 // Utilities
@@ -146,9 +150,12 @@ void setup()
   txReqQ = xQueueCreate(4, sizeof(TxReq));   // TX requests
   evBits = xEventGroupCreate();              // state flags (EV_FIX, EV_HOME, EV_TXDONE)
 
-  // GPS UART (independent from USB CDC)
+  // GPS Enable and UART
+  pinMode(GPS_EN, OUTPUT);
+  digitalWrite(GPS_EN, HIGH); // Power on GPS
+  delay(100);                 // Let GPS power stabilize
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-  Serial.println("[INIT] GPS UART started");
+  Serial.println("[INIT] GPS powered on and UART started");
 
   // LoRa radio init (will be re-done in TaskLoRa, but SPI setup here)
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -201,6 +208,10 @@ void loop()
     // Deinitialize BLE to save power
     BLEDevice::deinit(true);
 
+    // Power off GPS to save power
+    digitalWrite(GPS_EN, LOW);
+    Serial.println("[SLEEP] GPS powered off");
+
     // Enter deep sleep
     Serial.printf("[SLEEP] Deep sleeping for %d s\n", SLEEP_SECONDS);
     Serial.flush();
@@ -218,11 +229,27 @@ void loop()
 void TaskGPS(void *)
 {
   GpsFix fix; // local working copy
+  uint32_t lastCharTime = millis();
+  int charCount = 0;
+
   for (;;)
   {
+    int avail = gpsSerial.available();
+    if (avail > 0)
+    {
+      charCount += avail;
+      if (millis() - lastCharTime > 5000)
+      {
+        Serial.printf("[GPS] Received %d chars in last 5s\n", charCount);
+        charCount = 0;
+        lastCharTime = millis();
+      }
+    }
+
     while (gpsSerial.available())
     {
-      gps.encode(gpsSerial.read());
+      char c = gpsSerial.read();
+      gps.encode(c);
     }
 
     // When location updates, refresh state
@@ -248,6 +275,7 @@ void TaskGPS(void *)
       if (fix.valid)
       {
         xEventGroupSetBits(evBits, EV_FIX);
+        Serial.printf("[GPS] Valid fix: %.6f, %.6f\n", fix.lat, fix.lon);
       }
       // Overwrite latest fix in queue (drop older value if present)
       xQueueOverwrite(gpsFixQ, &fix);
@@ -400,23 +428,67 @@ void TaskPower(void *)
   }
   else
   {
-    // Wait up to GPS_ACQUIRE_TIMEOUT for first valid fix
+    // Adaptive GPS acquisition: Cold start (first time) vs Warm start (subsequent)
+    uint32_t timeout = g_gpsWarmedUp ? GPS_WARM_START_TIMEOUT : GPS_COLD_START_TIMEOUT;
+    Serial.printf("[POWER] Waiting for GPS fix (%s start, %d s timeout)...\n",
+                  g_gpsWarmedUp ? "WARM" : "COLD", timeout / 1000);
+
     uint32_t tWaitStart = millis();
-    bool gotFix = false;
-    while (millis() - tWaitStart < GPS_ACQUIRE_TIMEOUT)
+    int validCount = 0;
+    bool gotStableFix = false;
+
+    // Wait for required number of consecutive valid fixes
+    while (millis() - tWaitStart < timeout)
     {
-      (void)xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)); // get latest if any
-      if (fix.valid)
+      if (xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)) == pdTRUE)
       {
-        gotFix = true;
-        break;
+        if (fix.valid)
+        {
+          validCount++;
+          Serial.printf("[POWER] GPS valid fix #%d: %.6f, %.6f\n",
+                        validCount, fix.lat, fix.lon);
+
+          if (validCount >= GPS_VALID_COUNT_REQUIRED)
+          {
+            gotStableFix = true;
+            Serial.printf("[POWER] GPS lock stable (%d valid fixes)\n", validCount);
+
+            // Mark GPS as warmed up for future cycles
+            if (!g_gpsWarmedUp)
+            {
+              g_gpsWarmedUp = true;
+              Serial.println("[POWER] GPS warmup complete - future cycles will be faster");
+            }
+            break;
+          }
+        }
+        else
+        {
+          // Reset count if we get an invalid fix
+          if (validCount > 0)
+          {
+            Serial.printf("[POWER] GPS fix lost, resetting count (was %d)\n", validCount);
+            validCount = 0;
+          }
+        }
       }
     }
 
+    if (!gotStableFix)
+    {
+      Serial.printf("[POWER] GPS timeout after %d ms (valid count: %d/%d)\n",
+                    millis() - tWaitStart, validCount, GPS_VALID_COUNT_REQUIRED);
+    }
+
+    bool gotFix = gotStableFix;
     if (gotFix)
     {
-      // Stabilise for additional GPS_STABILISE_MS
-      vTaskDelay(pdMS_TO_TICKS(GPS_STABILISE_MS));
+      // Short stabilization period, then get freshest fix
+      if (GPS_STABILISE_MS > 0)
+      {
+        Serial.printf("[POWER] Stabilizing for %d ms...\n", GPS_STABILISE_MS);
+        vTaskDelay(pdMS_TO_TICKS(GPS_STABILISE_MS));
+      }
       (void)xQueueReceive(gpsFixQ, &fix, 0); // refresh latest
 
       // Prepare full JSON with range/bearing if possible
