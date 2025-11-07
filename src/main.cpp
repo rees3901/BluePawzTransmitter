@@ -28,6 +28,7 @@
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
+#include <Preferences.h>
 
 // ─────────────────────────────────────────────
 // Build‑time configuration / constants
@@ -102,9 +103,12 @@ static EventGroupHandle_t evBits; // state flags
 #define EV_HOME (1 << 1)   // BLE beacon seen this cycle
 #define EV_TXDONE (1 << 2) // LoRa TX finished
 
-// Persisted counters and state across deep sleep
+// Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
 RTC_DATA_ATTR bool g_gpsWarmedUp = false; // Tracks if GPS has achieved initial lock
+
+// NVS backup for msg counter (Flash memory - survives any reset including USB resets)
+Preferences prefs;
 
 // ─────────────────────────────────────────────
 // Utilities
@@ -139,11 +143,46 @@ void TaskPower(void *);
 // ─────────────────────────────────────────────
 void setup()
 {
+  // Check wake reason BEFORE Serial init
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  // Release GPIO hold from deep sleep
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)GPS_EN);
+
   Serial.begin(115200);
+  delay(100); // Give serial time to initialize
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  delay(50);
-  Serial.println("[BOOT] CatTracker TX (RTOS)");
+
+  Serial.println("\n\n[BOOT] CatTracker TX (RTOS)");
+  Serial.printf("[BOOT] Reset reason: %d\n", esp_reset_reason());
+
+  // Load persistent counter from NVS (survives all resets)
+  prefs.begin("cattracker", false);
+  uint32_t nvsCounter = prefs.getUInt("msg_id", 0);
+
+  switch (wakeup_reason)
+  {
+  case ESP_SLEEP_WAKEUP_TIMER:
+    Serial.printf("[BOOT] ✓ Wake from DEEP SLEEP (RTC msg_id: %d)\n", g_msgCounter);
+    // Use RTC counter if valid (faster), otherwise fall back to NVS
+    if (g_msgCounter < nvsCounter)
+    {
+      g_msgCounter = nvsCounter;
+      Serial.printf("[BOOT] RTC counter was stale, restored from NVS: %d\n", g_msgCounter);
+    }
+    break;
+  case ESP_SLEEP_WAKEUP_UNDEFINED:
+  default:
+    Serial.printf("[BOOT] ✗ POWER-ON RESET (cause: %d)\n", wakeup_reason);
+    // RTC lost, restore from NVS flash
+    g_msgCounter = nvsCounter;
+    g_gpsWarmedUp = false;
+    Serial.printf("[BOOT] Restored msg_id from NVS flash: %d\n", g_msgCounter);
+    break;
+  }
+  prefs.end();
 
   // Queues & events
   gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)
@@ -153,9 +192,18 @@ void setup()
   // GPS Enable and UART
   pinMode(GPS_EN, OUTPUT);
   digitalWrite(GPS_EN, HIGH); // Power on GPS
-  delay(100);                 // Let GPS power stabilize
+  Serial.println("[INIT] GPS power enabled");
+  delay(500); // Let GPS module fully power up and stabilize
+
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-  Serial.println("[INIT] GPS powered on and UART started");
+
+  // Flush any stale data in UART buffer from previous session
+  delay(100);
+  while (gpsSerial.available())
+  {
+    gpsSerial.read();
+  }
+  Serial.println("[INIT] GPS UART started and buffer flushed");
 
   // LoRa radio init (will be re-done in TaskLoRa, but SPI setup here)
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -208,13 +256,32 @@ void loop()
     // Deinitialize BLE to save power
     BLEDevice::deinit(true);
 
-    // Power off GPS to save power
+    // Power off GPS completely
     digitalWrite(GPS_EN, LOW);
-    Serial.println("[SLEEP] GPS powered off");
+    Serial.println("[SLEEP] GPS power disabled");
+
+    // End GPS serial to release pins
+    gpsSerial.end();
+    Serial.println("[SLEEP] GPS UART closed");
+
+    // Save msg_id to NVS before sleep (survives USB resets)
+    prefs.begin("cattracker", false);
+    prefs.putUInt("msg_id", g_msgCounter);
+    prefs.end();
+
+    // Hold GPIO states during deep sleep (keeps GPS_EN LOW)
+    gpio_hold_en((gpio_num_t)GPS_EN);
+    gpio_deep_sleep_hold_en();
 
     // Enter deep sleep
-    Serial.printf("[SLEEP] Deep sleeping for %d s\n", SLEEP_SECONDS);
+    Serial.printf("[SLEEP] Deep sleeping for %d s (msg_id saved: %d)\n", SLEEP_SECONDS, g_msgCounter);
     Serial.flush();
+    delay(100); // Ensure serial buffer is flushed
+
+// Disable USB serial as wakeup source
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+#endif
 
     esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
     esp_deep_sleep_start();
@@ -358,7 +425,17 @@ void TaskLoRa(void *)
           digitalWrite(LED_PIN, LOW);
           vTaskDelay(pdMS_TO_TICKS(50));
         }
-        Serial.println(String("[LoRa] sent: ") + req.json);
+        Serial.println(String("[LoRa] TX SUCCESS: ") + req.json);
+        Serial.printf("[LoRa] Next msg_id will be: %d\n", g_msgCounter);
+
+        // Save to NVS every 10 messages to reduce flash wear
+        if (g_msgCounter % 10 == 0)
+        {
+          prefs.begin("cattracker", false);
+          prefs.putUInt("msg_id", g_msgCounter);
+          prefs.end();
+          Serial.printf("[LoRa] Saved msg_id to NVS: %d\n", g_msgCounter);
+        }
       }
       else
       {
