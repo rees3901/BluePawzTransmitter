@@ -51,6 +51,10 @@
 #define BLE_SCAN_WINDOW_S 3          // Active scan seconds per cycle
 #define BEACON_NAME "Home"           // BLE device name that means "at home"
 
+// Debug serial on spare pin (for battery operation monitoring)
+#define DEBUG_SERIAL_ENABLED true // Set to false to disable
+#define DEBUG_TX_PIN 6            // D5 - Connect to RX of USB-Serial adapter
+
 // Home location (for distance/bearing when available)
 const double HOME_LAT = 51.87370573411073;
 const double HOME_LON = -2.2396017778476716;
@@ -78,6 +82,18 @@ SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
+
+// Debug serial for battery operation
+#if DEBUG_SERIAL_ENABLED
+HardwareSerial DebugSerial(2); // Use UART2
+#define DEBUG_PRINT(x) DebugSerial.print(x)
+#define DEBUG_PRINTLN(x) DebugSerial.println(x)
+#define DEBUG_PRINTF(...) DebugSerial.printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(x)
+#define DEBUG_PRINTLN(x)
+#define DEBUG_PRINTF(...)
+#endif
 
 // ─────────────────────────────────────────────
 // RTOS primitives: queues + event bits
@@ -152,11 +168,21 @@ void setup()
 
   Serial.begin(115200);
   delay(100); // Give serial time to initialize
+
+  // Initialize debug serial for battery operation
+#if DEBUG_SERIAL_ENABLED
+  DebugSerial.begin(115200, SERIAL_8N1, -1, DEBUG_TX_PIN); // TX only
+  delay(50);
+  DEBUG_PRINTLN("\n\n=== DEBUG SERIAL ACTIVE ===");
+#endif
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
   Serial.println("\n\n[BOOT] CatTracker TX (RTOS)");
+  DEBUG_PRINTLN("[BOOT] CatTracker TX (RTOS)");
   Serial.printf("[BOOT] Reset reason: %d\n", esp_reset_reason());
+  DEBUG_PRINTF("[BOOT] Reset reason: %d\n", esp_reset_reason());
 
   // Load persistent counter from NVS (survives all resets)
   prefs.begin("cattracker", false);
@@ -166,20 +192,24 @@ void setup()
   {
   case ESP_SLEEP_WAKEUP_TIMER:
     Serial.printf("[BOOT] ✓ Wake from DEEP SLEEP (RTC msg_id: %d)\n", g_msgCounter);
+    DEBUG_PRINTF("[BOOT] Wake from DEEP SLEEP (msg_id: %d)\n", g_msgCounter);
     // Use RTC counter if valid (faster), otherwise fall back to NVS
     if (g_msgCounter < nvsCounter)
     {
       g_msgCounter = nvsCounter;
       Serial.printf("[BOOT] RTC counter was stale, restored from NVS: %d\n", g_msgCounter);
+      DEBUG_PRINTF("[BOOT] Restored from NVS: %d\n", g_msgCounter);
     }
     break;
   case ESP_SLEEP_WAKEUP_UNDEFINED:
   default:
     Serial.printf("[BOOT] ✗ POWER-ON RESET (cause: %d)\n", wakeup_reason);
+    DEBUG_PRINTF("[BOOT] POWER-ON RESET (cause: %d)\n", wakeup_reason);
     // RTC lost, restore from NVS flash
     g_msgCounter = nvsCounter;
     g_gpsWarmedUp = false;
     Serial.printf("[BOOT] Restored msg_id from NVS flash: %d\n", g_msgCounter);
+    DEBUG_PRINTF("[BOOT] msg_id from NVS: %d\n", g_msgCounter);
     break;
   }
   prefs.end();
@@ -193,6 +223,7 @@ void setup()
   pinMode(GPS_EN, OUTPUT);
   digitalWrite(GPS_EN, HIGH); // Power on GPS
   Serial.println("[INIT] GPS power enabled");
+  DEBUG_PRINTLN("[INIT] GPS power enabled");
   delay(500); // Let GPS module fully power up and stabilize
 
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
@@ -204,6 +235,7 @@ void setup()
     gpsSerial.read();
   }
   Serial.println("[INIT] GPS UART started and buffer flushed");
+  DEBUG_PRINTLN("[INIT] GPS UART ready");
 
   // LoRa radio init (will be re-done in TaskLoRa, but SPI setup here)
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -275,7 +307,11 @@ void loop()
 
     // Enter deep sleep
     Serial.printf("[SLEEP] Deep sleeping for %d s (msg_id saved: %d)\n", SLEEP_SECONDS, g_msgCounter);
+    DEBUG_PRINTF("[SLEEP] Sleeping %ds (msg_id: %d)\n", SLEEP_SECONDS, g_msgCounter);
     Serial.flush();
+#if DEBUG_SERIAL_ENABLED
+    DebugSerial.flush();
+#endif
     delay(100); // Ensure serial buffer is flushed
 
 // Disable USB serial as wakeup source
@@ -343,6 +379,7 @@ void TaskGPS(void *)
       {
         xEventGroupSetBits(evBits, EV_FIX);
         Serial.printf("[GPS] Valid fix: %.6f, %.6f\n", fix.lat, fix.lon);
+        DEBUG_PRINTF("[GPS] Fix: %.6f, %.6f\n", fix.lat, fix.lon);
       }
       // Overwrite latest fix in queue (drop older value if present)
       xQueueOverwrite(gpsFixQ, &fix);
@@ -426,7 +463,9 @@ void TaskLoRa(void *)
           vTaskDelay(pdMS_TO_TICKS(50));
         }
         Serial.println(String("[LoRa] TX SUCCESS: ") + req.json);
+        DEBUG_PRINTLN(String("[TX] ") + req.json);
         Serial.printf("[LoRa] Next msg_id will be: %d\n", g_msgCounter);
+        DEBUG_PRINTF("[TX] Next msg_id: %d\n", g_msgCounter);
 
         // Save to NVS every 10 messages to reduce flash wear
         if (g_msgCounter % 10 == 0)
