@@ -33,8 +33,12 @@
 // ─────────────────────────────────────────────
 // Build‑time configuration / constants
 // ─────────────────────────────────────────────
-#define SENDER_ID "Podge" // Human‑readable name
-#define DEVICE_ID_INT 1   // Numeric device id in JSON
+#define SENDER_ID "Macy" // Human‑readable name
+// #define SENDER_ID "Podge" // Human‑readable name
+// #define SENDER_ID "Gizmo" // Human‑readable name
+// #define SENDER_ID "Simba" // Human‑readable name
+// #define SENDER_ID "Carrie" // Human‑readable name
+#define DEVICE_ID_INT 4   // Numeric device id in JSON
 #define LORA_FREQ_MHZ 915.0
 #define LORA_POWER_DBM 22
 #define LORA_SF 8
@@ -43,11 +47,19 @@
 #define LORA_PREAMBLE 16
 #define LORA_USE_CRC 1
 
+// LBT (Listen Before Talk) configuration
+#define LBT_ENABLED true              // Enable channel activity detection before TX
+#define LBT_RSSI_THRESHOLD -100       // dBm - if RSSI > this, channel is busy (-100 = sensitive)
+#define LBT_SCAN_TIME_US 5000         // Microseconds to listen (5ms = 5000us)
+#define LBT_MAX_RETRIES 5             // Number of retry attempts if channel busy
+#define LBT_RETRY_DELAY_MIN_MS 50     // Minimum random delay between retries
+#define LBT_RETRY_DELAY_MAX_MS 500    // Maximum random delay between retries
+
 #define SLEEP_SECONDS 30             // Deep sleep interval after each cycle
 #define GPS_COLD_START_TIMEOUT 60000 // 60s for initial cold start acquisition
 #define GPS_WARM_START_TIMEOUT 20000 // 20s for subsequent warm starts
 #define GPS_VALID_COUNT_REQUIRED 5   // Number of consecutive valid fixes to confirm lock
-#define GPS_STABILISE_MS 5000        // Extra wait after achieving required valid count
+#define GPS_STABILISE_MS 15000       // Extra wait after achieving required valid count (15s)
 #define BLE_SCAN_WINDOW_S 3          // Active scan seconds per cycle
 #define BEACON_NAME "Home"           // BLE device name that means "at home"
 
@@ -136,6 +148,18 @@ static String cardinalDirection(double bearing)
       "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
   int idx = (int)((bearing + 11.25) / 22.5) % 16;
   return String(dirs[idx]);
+}
+
+// LED flicker for successful transmission
+static void led_flicker()
+{
+  for (int i = 0; i < 5; i++)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    digitalWrite(LED_PIN, LOW);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -447,21 +471,61 @@ void TaskLoRa(void *)
   for (;;)
   {
     TxReq req;
-    if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE) //
+    if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE)
     {
       lora.standby();
+
+#if LBT_ENABLED
+      // Listen Before Talk: check if channel is clear
+      bool channelClear = false;
+      int retryCount = 0;
+
+      while (!channelClear && retryCount < LBT_MAX_RETRIES)
+      {
+        // Start channel activity detection (CAD)
+        int scanResult = lora.scanChannel();
+
+        if (scanResult == RADIOLIB_CHANNEL_FREE)
+        {
+          channelClear = true;
+          Serial.println("[LoRa] LBT: Channel clear, proceeding with TX");
+          DEBUG_PRINTLN("[LoRa] LBT: Clear");
+        }
+        else if (scanResult == RADIOLIB_PREAMBLE_DETECTED)
+        {
+          retryCount++;
+          // Random backoff to avoid synchronized retries from multiple devices
+          int delayMs = random(LBT_RETRY_DELAY_MIN_MS, LBT_RETRY_DELAY_MAX_MS);
+          Serial.printf("[LoRa] LBT: Channel busy (retry %d/%d), waiting %d ms\n",
+                        retryCount, LBT_MAX_RETRIES, delayMs);
+          DEBUG_PRINTF("[LoRa] LBT: Busy, retry %d\n", retryCount);
+          vTaskDelay(pdMS_TO_TICKS(delayMs));
+        }
+        else
+        {
+          // Scan failed - proceed anyway but log it
+          Serial.printf("[LoRa] LBT: Scan error (%d), proceeding with TX\n", scanResult);
+          DEBUG_PRINTLN("[LoRa] LBT: Error");
+          channelClear = true; // Fail-safe: transmit anyway
+        }
+      }
+
+      if (!channelClear)
+      {
+        Serial.printf("[LoRa] LBT: Channel still busy after %d retries, transmitting anyway\n",
+                      LBT_MAX_RETRIES);
+        DEBUG_PRINTLN("[LoRa] LBT: Forced TX");
+      }
+#endif
+
       int ts = lora.transmit(req.json);
       if (ts == RADIOLIB_ERR_NONE)
       {
         xEventGroupSetBits(evBits, EV_TXDONE);
-        // rapid strobe 5x
-        for (int i = 0; i < 5; i++)
-        {
-          digitalWrite(LED_PIN, HIGH);
-          vTaskDelay(pdMS_TO_TICKS(50));
-          digitalWrite(LED_PIN, LOW);
-          vTaskDelay(pdMS_TO_TICKS(50));
-        }
+
+        // LED flicker to indicate successful transmission
+        led_flicker();
+
         Serial.println(String("[LoRa] TX SUCCESS: ") + req.json);
         DEBUG_PRINTLN(String("[TX] ") + req.json);
         Serial.printf("[LoRa] Next msg_id will be: %d\n", g_msgCounter);
