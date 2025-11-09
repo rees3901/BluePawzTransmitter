@@ -38,7 +38,7 @@
 // #define SENDER_ID "Gizmo" // Human‑readable name
 // #define SENDER_ID "Simba" // Human‑readable name
 // #define SENDER_ID "Carrie" // Human‑readable name
-#define DEVICE_ID_INT 4   // Numeric device id in JSON
+#define DEVICE_ID_INT 4 // Numeric device id in JSON
 #define LORA_FREQ_MHZ 915.0
 #define LORA_POWER_DBM 22
 #define LORA_SF 8
@@ -48,12 +48,12 @@
 #define LORA_USE_CRC 1
 
 // LBT (Listen Before Talk) configuration
-#define LBT_ENABLED true              // Enable channel activity detection before TX
-#define LBT_RSSI_THRESHOLD -100       // dBm - if RSSI > this, channel is busy (-100 = sensitive)
-#define LBT_SCAN_TIME_US 5000         // Microseconds to listen (5ms = 5000us)
-#define LBT_MAX_RETRIES 5             // Number of retry attempts if channel busy
-#define LBT_RETRY_DELAY_MIN_MS 50     // Minimum random delay between retries
-#define LBT_RETRY_DELAY_MAX_MS 500    // Maximum random delay between retries
+#define LBT_ENABLED true           // Enable channel activity detection before TX
+#define LBT_RSSI_THRESHOLD -100    // dBm - if RSSI > this, channel is busy (-100 = sensitive)
+#define LBT_SCAN_TIME_US 5000      // Microseconds to listen (5ms = 5000us)
+#define LBT_MAX_RETRIES 5          // Number of retry attempts if channel busy
+#define LBT_RETRY_DELAY_MIN_MS 50  // Minimum random delay between retries
+#define LBT_RETRY_DELAY_MAX_MS 500 // Maximum random delay between retries
 
 #define SLEEP_SECONDS 30             // Deep sleep interval after each cycle
 #define GPS_COLD_START_TIMEOUT 60000 // 60s for initial cold start acquisition
