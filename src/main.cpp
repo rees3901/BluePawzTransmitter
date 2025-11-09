@@ -33,8 +33,8 @@
 // ─────────────────────────────────────────────
 // Build‑time configuration / constants
 // ─────────────────────────────────────────────
-#define SENDER_ID "Macy" // Human‑readable name
-// #define SENDER_ID "Podge" // Human‑readable name
+// #define SENDER_ID "Macy" // Human‑readable name
+#define SENDER_ID "Podge" // Human‑readable name
 // #define SENDER_ID "Gizmo" // Human‑readable name
 // #define SENDER_ID "Simba" // Human‑readable name
 // #define SENDER_ID "Carrie" // Human‑readable name
