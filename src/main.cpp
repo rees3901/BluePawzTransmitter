@@ -29,41 +29,19 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <Preferences.h>
+#include "config.h" // Operating modes and shared configuration
 
 // ─────────────────────────────────────────────
-// Build‑time configuration / constants
+// Device Identity (per-node configuration)
 // ─────────────────────────────────────────────
-// #define SENDER_ID "Macy" // Human‑readable name
-#define SENDER_ID "Podge" // Human‑readable name
-// #define SENDER_ID "Gizmo" // Human‑readable name
-// #define SENDER_ID "Simba" // Human‑readable name
-// #define SENDER_ID "Carrie" // Human‑readable name
-#define DEVICE_ID_INT 4 // Numeric device id in JSON
-#define LORA_FREQ_MHZ 915.0
-#define LORA_POWER_DBM 22
-#define LORA_SF 8
-#define LORA_BW_KHZ 250.0
-#define LORA_CR 5 // 4/5
-#define LORA_PREAMBLE 16
-#define LORA_USE_CRC 1
+// Uncomment ONE device name per tracker
+// #define SENDER_ID "Macy"
+#define SENDER_ID "Podge"
+// #define SENDER_ID "Gizmo"
+// #define SENDER_ID "Simba"
+// #define SENDER_ID "Carrie"
 
-// LBT (Listen Before Talk) configuration
-#define LBT_ENABLED true           // Enable channel activity detection before TX
-#define LBT_RSSI_THRESHOLD -100    // dBm - if RSSI > this, channel is busy (-100 = sensitive)
-#define LBT_SCAN_TIME_US 5000      // Microseconds to listen (5ms = 5000us)
-#define LBT_MAX_RETRIES 5          // Number of retry attempts if channel busy
-#define LBT_RETRY_DELAY_MIN_MS 50  // Minimum random delay between retries
-#define LBT_RETRY_DELAY_MAX_MS 500 // Maximum random delay between retries
-
-#define SLEEP_SECONDS 30             // Deep sleep interval after each cycle
-#define GPS_COLD_START_TIMEOUT 60000 // 60s for initial cold start acquisition
-#define GPS_WARM_START_TIMEOUT 20000 // 20s for subsequent warm starts
-#define GPS_VALID_COUNT_REQUIRED 5   // Number of consecutive valid fixes to confirm lock
-#define GPS_STABILISE_MS 15000       // Extra wait after achieving required valid count (15s)
-#define BLE_INITIAL_SCAN_S 10        // Initial BLE scan on wake before GPS (10s)
-#define BLE_SCAN_WINDOW_S 3          // Active scan seconds during GPS acquisition
-#define BEACON_NAME "Home"           // BLE device name that means "at home"
-#define HOME_SLEEP_CYCLES 5          // Number of sleep cycles at home before transmitting "BLEHome"
+#define DEVICE_ID_INT 4 // Numeric device ID (read-only, not changeable via remote)
 
 // Debug serial on spare pin (for battery operation monitoring)
 #define DEBUG_SERIAL_ENABLED true // Set to false to disable
@@ -135,8 +113,13 @@ static EventGroupHandle_t evBits; // state flags
 
 // Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
-RTC_DATA_ATTR bool g_gpsWarmedUp = false;     // Tracks if GPS has achieved initial lock
-RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0; // Count consecutive cycles at home (BLE detected)
+RTC_DATA_ATTR bool g_gpsWarmedUp = false;        // Tracks if GPS has achieved initial lock
+RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0;    // Count consecutive cycles at home (BLE detected)
+RTC_DATA_ATTR char g_currentMode[16] = "normal"; // Current operating mode name
+RTC_DATA_ATTR uint32_t g_lostModeStartTime = 0;  // Timestamp when lost mode activated (0 = not in lost mode)
+
+// Current active mode (loaded from NVS/RTC on boot)
+const OperatingMode *g_activeMode = &MODE_NORMAL;
 
 // NVS backup for msg counter (Flash memory - survives any reset including USB resets)
 Preferences prefs;
@@ -156,13 +139,205 @@ static String cardinalDirection(double bearing)
 // LED flicker for successful transmission
 static void led_flicker()
 {
-  for (int i = 0; i < 5; i++)
+  uint8_t flashCount = g_activeMode->led_flash_count;
+  for (int i = 0; i < flashCount; i++)
   {
     digitalWrite(LED_PIN, HIGH);
     vTaskDelay(pdMS_TO_TICKS(50));
     digitalWrite(LED_PIN, LOW);
     vTaskDelay(pdMS_TO_TICKS(50));
   }
+}
+
+// LED beacon mode (continuous flashing for lost mode)
+static void led_beacon_pulse()
+{
+  if (g_activeMode->led_beacon_mode)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+// Load operating mode from NVS or use default
+static void loadOperatingMode()
+{
+  prefs.begin("cattracker", true); // Read-only
+  String modeName = prefs.getString("op_mode", "normal");
+  prefs.end();
+
+  // Update RTC-backed mode name
+  strncpy(g_currentMode, modeName.c_str(), sizeof(g_currentMode) - 1);
+  g_currentMode[sizeof(g_currentMode) - 1] = '\0';
+
+  // Set active mode pointer
+  g_activeMode = getModeByName(g_currentMode);
+
+  Serial.printf("[MODE] Loaded: %s (Power: %ddBm, Sleep: %ds)\n",
+                g_activeMode->name, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
+  DEBUG_PRINTF("[MODE] %s P%d S%d\n",
+               g_activeMode->name, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
+}
+
+// Save operating mode to NVS
+static void saveOperatingMode(const char *modeName)
+{
+  prefs.begin("cattracker", false);
+  prefs.putString("op_mode", modeName);
+  prefs.end();
+
+  // Update RTC mode
+  strncpy(g_currentMode, modeName, sizeof(g_currentMode) - 1);
+  g_currentMode[sizeof(g_currentMode) - 1] = '\0';
+
+  // Update active mode
+  g_activeMode = getModeByName(modeName);
+
+  Serial.printf("[MODE] Saved: %s\n", modeName);
+  DEBUG_PRINTF("[MODE] Saved: %s\n", modeName);
+}
+
+// Check lost mode timeout and auto-revert if needed
+static void checkLostModeTimeout()
+{
+  if (strcmp(g_currentMode, "lost") != 0)
+  {
+    g_lostModeStartTime = 0; // Not in lost mode
+    return;
+  }
+
+  // If lost mode start time not set, initialize it
+  if (g_lostModeStartTime == 0)
+  {
+    g_lostModeStartTime = millis() / 1000; // Store in seconds
+    Serial.printf("[MODE] Lost mode activated at uptime %d s\n", g_lostModeStartTime);
+    DEBUG_PRINTLN("[MODE] Lost mode started");
+    return;
+  }
+
+  // Check if timeout exceeded
+  uint32_t currentTime = millis() / 1000;
+  uint32_t elapsedTime = currentTime - g_lostModeStartTime;
+
+  if (elapsedTime >= LOST_MODE_MAX_DURATION_S)
+  {
+    Serial.printf("[MODE] Lost mode timeout after %d seconds - reverting to %s\n",
+                  elapsedTime, LOST_MODE_FALLBACK_MODE);
+    DEBUG_PRINTF("[MODE] Lost timeout -> %s\n", LOST_MODE_FALLBACK_MODE);
+
+    saveOperatingMode(LOST_MODE_FALLBACK_MODE);
+    g_lostModeStartTime = 0;
+
+    // Send alert to base station
+    StaticJsonDocument<128> alert;
+    alert["alert"] = "lost_mode_timeout";
+    alert["duration_s"] = elapsedTime;
+    alert["new_mode"] = LOST_MODE_FALLBACK_MODE;
+
+    TxReq req{};
+    serializeJson(alert, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, 0); // Non-blocking queue
+  }
+}
+
+// Parse and handle mode change command from base station
+static bool handleModeCommand(const char *json)
+{
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, json);
+
+  if (error)
+  {
+    Serial.printf("[RX] JSON parse error: %s\n", error.c_str());
+    DEBUG_PRINTLN("[RX] Parse error");
+    return false;
+  }
+
+  const char *cmd = doc["cmd"];
+  if (!cmd)
+  {
+    Serial.println("[RX] Missing 'cmd' field");
+    return false;
+  }
+
+  // Handle mode change command
+  if (strcmp(cmd, "mode") == 0)
+  {
+    const char *profile = doc["profile"];
+    if (!profile)
+    {
+      Serial.println("[RX] Missing 'profile' field");
+      return false;
+    }
+
+    // Validate profile name
+    const OperatingMode *newMode = getModeByName(profile);
+    if (newMode == nullptr)
+    {
+      Serial.printf("[RX] Unknown profile: %s\n", profile);
+      DEBUG_PRINTF("[RX] Unknown: %s\n", profile);
+      return false;
+    }
+
+    // Save new mode
+    saveOperatingMode(profile);
+
+    // Reset lost mode timer if switching to lost mode
+    if (strcmp(profile, "lost") == 0)
+    {
+      g_lostModeStartTime = 0; // Will be initialized on next wake
+    }
+
+    // Send ACK
+    StaticJsonDocument<192> ack;
+    ack["ack"] = "mode";
+    ack["profile"] = profile;
+    ack["power"] = newMode->lora_power_dbm;
+    ack["sleep"] = newMode->sleep_interval_s;
+    ack["device"] = SENDER_ID;
+
+    TxReq req{};
+    serializeJson(ack, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.printf("[MODE] Changed to '%s' (ACK queued)\n", profile);
+    DEBUG_PRINTF("[MODE] -> %s\n", profile);
+
+    return true;
+  }
+
+  // Handle status request
+  else if (strcmp(cmd, "get_status") == 0)
+  {
+    StaticJsonDocument<256> status;
+    status["status"] = "ok";
+    status["device"] = SENDER_ID;
+    status["mode"] = g_currentMode;
+    status["power"] = g_activeMode->lora_power_dbm;
+    status["sleep"] = g_activeMode->sleep_interval_s;
+    status["msg_id"] = g_msgCounter;
+    status["gps_warm"] = g_gpsWarmedUp;
+    status["home_cycles"] = g_homeBeaconCycles;
+
+    if (g_lostModeStartTime > 0)
+    {
+      uint32_t elapsed = (millis() / 1000) - g_lostModeStartTime;
+      status["lost_mode_s"] = elapsed;
+    }
+
+    TxReq req{};
+    serializeJson(status, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.println("[RX] Status request - response queued");
+    DEBUG_PRINTLN("[RX] Status sent");
+
+    return true;
+  }
+
+  Serial.printf("[RX] Unknown command: %s\n", cmd);
+  return false;
 }
 
 // ─────────────────────────────────────────────
@@ -240,6 +415,12 @@ void setup()
     break;
   }
   prefs.end();
+
+  // Load operating mode from NVS
+  loadOperatingMode();
+
+  // Check lost mode timeout (auto-revert if exceeded)
+  checkLostModeTimeout();
 
   // Queues & events
   gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)
@@ -332,9 +513,13 @@ void loop()
     gpio_hold_en((gpio_num_t)GPS_EN);
     gpio_deep_sleep_hold_en();
 
+    // Get sleep interval from active mode
+    uint16_t sleepSeconds = g_activeMode->sleep_interval_s;
+
     // Enter deep sleep
-    Serial.printf("[SLEEP] Deep sleeping for %d s (msg_id saved: %d)\n", SLEEP_SECONDS, g_msgCounter);
-    DEBUG_PRINTF("[SLEEP] Sleeping %ds (msg_id: %d)\n", SLEEP_SECONDS, g_msgCounter);
+    Serial.printf("[SLEEP] Deep sleeping for %d s in '%s' mode (msg_id: %d)\n",
+                  sleepSeconds, g_activeMode->name, g_msgCounter);
+    DEBUG_PRINTF("[SLEEP] %ds (%s) msg_id:%d\n", sleepSeconds, g_activeMode->name, g_msgCounter);
     Serial.flush();
 #if DEBUG_SERIAL_ENABLED
     DebugSerial.flush();
@@ -346,7 +531,7 @@ void loop()
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 #endif
 
-    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
     esp_deep_sleep_start();
     // Never returns - ESP32 will restart and run setup() again
   }
@@ -448,32 +633,53 @@ void TaskBLE(void *)
 }
 
 // ─────────────────────────────────────────────
-// Task: LoRa owner (TX only for now)
-//  • Dequeues payloads and transmits
-//  • Blinks LED on success
-//  • Initializes radio on first run
+// Task: LoRa owner
+//  • Receives mode commands from base station
+//  • Transmits packets with mode-based power
+//  • Handles RX and TX
 // ─────────────────────────────────────────────
 void TaskLoRa(void *)
 {
-  // Initialize LoRa radio (sole owner)
+  // Initialize LoRa radio (sole owner) - use mode-based power
   Serial.println("[LoRa] Initializing radio...");
   int s = lora.begin(LORA_FREQ_MHZ);
   if (s != RADIOLIB_ERR_NONE)
   {
     Serial.printf("[LORA] init failed (%d)\n", s);
-    vTaskDelete(nullptr); // Kill this task
+    vTaskDelete(nullptr);
     return;
   }
-  lora.setOutputPower(LORA_POWER_DBM);
+
+  // Use power from active mode
+  lora.setOutputPower(g_activeMode->lora_power_dbm);
   lora.setSpreadingFactor(LORA_SF);
   lora.setBandwidth(LORA_BW_KHZ);
   lora.setCodingRate(LORA_CR);
   lora.setCRC(LORA_USE_CRC);
   lora.setPreambleLength(LORA_PREAMBLE);
-  Serial.println("[LORA] configured and ready");
+  lora.setSyncWord(LORA_SYNC_WORD);
+
+  Serial.printf("[LORA] configured (SF%d, BW%.0f, PWR%d dBm)\n",
+                LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
+  DEBUG_PRINTF("[LORA] SF%d BW%.0f P%d\n", LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
+
+  // TODO: Enable RX mode for command reception (future enhancement)
+  // lora.setDio1Action(rxISR);
+  // lora.startReceive();
 
   for (;;)
   {
+    // LED beacon pulse in lost mode
+    if (g_activeMode->led_beacon_mode)
+    {
+      static uint32_t lastBeacon = 0;
+      if (millis() - lastBeacon >= g_activeMode->led_beacon_interval_ms)
+      {
+        led_beacon_pulse();
+        lastBeacon = millis();
+      }
+    }
+
     TxReq req;
     if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE)
     {
