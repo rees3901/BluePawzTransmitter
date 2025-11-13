@@ -60,8 +60,10 @@
 #define GPS_WARM_START_TIMEOUT 20000 // 20s for subsequent warm starts
 #define GPS_VALID_COUNT_REQUIRED 5   // Number of consecutive valid fixes to confirm lock
 #define GPS_STABILISE_MS 15000       // Extra wait after achieving required valid count (15s)
-#define BLE_SCAN_WINDOW_S 3          // Active scan seconds per cycle
+#define BLE_INITIAL_SCAN_S 10        // Initial BLE scan on wake before GPS (10s)
+#define BLE_SCAN_WINDOW_S 3          // Active scan seconds during GPS acquisition
 #define BEACON_NAME "Home"           // BLE device name that means "at home"
+#define HOME_SLEEP_CYCLES 5          // Number of sleep cycles at home before transmitting "BLEHome"
 
 // Debug serial on spare pin (for battery operation monitoring)
 #define DEBUG_SERIAL_ENABLED true // Set to false to disable
@@ -133,7 +135,8 @@ static EventGroupHandle_t evBits; // state flags
 
 // Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
-RTC_DATA_ATTR bool g_gpsWarmedUp = false; // Tracks if GPS has achieved initial lock
+RTC_DATA_ATTR bool g_gpsWarmedUp = false;     // Tracks if GPS has achieved initial lock
+RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0; // Count consecutive cycles at home (BLE detected)
 
 // NVS backup for msg counter (Flash memory - survives any reset including USB resets)
 Preferences prefs;
@@ -414,8 +417,10 @@ void TaskGPS(void *)
 }
 
 // ─────────────────────────────────────────────
-// Task: BLE scanner (short active window)
-//  • Scans for BEACON_NAME; sets EV_HOME when seen
+// Task: BLE scanner
+//  • Performs initial 10s scan on wake
+//  • Continues scanning during GPS acquisition
+//  • Sets EV_HOME when beacon detected
 // ─────────────────────────────────────────────
 void TaskBLE(void *)
 {
@@ -424,9 +429,6 @@ void TaskBLE(void *)
 
   for (;;)
   {
-    // Reset HOME bit each cycle; Power task decides final status
-    xEventGroupClearBits(evBits, EV_HOME);
-
     BLEScanResults res = scan->start(BLE_SCAN_WINDOW_S, false);
     for (int i = 0; i < res.getCount(); i++)
     {
@@ -434,12 +436,14 @@ void TaskBLE(void *)
       if (dev.haveName() && String(dev.getName().c_str()) == BEACON_NAME)
       {
         xEventGroupSetBits(evBits, EV_HOME);
+        Serial.println("[BLE] 'Home' beacon detected!");
+        DEBUG_PRINTLN("[BLE] Home detected");
         break;
       }
     }
     scan->clearResults();
 
-    vTaskDelay(pdMS_TO_TICKS(1000)); // short idle until next cycle
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short delay between scans
   }
 }
 
@@ -553,164 +557,268 @@ void TaskLoRa(void *)
 
 // ─────────────────────────────────────────────
 // Task: Power / Orchestrator
-//  • One full cycle:
-//    1) Clear state; allow BLE/GPS to work
-//    2) If HOME seen → send JSON with status=home (GPS optional)
-//    3) Else wait up to 30s for first valid fix; then +10s stabilise
-//    4) If still invalid → send status=invalidGPSLoc
-//    5) Queue LoRa TX; wait for TX completion
-//    6) Signal main loop to initiate sleep
+//  • New power-saving strategy:
+//    1) Wake → BLE scan 10s for 'Home' beacon
+//    2) If Home detected → sleep immediately (skip GPS/TX)
+//       - After 5 consecutive home cycles, transmit "BLEHome" status
+//    3) If no Home → enable GPS, continue BLE scanning during GPS acquisition
+//       - If Home appears during GPS → abort TX and sleep
+//       - If no Home → transmit with GPS data and "outanabout" status
 // ─────────────────────────────────────────────
 void TaskPower(void *)
 {
   // Reset cycle state
   xEventGroupClearBits(evBits, EV_FIX | EV_HOME | EV_TXDONE);
 
-  // Let BLE & GPS run in parallel for a brief moment
-  uint32_t tStart = millis();
+  Serial.println("\n[POWER] === New wake cycle ===");
+  DEBUG_PRINTLN("\n[POWER] Wake cycle");
 
-  // Poll for fast HOME win
-  bool homeSeen = false;
-  while (millis() - tStart < 500)
+  // ─────────────────────────────────────────────
+  // PHASE 1: Initial 10-second BLE scan
+  // ─────────────────────────────────────────────
+  Serial.printf("[POWER] Phase 1: BLE scan for %d seconds...\n", BLE_INITIAL_SCAN_S);
+  DEBUG_PRINTF("[POWER] BLE scan %ds\n", BLE_INITIAL_SCAN_S);
+
+  uint32_t bleStartTime = millis();
+  bool homeDetectedInitial = false;
+
+  while (millis() - bleStartTime < (BLE_INITIAL_SCAN_S * 1000))
   {
-    EventBits_t b = xEventGroupGetBits(evBits);
-    if (b & EV_HOME)
+    EventBits_t bits = xEventGroupGetBits(evBits);
+    if (bits & EV_HOME)
     {
-      homeSeen = true;
+      homeDetectedInitial = true;
+      Serial.printf("[POWER] Home beacon detected after %d ms\n", millis() - bleStartTime);
+      DEBUG_PRINTLN("[POWER] Home found (initial)");
       break;
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 
-  GpsFix fix{};
-
-  if (homeSeen)
+  // ─────────────────────────────────────────────
+  // PHASE 2: Handle home detection
+  // ─────────────────────────────────────────────
+  if (homeDetectedInitial)
   {
-    // Build minimal JSON with home status; GPS optional if already valid
-    (void)xQueueReceive(gpsFixQ, &fix, 0);
-    StaticJsonDocument<320> doc;
-    doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = SENDER_ID;
-    doc["status"] = "home";
-    if (fix.valid)
+    g_homeBeaconCycles++;
+    Serial.printf("[POWER] At home (cycle %d/%d)\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
+    DEBUG_PRINTF("[POWER] Home cycle %d/%d\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
+
+    if (g_homeBeaconCycles >= HOME_SLEEP_CYCLES)
     {
-      doc["lat"] = fix.lat;
-      doc["lon"] = fix.lon;
-      if (fix.dateTime[0] != '\0')
-      {
-        doc["time"] = fix.dateTime;
-      }
-    }
-    TxReq req{};
-    serializeJson(doc, req.json, sizeof(req.json));
-    xQueueSend(txReqQ, &req, portMAX_DELAY);
-  }
-  else
-  {
-    // Adaptive GPS acquisition: Cold start (first time) vs Warm start (subsequent)
-    uint32_t timeout = g_gpsWarmedUp ? GPS_WARM_START_TIMEOUT : GPS_COLD_START_TIMEOUT;
-    Serial.printf("[POWER] Waiting for GPS fix (%s start, %d s timeout)...\n",
-                  g_gpsWarmedUp ? "WARM" : "COLD", timeout / 1000);
+      // 5th cycle at home - transmit with "BLEHome" status
+      Serial.println("[POWER] 5th home cycle - transmitting 'BLEHome' status");
+      DEBUG_PRINTLN("[POWER] TX BLEHome");
 
-    uint32_t tWaitStart = millis();
-    int validCount = 0;
-    bool gotStableFix = false;
-
-    // Wait for required number of consecutive valid fixes
-    while (millis() - tWaitStart < timeout)
-    {
-      if (xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)) == pdTRUE)
-      {
-        if (fix.valid)
-        {
-          validCount++;
-          Serial.printf("[POWER] GPS valid fix #%d: %.6f, %.6f\n",
-                        validCount, fix.lat, fix.lon);
-
-          if (validCount >= GPS_VALID_COUNT_REQUIRED)
-          {
-            gotStableFix = true;
-            Serial.printf("[POWER] GPS lock stable (%d valid fixes)\n", validCount);
-
-            // Mark GPS as warmed up for future cycles
-            if (!g_gpsWarmedUp)
-            {
-              g_gpsWarmedUp = true;
-              Serial.println("[POWER] GPS warmup complete - future cycles will be faster");
-            }
-            break;
-          }
-        }
-        else
-        {
-          // Reset count if we get an invalid fix
-          if (validCount > 0)
-          {
-            Serial.printf("[POWER] GPS fix lost, resetting count (was %d)\n", validCount);
-            validCount = 0;
-          }
-        }
-      }
-    }
-
-    if (!gotStableFix)
-    {
-      Serial.printf("[POWER] GPS timeout after %d ms (valid count: %d/%d)\n",
-                    millis() - tWaitStart, validCount, GPS_VALID_COUNT_REQUIRED);
-    }
-
-    bool gotFix = gotStableFix;
-    if (gotFix)
-    {
-      // Short stabilization period, then get freshest fix
-      if (GPS_STABILISE_MS > 0)
-      {
-        Serial.printf("[POWER] Stabilizing for %d ms...\n", GPS_STABILISE_MS);
-        vTaskDelay(pdMS_TO_TICKS(GPS_STABILISE_MS));
-      }
-      (void)xQueueReceive(gpsFixQ, &fix, 0); // refresh latest
-
-      // Prepare full JSON with range/bearing if possible
       StaticJsonDocument<320> doc;
       doc["msg_id"] = g_msgCounter++;
       doc["device_id"] = DEVICE_ID_INT;
       doc["id"] = SENDER_ID;
-      doc["status"] = (xEventGroupGetBits(evBits) & EV_HOME) ? "home" : "outanabout";
-      doc["lat"] = fix.lat;
-      doc["lon"] = fix.lon;
-      if (fix.dateTime[0] != '\0')
-      {
-        doc["time"] = fix.dateTime;
-      }
-      // Distance & bearing (TinyGPSPlus helpers are static)
-      double dist = TinyGPSPlus::distanceBetween(fix.lat, fix.lon, HOME_LAT, HOME_LON);
-      double brng = TinyGPSPlus::courseTo(fix.lat, fix.lon, HOME_LAT, HOME_LON);
-      String dir = String((int)brng) + "-" + cardinalDirection(brng);
-      doc["dist_m"] = dist;
-      doc["bearing"] = dir;
+      doc["status"] = "BLEHome";
+
       TxReq req{};
       serializeJson(doc, req.json, sizeof(req.json));
       xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+      // Reset counter for next home detection sequence
+      g_homeBeaconCycles = 0;
+
+      // Wait for TX completion before sleep
+      Serial.println("[POWER] Waiting for TX completion...");
     }
     else
     {
-      // Timeout → send invalid status
-      StaticJsonDocument<192> doc;
-      doc["msg_id"] = g_msgCounter++;
-      doc["device_id"] = DEVICE_ID_INT;
-      doc["id"] = SENDER_ID;
-      doc["status"] = "invalidGPSLoc";
-      TxReq req{};
-      serializeJson(doc, req.json, sizeof(req.json));
-      xQueueSend(txReqQ, &req, portMAX_DELAY);
+      // Cycles 1-4: skip GPS and TX, go straight to sleep
+      Serial.println("[POWER] Skipping GPS/TX, going to sleep");
+      DEBUG_PRINTLN("[POWER] Sleep (home)");
+
+      // Signal sleep without TX
+      xEventGroupSetBits(evBits, EV_TXDONE);
+    }
+
+    // Task done - will be deleted by main loop
+    vTaskSuspend(nullptr);
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  // PHASE 3: Not at home - enable GPS and continue
+  // ─────────────────────────────────────────────
+  Serial.println("[POWER] No home beacon - starting GPS acquisition");
+  DEBUG_PRINTLN("[POWER] GPS start");
+
+  // Reset home beacon counter (device has left home)
+  if (g_homeBeaconCycles > 0)
+  {
+    Serial.printf("[POWER] Leaving home (was at home for %d cycles)\n", g_homeBeaconCycles);
+    DEBUG_PRINTLN("[POWER] Left home");
+    g_homeBeaconCycles = 0;
+  }
+
+  // GPS is already powered on from setup(), just wait for fix
+  GpsFix fix{};
+
+  // Adaptive GPS acquisition: Cold start vs Warm start
+  uint32_t timeout = g_gpsWarmedUp ? GPS_WARM_START_TIMEOUT : GPS_COLD_START_TIMEOUT;
+  Serial.printf("[POWER] Waiting for GPS fix (%s start, %d s timeout)...\n",
+                g_gpsWarmedUp ? "WARM" : "COLD", timeout / 1000);
+  DEBUG_PRINTF("[POWER] GPS %s (%ds)\n", g_gpsWarmedUp ? "warm" : "cold", timeout / 1000);
+
+  uint32_t gpsStartTime = millis();
+  int validCount = 0;
+  bool gotStableFix = false;
+  bool homeDetectedDuringGPS = false;
+
+  // Wait for required number of consecutive valid fixes
+  while (millis() - gpsStartTime < timeout)
+  {
+    // Check if home beacon appeared during GPS acquisition
+    EventBits_t bits = xEventGroupGetBits(evBits);
+    if (bits & EV_HOME)
+    {
+      homeDetectedDuringGPS = true;
+      Serial.printf("[POWER] Home beacon appeared during GPS (after %d ms) - aborting TX\n",
+                    millis() - gpsStartTime);
+      DEBUG_PRINTLN("[POWER] Home during GPS - abort");
+      break;
+    }
+
+    // Check for GPS fix
+    if (xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)) == pdTRUE)
+    {
+      if (fix.valid)
+      {
+        validCount++;
+        Serial.printf("[POWER] GPS valid fix #%d: %.6f, %.6f\n",
+                      validCount, fix.lat, fix.lon);
+        DEBUG_PRINTF("[POWER] Fix #%d\n", validCount);
+
+        if (validCount >= GPS_VALID_COUNT_REQUIRED)
+        {
+          gotStableFix = true;
+          Serial.printf("[POWER] GPS lock stable (%d valid fixes)\n", validCount);
+          DEBUG_PRINTLN("[POWER] GPS locked");
+
+          // Mark GPS as warmed up for future cycles
+          if (!g_gpsWarmedUp)
+          {
+            g_gpsWarmedUp = true;
+            Serial.println("[POWER] GPS warmup complete - future cycles will be faster");
+            DEBUG_PRINTLN("[POWER] GPS warmed up");
+          }
+          break;
+        }
+      }
+      else
+      {
+        // Reset count if we get an invalid fix
+        if (validCount > 0)
+        {
+          Serial.printf("[POWER] GPS fix lost, resetting count (was %d)\n", validCount);
+          validCount = 0;
+        }
+      }
     }
   }
 
-  // Wait for TX completion (EV_TXDONE set by TaskLoRa)
-  // Main loop() will handle the actual sleep entry
-  Serial.println("[POWER] Cycle complete, waiting for TX");
+  // ─────────────────────────────────────────────
+  // PHASE 4: Handle GPS result or home abort
+  // ─────────────────────────────────────────────
+  if (homeDetectedDuringGPS)
+  {
+    // Home beacon appeared - abort transmission and sleep
+    g_homeBeaconCycles = 1; // Start counting home cycles
+    Serial.println("[POWER] TX aborted due to home beacon - going to sleep");
+    DEBUG_PRINTLN("[POWER] Abort - sleep");
 
-  // Task is done - it will be deleted by main loop
+    // Signal sleep without TX
+    xEventGroupSetBits(evBits, EV_TXDONE);
+    vTaskSuspend(nullptr);
+    return;
+  }
+
+  if (!gotStableFix)
+  {
+    Serial.printf("[POWER] GPS timeout after %d ms (valid count: %d/%d)\n",
+                  millis() - gpsStartTime, validCount, GPS_VALID_COUNT_REQUIRED);
+    DEBUG_PRINTF("[POWER] GPS timeout (%d/%d)\n", validCount, GPS_VALID_COUNT_REQUIRED);
+  }
+
+  if (gotStableFix)
+  {
+    // Stabilization period with continued home beacon check
+    if (GPS_STABILISE_MS > 0)
+    {
+      Serial.printf("[POWER] Stabilizing for %d ms (checking for home beacon)...\n", GPS_STABILISE_MS);
+      DEBUG_PRINTF("[POWER] Stabilize %dms\n", GPS_STABILISE_MS);
+
+      uint32_t stabilizeStart = millis();
+      while (millis() - stabilizeStart < GPS_STABILISE_MS)
+      {
+        EventBits_t bits = xEventGroupGetBits(evBits);
+        if (bits & EV_HOME)
+        {
+          Serial.println("[POWER] Home beacon detected during stabilization - aborting TX");
+          DEBUG_PRINTLN("[POWER] Home in stabilize - abort");
+          g_homeBeaconCycles = 1;
+          xEventGroupSetBits(evBits, EV_TXDONE);
+          vTaskSuspend(nullptr);
+          return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    }
+
+    (void)xQueueReceive(gpsFixQ, &fix, 0); // Get freshest fix
+
+    // Build full JSON with GPS data
+    StaticJsonDocument<320> doc;
+    doc["msg_id"] = g_msgCounter++;
+    doc["device_id"] = DEVICE_ID_INT;
+    doc["id"] = SENDER_ID;
+    doc["status"] = "outanabout";
+    doc["lat"] = fix.lat;
+    doc["lon"] = fix.lon;
+    if (fix.dateTime[0] != '\0')
+    {
+      doc["time"] = fix.dateTime;
+    }
+
+    // Distance & bearing to home
+    double dist = TinyGPSPlus::distanceBetween(fix.lat, fix.lon, HOME_LAT, HOME_LON);
+    double brng = TinyGPSPlus::courseTo(fix.lat, fix.lon, HOME_LAT, HOME_LON);
+    String dir = String((int)brng) + "-" + cardinalDirection(brng);
+    doc["dist_m"] = dist;
+    doc["bearing"] = dir;
+
+    TxReq req{};
+    serializeJson(doc, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.println("[POWER] GPS fix acquired - queued for transmission");
+    DEBUG_PRINTLN("[POWER] TX queued");
+  }
+  else
+  {
+    // GPS timeout - send invalid status
+    StaticJsonDocument<192> doc;
+    doc["msg_id"] = g_msgCounter++;
+    doc["device_id"] = DEVICE_ID_INT;
+    doc["id"] = SENDER_ID;
+    doc["status"] = "invalidGPSLoc";
+
+    TxReq req{};
+    serializeJson(doc, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.println("[POWER] GPS timeout - sending invalidGPSLoc");
+    DEBUG_PRINTLN("[POWER] TX invalid");
+  }
+
+  // Wait for TX completion (EV_TXDONE set by TaskLoRa)
+  Serial.println("[POWER] Waiting for TX completion...");
+  DEBUG_PRINTLN("[POWER] Wait TX done");
+
+  // Task done - will be deleted by main loop
   vTaskSuspend(nullptr);
 }
