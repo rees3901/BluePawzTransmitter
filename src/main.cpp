@@ -29,6 +29,7 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include "config.h" // Operating modes and shared configuration
 
 // ─────────────────────────────────────────────
@@ -50,6 +51,14 @@
 // Home location (for distance/bearing when available)
 const double HOME_LAT = 51.87370573411073;
 const double HOME_LON = -2.2396017778476716;
+
+// ─────────────────────────────────────────────
+// CSV Logging Configuration
+// ─────────────────────────────────────────────
+#define CSV_LOG_ENABLED true          // Enable CSV logging to flash
+#define CSV_LOG_FILE "/track_log.csv" // Log file path in LittleFS
+#define CSV_MAX_FILE_SIZE_KB 3072     // Max log file size (3MB of 4MB available)
+#define CSV_LOG_HEADER "timestamp,msg_id,device,mode,status,lat,lon,dist_m,bearing,battery_v,rssi,snr"
 
 // ─────────────────────────────────────────────
 // Pin mapping (Seeeduino XIAO ESP32S3 + SX1262 B2B)
@@ -107,9 +116,10 @@ static QueueHandle_t gpsFixQ;     // latest fix (overwrite)
 static QueueHandle_t txReqQ;      // TX requests
 static EventGroupHandle_t evBits; // state flags
 
-#define EV_FIX (1 << 0)    // have recent valid GPS fix
-#define EV_HOME (1 << 1)   // BLE beacon seen this cycle
-#define EV_TXDONE (1 << 2) // LoRa TX finished
+#define EV_FIX (1 << 0)      // have recent valid GPS fix
+#define EV_HOME (1 << 1)     // BLE beacon seen this cycle
+#define EV_TXDONE (1 << 2)   // LoRa TX finished
+#define EV_LORA_CMD (1 << 3) // LoRa command received (HIGHEST PRIORITY)
 
 // Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
@@ -123,6 +133,9 @@ const OperatingMode *g_activeMode = &MODE_NORMAL;
 
 // NVS backup for msg counter (Flash memory - survives any reset including USB resets)
 Preferences prefs;
+
+// LoRa RX interrupt flag
+volatile bool rxFlag = false;
 
 // ─────────────────────────────────────────────
 // Utilities
@@ -158,6 +171,12 @@ static void led_beacon_pulse()
     vTaskDelay(pdMS_TO_TICKS(100));
     digitalWrite(LED_PIN, LOW);
   }
+}
+
+// LoRa RX interrupt handler (ISR - keep minimal!)
+void IRAM_ATTR setRxFlag(void)
+{
+  rxFlag = true;
 }
 
 // Load operating mode from NVS or use default
@@ -241,6 +260,181 @@ static void checkLostModeTimeout()
   }
 }
 
+// ─────────────────────────────────────────────
+// CSV Logging Functions
+// ─────────────────────────────────────────────
+
+// Initialize LittleFS and create CSV header if needed
+static bool initCSVLogging()
+{
+#if CSV_LOG_ENABLED
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("[CSV] LittleFS mount failed!");
+    DEBUG_PRINTLN("[CSV] Mount failed");
+    return false;
+  }
+
+  Serial.printf("[CSV] LittleFS mounted - Total: %d KB, Used: %d KB\n",
+                LittleFS.totalBytes() / 1024, LittleFS.usedBytes() / 1024);
+  DEBUG_PRINTF("[CSV] FS: %dKB/%dKB\n", LittleFS.usedBytes() / 1024, LittleFS.totalBytes() / 1024);
+
+  // Check if log file exists
+  if (!LittleFS.exists(CSV_LOG_FILE))
+  {
+    // Create new file with header
+    File logFile = LittleFS.open(CSV_LOG_FILE, "w");
+    if (!logFile)
+    {
+      Serial.println("[CSV] Failed to create log file");
+      DEBUG_PRINTLN("[CSV] Create failed");
+      return false;
+    }
+    logFile.println(CSV_LOG_HEADER);
+    logFile.close();
+    Serial.println("[CSV] Created new log file with header");
+    DEBUG_PRINTLN("[CSV] New log created");
+  }
+  else
+  {
+    // Check file size and rotate if needed
+    File logFile = LittleFS.open(CSV_LOG_FILE, "r");
+    if (logFile)
+    {
+      size_t fileSize = logFile.size();
+      logFile.close();
+
+      if (fileSize > (CSV_MAX_FILE_SIZE_KB * 1024))
+      {
+        Serial.printf("[CSV] Log file too large (%d KB), rotating...\n", fileSize / 1024);
+        DEBUG_PRINTLN("[CSV] Rotating log");
+
+        // Backup old log
+        LittleFS.remove("/track_log_old.csv");
+        LittleFS.rename(CSV_LOG_FILE, "/track_log_old.csv");
+
+        // Create new log with header
+        File newLog = LittleFS.open(CSV_LOG_FILE, "w");
+        if (newLog)
+        {
+          newLog.println(CSV_LOG_HEADER);
+          newLog.close();
+          Serial.println("[CSV] Log rotated successfully");
+        }
+      }
+      else
+      {
+        Serial.printf("[CSV] Log file ready (%d KB)\n", fileSize / 1024);
+        DEBUG_PRINTF("[CSV] Log: %dKB\n", fileSize / 1024);
+      }
+    }
+  }
+
+  return true;
+#else
+  return false;
+#endif
+}
+
+// Log transmission to CSV file
+static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0)
+{
+#if CSV_LOG_ENABLED
+  // Parse the JSON to extract fields
+  StaticJsonDocument<320> doc;
+  DeserializationError error = deserializeJson(doc, json);
+
+  if (error)
+  {
+    Serial.printf("[CSV] JSON parse error: %s\n", error.c_str());
+    return;
+  }
+
+  // Open file in append mode
+  File logFile = LittleFS.open(CSV_LOG_FILE, "a");
+  if (!logFile)
+  {
+    Serial.println("[CSV] Failed to open log file for append");
+    DEBUG_PRINTLN("[CSV] Append failed");
+    return;
+  }
+
+  // Build CSV line: timestamp,msg_id,device,mode,status,lat,lon,dist_m,bearing,battery_v,rssi,snr
+  char csvLine[256];
+
+  // Get current time from GPS if available, otherwise use uptime
+  const char *timestamp = doc["time"] | "";
+  if (strlen(timestamp) == 0)
+  {
+    snprintf(csvLine, sizeof(csvLine), "%lu,", millis() / 1000); // Uptime in seconds
+  }
+  else
+  {
+    snprintf(csvLine, sizeof(csvLine), "%s,", timestamp);
+  }
+
+  // Add remaining fields
+  char temp[200];
+  snprintf(temp, sizeof(temp), "%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
+           doc["msg_id"] | 0,
+           doc["id"] | SENDER_ID,
+           g_currentMode,
+           doc["status"] | "unknown",
+           doc["lat"] | 0.0,
+           doc["lon"] | 0.0,
+           doc["dist_m"] | 0.0,
+           doc["bearing"] | "0-N",
+           0.0, // battery_v (TODO: add battery monitoring)
+           rssi,
+           snr);
+
+  strcat(csvLine, temp);
+
+  // Write to file
+  logFile.println(csvLine);
+  logFile.close();
+
+  Serial.printf("[CSV] Logged: msg_id=%u, status=%s\n",
+                doc["msg_id"] | 0, doc["status"] | "?");
+  DEBUG_PRINTF("[CSV] Log: %u\n", doc["msg_id"] | 0);
+
+#endif
+}
+
+// Get CSV log file info (for status requests)
+static void getCSVLogInfo(char *info, size_t maxLen)
+{
+#if CSV_LOG_ENABLED
+  if (!LittleFS.exists(CSV_LOG_FILE))
+  {
+    snprintf(info, maxLen, "No log file");
+    return;
+  }
+
+  File logFile = LittleFS.open(CSV_LOG_FILE, "r");
+  if (!logFile)
+  {
+    snprintf(info, maxLen, "Cannot open log");
+    return;
+  }
+
+  size_t fileSize = logFile.size();
+  int lineCount = 0;
+
+  // Count lines
+  while (logFile.available())
+  {
+    if (logFile.read() == '\n')
+      lineCount++;
+  }
+  logFile.close();
+
+  snprintf(info, maxLen, "%d entries, %d KB", lineCount - 1, fileSize / 1024); // -1 for header
+#else
+  snprintf(info, maxLen, "Logging disabled");
+#endif
+}
+
 // Parse and handle mode change command from base station
 static bool handleModeCommand(const char *json)
 {
@@ -310,7 +504,10 @@ static bool handleModeCommand(const char *json)
   // Handle status request
   else if (strcmp(cmd, "get_status") == 0)
   {
-    StaticJsonDocument<256> status;
+    char logInfo[64];
+    getCSVLogInfo(logInfo, sizeof(logInfo));
+
+    StaticJsonDocument<320> status;
     status["status"] = "ok";
     status["device"] = SENDER_ID;
     status["mode"] = g_currentMode;
@@ -319,6 +516,7 @@ static bool handleModeCommand(const char *json)
     status["msg_id"] = g_msgCounter;
     status["gps_warm"] = g_gpsWarmedUp;
     status["home_cycles"] = g_homeBeaconCycles;
+    status["log"] = logInfo;
 
     if (g_lostModeStartTime > 0)
     {
@@ -421,6 +619,9 @@ void setup()
 
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
+
+  // Initialize CSV logging (LittleFS)
+  initCSVLogging();
 
   // Queues & events
   gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)
@@ -663,13 +864,62 @@ void TaskLoRa(void *)
                 LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
   DEBUG_PRINTF("[LORA] SF%d BW%.0f P%d\n", LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
 
-  // TODO: Enable RX mode for command reception (future enhancement)
-  // lora.setDio1Action(rxISR);
-  // lora.startReceive();
+  // Enable RX mode with interrupt
+  lora.setDio1Action(setRxFlag);
+  int rxState = lora.startReceive();
+  if (rxState == RADIOLIB_ERR_NONE)
+  {
+    Serial.println("[LORA] RX mode active - listening for commands");
+    DEBUG_PRINTLN("[LORA] RX active");
+  }
+  else
+  {
+    Serial.printf("[LORA] RX start failed: %d\n", rxState);
+  }
 
   for (;;)
   {
-    // LED beacon pulse in lost mode
+    // ─────────────────────────────────────────────
+    // PRIORITY 1: Check for LoRa RX commands (HIGHEST)
+    // ─────────────────────────────────────────────
+    if (rxFlag)
+    {
+      rxFlag = false;
+
+      uint8_t rxBuf[256];
+      int state = lora.readData(rxBuf, sizeof(rxBuf));
+
+      if (state == RADIOLIB_ERR_NONE)
+      {
+        rxBuf[255] = '\0'; // Ensure null termination
+
+        Serial.printf("[RX] Command received (%d bytes): %s\n",
+                      lora.getPacketLength(), (char *)rxBuf);
+        DEBUG_PRINTF("[RX] CMD: %s\n", (char *)rxBuf);
+
+        // Parse and handle command
+        if (handleModeCommand((char *)rxBuf))
+        {
+          // Set high-priority flag to override BLE home detection
+          xEventGroupSetBits(evBits, EV_LORA_CMD);
+
+          Serial.println("[RX] Command processed - will override BLE home sleep");
+          DEBUG_PRINTLN("[RX] CMD priority set");
+        }
+      }
+      else if (state == RADIOLIB_ERR_CRC_MISMATCH)
+      {
+        Serial.println("[RX] CRC error - packet corrupted");
+        DEBUG_PRINTLN("[RX] CRC fail");
+      }
+
+      // Return to RX mode
+      lora.startReceive();
+    }
+
+    // ─────────────────────────────────────────────
+    // PRIORITY 2: LED beacon pulse in lost mode
+    // ─────────────────────────────────────────────
     if (g_activeMode->led_beacon_mode)
     {
       static uint32_t lastBeacon = 0;
@@ -680,6 +930,9 @@ void TaskLoRa(void *)
       }
     }
 
+    // ─────────────────────────────────────────────
+    // PRIORITY 3: Handle TX requests
+    // ─────────────────────────────────────────────
     TxReq req;
     if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE)
     {
@@ -741,6 +994,13 @@ void TaskLoRa(void *)
         Serial.printf("[LoRa] Next msg_id will be: %d\n", g_msgCounter);
         DEBUG_PRINTF("[TX] Next msg_id: %d\n", g_msgCounter);
 
+        // Get RSSI and SNR after transmission
+        int16_t rssi = lora.getRSSI();
+        float snr = lora.getSNR();
+
+        // Log transmission to CSV file
+        logTransmissionToCSV(req.json, rssi, snr);
+
         // Save to NVS every 10 messages to reduce flash wear
         if (g_msgCounter % 10 == 0)
         {
@@ -755,7 +1015,11 @@ void TaskLoRa(void *)
         Serial.print("[LoRa] TX error: ");
         Serial.println(ts);
       }
-      // Return to standby/receive if you later add RX
+
+      // Return to RX mode after TX
+      lora.startReceive();
+      Serial.println("[LoRa] Returned to RX mode");
+      DEBUG_PRINTLN("[LoRa] RX resume");
     }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -780,31 +1044,60 @@ void TaskPower(void *)
   DEBUG_PRINTLN("\n[POWER] Wake cycle");
 
   // ─────────────────────────────────────────────
-  // PHASE 1: Initial 10-second BLE scan
+  // PHASE 1: Initial 10-second BLE + LoRa RX scan
   // ─────────────────────────────────────────────
-  Serial.printf("[POWER] Phase 1: BLE scan for %d seconds...\n", BLE_INITIAL_SCAN_S);
-  DEBUG_PRINTF("[POWER] BLE scan %ds\n", BLE_INITIAL_SCAN_S);
+  Serial.printf("[POWER] Phase 1: BLE + LoRa RX scan for %d seconds...\n", BLE_INITIAL_SCAN_S);
+  DEBUG_PRINTF("[POWER] BLE+LoRa scan %ds\n", BLE_INITIAL_SCAN_S);
 
   uint32_t bleStartTime = millis();
   bool homeDetectedInitial = false;
+  bool loraCommandReceived = false;
 
   while (millis() - bleStartTime < (BLE_INITIAL_SCAN_S * 1000))
   {
     EventBits_t bits = xEventGroupGetBits(evBits);
+
+    // PRIORITY 1: Check for LoRa command (overrides everything)
+    if (bits & EV_LORA_CMD)
+    {
+      loraCommandReceived = true;
+      Serial.printf("[POWER] LoRa command received after %d ms - PRIORITY MODE\n", millis() - bleStartTime);
+      DEBUG_PRINTLN("[POWER] LoRa CMD priority");
+      break; // Exit scan immediately
+    }
+
+    // PRIORITY 2: Check for BLE home
     if (bits & EV_HOME)
     {
       homeDetectedInitial = true;
       Serial.printf("[POWER] Home beacon detected after %d ms\n", millis() - bleStartTime);
       DEBUG_PRINTLN("[POWER] Home found (initial)");
-      break;
+      // Don't break - continue scanning for LoRa commands
     }
+
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   // ─────────────────────────────────────────────
-  // PHASE 2: Handle home detection
+  // PHASE 2: Priority Decision Logic
   // ─────────────────────────────────────────────
-  if (homeDetectedInitial)
+
+  // CASE 1: LoRa command received - apply settings and continue cycle normally
+  if (loraCommandReceived)
+  {
+    Serial.println("[POWER] LoRa command takes precedence - continuing cycle with new settings");
+    DEBUG_PRINTLN("[POWER] LoRa CMD applied");
+
+    // Clear the command flag
+    xEventGroupClearBits(evBits, EV_LORA_CMD);
+
+    // Settings already applied by handleModeCommand()
+    // Continue to GPS acquisition phase (don't sleep even if home detected)
+    homeDetectedInitial = false; // Override BLE home detection
+  }
+
+  // CASE 2: Home detected (and NO LoRa command)
+  if (homeDetectedInitial && !loraCommandReceived)
   {
     g_homeBeaconCycles++;
     Serial.printf("[POWER] At home (cycle %d/%d)\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
