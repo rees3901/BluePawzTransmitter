@@ -24,11 +24,7 @@
 // ═══════════════════════════════════════════════
 // Device Identity — Change this per collar!
 // ═══════════════════════════════════════════════
-#define MY_DEVICE_ID 0x0001 // Macy (see DEVICE_REGISTRY in protocol.h)
-// #define MY_DEVICE_ID 0x0002 // Gizmo
-// #define MY_DEVICE_ID 0x0003 // Simba
-// #define MY_DEVICE_ID 0x0004 // Podge
-// #define MY_DEVICE_ID 0x0005 // Carrie
+#define MY_DEVICE_ID 0x0001 // Unique collar ID (1-65534). Change per collar before flashing.
 
 // ═══════════════════════════════════════════════
 // Pin Definitions
@@ -521,7 +517,7 @@ void sendTelemetry()
   if (isHome)
   {
     status = STATUS_BLE_HOME;
-    flags |= FLAG_BLE_HOME;
+    flags |= FLAG_BLE_HOME | FLAG_HAS_GPS; // Include GPS flag since we send home coords
   }
   else if (locValid && !isStale)
   {
@@ -554,7 +550,14 @@ void sendTelemetry()
   pkt_init(buf, MY_DEVICE_ID, messageSeq, unixTime, status, flags);
 
   // GPS fields
-  if (flags & FLAG_HAS_GPS)
+  if (isHome)
+  {
+    // BLE home detected — use home coordinates
+    int32_t lat_e7 = (int32_t)(HOME_LAT * 1e7);
+    int32_t lon_e7 = (int32_t)(HOME_LON * 1e7);
+    pkt_set_gps(buf, lat_e7, lon_e7, 0, 0);
+  }
+  else if (flags & FLAG_HAS_GPS)
   {
     int32_t lat_e7 = (int32_t)(gps.location.lat() * 1e7);
     int32_t lon_e7 = (int32_t)(gps.location.lng() * 1e7);
@@ -577,13 +580,6 @@ void sendTelemetry()
     // Fix age (seconds)
     uint16_t fixAge_s = (uint16_t)(locAge / 1000);
     memcpy(&buf[26], &fixAge_s, 2);
-  }
-  else if (isHome)
-  {
-    // Use home coordinates when BLE home detected
-    int32_t lat_e7 = (int32_t)(HOME_LAT * 1e7);
-    int32_t lon_e7 = (int32_t)(HOME_LON * 1e7);
-    pkt_set_gps(buf, lat_e7, lon_e7, 0, 0);
   }
 
   // Battery (placeholder — no ADC reading yet)

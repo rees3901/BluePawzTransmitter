@@ -39,7 +39,7 @@
 
 #define BLE_INITIAL_SCAN_S 10 // Initial BLE scan on wake
 #define BLE_SCAN_WINDOW_S 3   // BLE scan window during GPS
-#define BEACON_NAME "Home"    // BLE beacon device name
+#define BEACON_NAME "HOME"    // BLE beacon device name (must match RX advertising name)
 #define HOME_SLEEP_CYCLES 5   // Cycles at home before "BLEHome" TX
 
 // ─────────────────────────────────────────────

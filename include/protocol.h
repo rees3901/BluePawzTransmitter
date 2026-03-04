@@ -95,37 +95,30 @@ enum bp_tlv_type_t : uint8_t
 #define DEVICE_ID_BASE 0x0000      // Base station (RX)
 #define DEVICE_ID_BROADCAST 0xFFFF // Broadcast to all collars
 
-struct DeviceInfo
-{
-    uint16_t id;
-    const char *name;
-};
-
-static const DeviceInfo DEVICE_REGISTRY[] = {
-    {1, "Macy"},
-    {2, "Gizmo"},
-    {3, "Simba"},
-    {4, "Podge"},
-    {5, "Carrie"},
-};
-static const uint8_t DEVICE_REGISTRY_SIZE = sizeof(DEVICE_REGISTRY) / sizeof(DEVICE_REGISTRY[0]);
+// Device name buffer for formatting "Device_XXXX" strings
+// Must be static so the returned pointer remains valid
+static char _bp_dev_name_buf[16];
 
 static inline const char *getDeviceName(uint16_t id)
 {
-    for (uint8_t i = 0; i < DEVICE_REGISTRY_SIZE; i++)
-    {
-        if (DEVICE_REGISTRY[i].id == id)
-            return DEVICE_REGISTRY[i].name;
-    }
-    return "Unknown";
+    if (id == DEVICE_ID_BASE)
+        return "BaseStation";
+    snprintf(_bp_dev_name_buf, sizeof(_bp_dev_name_buf), "Device_%04X", id);
+    return _bp_dev_name_buf;
 }
 
 static inline uint16_t getDeviceIdByName(const char *name)
 {
-    for (uint8_t i = 0; i < DEVICE_REGISTRY_SIZE; i++)
+    if (strcmp(name, "BaseStation") == 0)
+        return DEVICE_ID_BASE;
+    if (strcmp(name, "broadcast") == 0)
+        return DEVICE_ID_BROADCAST;
+    // Parse "Device_XXXX" format
+    if (strncmp(name, "Device_", 7) == 0)
     {
-        if (strcmp(DEVICE_REGISTRY[i].name, name) == 0)
-            return DEVICE_REGISTRY[i].id;
+        unsigned int id = 0;
+        if (sscanf(name + 7, "%x", &id) == 1 && id > 0 && id <= 0xFFFE)
+            return (uint16_t)id;
     }
     return 0; // Invalid
 }
