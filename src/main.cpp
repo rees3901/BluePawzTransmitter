@@ -24,11 +24,7 @@
 // ═══════════════════════════════════════════════
 // Device Identity — Change this per collar!
 // ═══════════════════════════════════════════════
-#define MY_DEVICE_ID 0x0001 // Macy (see DEVICE_REGISTRY in protocol.h)
-// #define MY_DEVICE_ID 0x0002 // Gizmo
-// #define MY_DEVICE_ID 0x0003 // Simba
-// #define MY_DEVICE_ID 0x0004 // Podge
-// #define MY_DEVICE_ID 0x0005 // Carrie
+#define MY_DEVICE_ID 0x0001 // Unique collar ID (1-65534). Change per collar before flashing.
 
 // ═══════════════════════════════════════════════
 // Pin Definitions
