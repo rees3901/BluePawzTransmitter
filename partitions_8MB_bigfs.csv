@@ -1,3 +1,23 @@
+# ═══════════════════════════════════════════════════════════════
+# ESP32 Partition Table — 8MB Flash Layout
+# ═══════════════════════════════════════════════════════════════
+#
+# This defines how the 8MB flash chip is divided into regions.
+# Each partition has a name, type, subtype, start offset, and size.
+#
+# Total flash: 8MB (0x800000 bytes)
+#
+# Layout:
+#   0x0000 - 0x8FFF : Bootloader (not listed here, handled by ESP-IDF)
+#   0x9000 - 0xCFFF : NVS (Non-Volatile Storage) — WiFi config, BLE bonds, user preferences
+#   0xD000 - 0xEFFF : OTA data — tracks which app partition (app0 or app1) is active
+#   0x10000 - 0x2CFFFF : App partition 0 — primary firmware (2.75 MB)
+#   0x2D0000 - 0x58FFFF : App partition 1 — OTA update firmware (2.75 MB)
+#   0x590000 - 0x7FFFFF : SPIFFS/LittleFS — filesystem for data logging (2.4375 MB)
+#
+# Note: Two app partitions (app0, app1) enable Over-The-Air (OTA) updates.
+# The device can download new firmware to the inactive partition and swap on reboot.
+#
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x4000,
 otadata,  data, ota,     0xd000,  0x2000,
