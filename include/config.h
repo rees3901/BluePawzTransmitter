@@ -23,6 +23,15 @@
 #define LORA_USE_CRC 1      // Enable CRC
 #define LORA_SYNC_WORD 0x12 // Private network sync word
 
+// AES-128 encryption key (16 bytes)
+// Override per-deployment via build flags
+#ifndef LORA_AES_KEY
+#define LORA_AES_KEY { \
+    0xB7, 0x3A, 0x1F, 0x5D, 0x82, 0xC6, 0x49, 0xE0, \
+    0x15, 0x7B, 0xA8, 0x3E, 0xD4, 0x6C, 0xF1, 0x23  \
+}
+#endif
+
 // LBT (Listen Before Talk) - Collision avoidance
 #define LBT_ENABLED true
 #define LBT_MAX_RETRIES 5

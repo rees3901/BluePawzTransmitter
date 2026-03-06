@@ -20,6 +20,7 @@
 
 #include "protocol.h"
 #include "config.h"
+#include "bp_crypto.h"
 
 // ═══════════════════════════════════════════════
 // Device Identity — Change this per collar!
@@ -156,6 +157,12 @@ RTC_DATA_ATTR int bootFlag = 0;
 // Operating mode state
 const OperatingMode *currentMode = &MODE_NORMAL;
 bp_profile_t currentProfile = PROFILE_NORMAL;
+
+// Command deduplication — ignore retransmitted commands from base station
+static uint32_t lastProcessedCmdSeq = 0;
+
+// AES-128 encryption key
+static const uint8_t aesKey[16] = LORA_AES_KEY;
 
 // Lost mode tracking
 unsigned long lostModeStartTime = 0;
@@ -335,6 +342,8 @@ void setup()
              String(LORA_SF) + " BW" + String(LORA_BW_KHZ) + "kHz CR4/" +
              String(LORA_CR) + " Preamble:" + String(LORA_PREAMBLE) +
              " Power:" + String(currentMode->lora_power_dbm) + "dBm", ANSI_BLUE);
+  colorPrint("[INIT] AES-128: " + String(bp_aes_key_is_zero(aesKey) ? "OFF (key all zeros)" : "ENABLED"),
+             bp_aes_key_is_zero(aesKey) ? ANSI_YELLOW : ANSI_GREEN);
 
   // --- BLE Init ---
   colorPrint("[INIT] Initializing BLE...", ANSI_BLUE);
@@ -710,6 +719,13 @@ void listenForCommands()
       {
         rxLen = lora.getPacketLength();
         colorPrint("[RX] Received " + String(rxLen) + " bytes", ANSI_BRIGHT_MAGENTA);
+
+        // Decrypt if AES key is configured
+        if (!bp_aes_key_is_zero(aesKey))
+        {
+          bp_aes_ctr_apply(rxBuf, rxLen, aesKey);
+        }
+
         pkt_print_hex(rxBuf, rxLen);
 
         // Check if it's a binary protocol packet
@@ -758,6 +774,14 @@ void handleReceivedCommand(const uint8_t *buf, uint8_t len)
 
   uint16_t pktType = pkt_pkt_type(buf);
   uint32_t cmdSeq = pkt_msg_seq(buf);
+
+  // Deduplication: base station retries up to 3x, ignore already-processed commands
+  if (cmdSeq != 0 && cmdSeq == lastProcessedCmdSeq)
+  {
+    colorPrint("[RX] Duplicate cmd seq " + String(cmdSeq) + " — ignoring", ANSI_YELLOW);
+    return;
+  }
+  lastProcessedCmdSeq = cmdSeq;
 
   switch (pktType)
   {
@@ -834,6 +858,12 @@ void applyProfile(bp_profile_t profile)
 // ═══════════════════════════════════════════════
 void transmitBinaryPacket(uint8_t *buf, uint8_t len)
 {
+  // Encrypt payload if AES key is configured
+  if (!bp_aes_key_is_zero(aesKey))
+  {
+    bp_aes_ctr_apply(buf, len, aesKey);
+  }
+
   colorPrint("[LORA TX] Transmitting " + String(len) + " bytes...", ANSI_BLUE);
 
   int state = lora.standby();
@@ -905,6 +935,13 @@ void handleLoraReception()
   {
     size_t rxLen = lora.getPacketLength();
     colorPrint("[LORA RX] Received " + String(rxLen) + " bytes", ANSI_BRIGHT_GREEN);
+
+    // Decrypt if AES key is configured
+    if (!bp_aes_key_is_zero(aesKey))
+    {
+      bp_aes_ctr_apply(rxBuf, rxLen, aesKey);
+    }
+
     pkt_print_hex(rxBuf, rxLen);
 
     if (rxLen >= BP_MIN_PACKET_SIZE && rxBuf[0] == BP_PROTOCOL_VERSION)
