@@ -767,9 +767,17 @@ void handleReceivedCommand(const uint8_t *buf, uint8_t len)
     uint8_t newProfile;
     if (pkt_tlv_get_u8(buf, TLV_PROFILE, &newProfile))
     {
-      colorPrint("[RX] Requested profile: " + String(profileToName((bp_profile_t)newProfile)), ANSI_BRIGHT_MAGENTA);
-      applyProfile((bp_profile_t)newProfile);
-      sendModeAck(cmdSeq);
+      bp_profile_t requestedProfile = (bp_profile_t)newProfile;
+      colorPrint("[RX] Requested profile: " + String(profileToName(requestedProfile)), ANSI_BRIGHT_MAGENTA);
+      if (requestedProfile == PROFILE_UNKNOWN)
+      {
+        colorPrint("[RX] Rejecting unknown profile in PKT_CMD_MODE.", ANSI_RED);
+      }
+      else
+      {
+        applyProfile(requestedProfile);
+        sendModeAck(cmdSeq);
+      }
     }
     else
     {
@@ -794,6 +802,12 @@ void handleReceivedCommand(const uint8_t *buf, uint8_t len)
 // ═══════════════════════════════════════════════
 void applyProfile(bp_profile_t profile)
 {
+  if (profile == PROFILE_UNKNOWN)
+  {
+    colorPrint("[MODE] Ignoring invalid/unknown profile request.", ANSI_RED);
+    return;
+  }
+
   const char *name = profileToName(profile);
   const OperatingMode *mode = getModeByName(name);
 
@@ -1005,15 +1019,8 @@ bool scanForHomeBeacon(uint32_t scanDurationSeconds)
              "\" (" + String(scanDurationSeconds) + "s)...", ANSI_BLUE);
   isHome = false;
 
+  // Blocking scan call: callback may stop it early if beacon is found.
   pBLEScan->start(scanDurationSeconds, false);
-
-  unsigned long scanStart = millis();
-  while (millis() - scanStart < (scanDurationSeconds * 1000))
-  {
-    if (isHome)
-      break;
-    delay(100);
-  }
 
   if (isHome)
   {
