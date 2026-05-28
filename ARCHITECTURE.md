@@ -398,7 +398,39 @@ revived if/when one of these changes:
 
 ---
 
-## 11. Glossary
+## 11. Versioning
+
+Semantic versioning, `MAJOR.MINOR.PATCH`.
+
+| Level | Bump when… | Examples |
+|---|---|---|
+| **MAJOR** | the wire format, hardware target, or anything that breaks compatibility between receiver and any collar in the fleet | V3 itself (JSON protocol + Heltec V2); a future V4 if we move to binary or encrypt the link |
+| **MINOR** | adding a new user-visible feature, backwards-compatible | adding battery telemetry, geofence alerts, breadcrumb persistence |
+| **PATCH** | bug fixes, polish, refactors with no functional change | the BLE name case fix, the lost-mode accumulator fix |
+
+Versions are owned per-repo:
+
+- **Receiver** version lives in
+  [`BluePawzReceiver/include/version.h`](https://github.com/rees3901/BluePawzReceiver/blob/main/include/version.h)
+  as `#define BLUEPAWZ_VERSION`. Surfaced on the TFT, on the web UI
+  title, and at `GET /version`.
+- **Transmitter** version is currently uncoupled from the receiver's —
+  collars don't yet send their version in telemetry. (Adding a
+  `"fw":"3.0.0"` field to the telemetry JSON is a likely MINOR bump.)
+
+The two MAJORs should always agree (a V3 receiver must only talk to V3
+collars). MINOR / PATCH can drift between halves — receivers are usually
+ahead because we OTA them more often.
+
+### When to bump in practice
+
+- Commits that don't change behaviour (typos, comments, doc) — no bump.
+- Commits that change behaviour but fix something — bump PATCH.
+- Commits that expose new functionality to the user — bump MINOR.
+- Commits that break compatibility with a deployed collar — bump MAJOR
+  and write a migration plan.
+
+## 12. Glossary
 
 - **LBT** — Listen Before Talk. The radio scans the channel for an
   in-progress transmission before keying up. Random backoff on collision.
