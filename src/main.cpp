@@ -1,38 +1,111 @@
 /*
-  ┌──────────────────────────────────────────────┐
-  │ CAT TRACKER TX — LoRa GPS Collar             │
-  │ SX1262 + TinyGPSPlus + Binary TLV Protocol   │
-  └──────────────────────────────────────────────┘
-  Binary TLV protocol compatible with BluePawzReceiver.
-  protocol.h and config.h MUST be identical on TX and RX.
+  ┌─────────────────────────────────────────────────────────────┐
+  │  CAT TRACKER TX (ESP32S3 + FreeRTOS)                       │
+  │  SX1262 LoRa + TinyGPSPlus + BLE "Home" beacon             │
+  │  Behaviour: wake → GPS/ BLE → build JSON → LoRa TX → sleep │
+  │  JSON fields: msg_id, device_id, id, status, lat/lon/time… │
+  └─────────────────────────────────────────────────────────────┘
+
+  High‑level RTOS design
+  ───────────────────────
+  • TaskGPS  : reads UART1, feeds TinyGPSPlus, publishes latest fix.
+  • TaskBLE  : short active scan window; sets Event bit when beacon "Home" seen.
+  • TaskLoRa : sole owner of RadioLib; sends payloads queued by the Power task; handles RX later.
+  • TaskPower: orchestrates one acquisition/decision cycle then enters sleep.
+
+  Sleep policy
+  ────────────
+  • Uses deep sleep via timer wake (default 30 s). Adjust SLEEP_SECONDS below.
+  • All state that must persist across deep sleep uses RTC_DATA_ATTR.
+
+  NOTE: Keep RadioLib access in a single task (TaskLoRa). Do not use RadioLib
+  from ISRs. If you later need LoRa RX commands, push them into a queue.
 */
 
 #include <Arduino.h>
 #include <RadioLib.h>
-#include <TinyGPS++.h>
-#include <esp_sleep.h>
-#include <HardwareSerial.h>
+#include <TinyGPSPlus.h>
+#include <ArduinoJson.h>
 #include <BLEDevice.h>
-#include <BLEUtils.h>
 #include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
-#include <esp_attr.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include "config.h" // Operating modes and shared configuration
 
-#include "protocol.h"
-#include "config.h"
+// ─────────────────────────────────────────────
+// Device Identity (per-node configuration)
+// ─────────────────────────────────────────────
+// V3: only DEVICE_ID_INT is hardcoded per flash. It is the immutable
+// numeric identity of this physical collar — used for command targeting
+// from the base station. The human-friendly NAME ("Podge", "Macy", etc.)
+// is a runtime value (g_senderName) stored in NVS and changed at any time
+// via the `set_name` command from the receiver. Default if NVS is empty:
+// "Device-<DEVICE_ID_INT>".
+#define DEVICE_ID_INT 4 // Numeric device ID — unique per flash, never changes remotely.
 
-// ═══════════════════════════════════════════════
-// Device Identity — Change this per collar!
-// ═══════════════════════════════════════════════
-#define MY_DEVICE_ID 0x0001 // Unique collar ID (1-65534). Change per collar before flashing.
+#define SENDER_NAME_MAX_LEN 15   // 15 chars + null terminator, matches NVS key length comfortably
+static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
 
-// ═══════════════════════════════════════════════
-// Pin Definitions
-// ═══════════════════════════════════════════════
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
+// Load the friendly name from NVS into g_senderName. If empty/unset, derive a
+// sensible default of "Device-<DEVICE_ID_INT>". Safe to call repeatedly.
+static void loadSenderName()
+{
+  Preferences p;
+  if (p.begin("cattracker", true)) // read-only
+  {
+    String stored = p.getString("name", "");
+    p.end();
+    if (stored.length() > 0 && stored.length() <= SENDER_NAME_MAX_LEN)
+    {
+      strncpy(g_senderName, stored.c_str(), SENDER_NAME_MAX_LEN);
+      g_senderName[SENDER_NAME_MAX_LEN] = '\0';
+      return;
+    }
+  }
+  snprintf(g_senderName, sizeof(g_senderName), "Device-%d", DEVICE_ID_INT);
+}
 
+// Validate + persist a new friendly name. Returns true on success.
+// Rejects: empty, too long, contains comma (CSV log safety) or control chars.
+static bool saveSenderName(const char *newName)
+{
+  if (!newName) return false;
+  size_t len = strnlen(newName, SENDER_NAME_MAX_LEN + 2);
+  if (len == 0 || len > SENDER_NAME_MAX_LEN) return false;
+  for (size_t i = 0; i < len; i++)
+  {
+    unsigned char c = (unsigned char)newName[i];
+    if (c < 0x20 || c == ',' || c == '"' || c == '\\') return false;
+  }
+  Preferences p;
+  if (!p.begin("cattracker", false)) return false;
+  p.putString("name", newName);
+  p.end();
+  strncpy(g_senderName, newName, SENDER_NAME_MAX_LEN);
+  g_senderName[SENDER_NAME_MAX_LEN] = '\0';
+  return true;
+}
+
+// Debug serial on spare pin (for battery operation monitoring)
+#define DEBUG_SERIAL_ENABLED true // Set to false to disable
+#define DEBUG_TX_PIN 6            // D5 - Connect to RX of USB-Serial adapter
+
+// V3: home location lives on the receiver. The collar only sends raw lat/lon;
+// the receiver computes distance/bearing on each inbound packet. This keeps
+// every collar agnostic to where "home" is — change it once at the base station
+// and every cat tracks against the new value with no reflash needed.
+
+// ─────────────────────────────────────────────
+// CSV Logging Configuration
+// ─────────────────────────────────────────────
+#define CSV_LOG_ENABLED true          // Enable CSV logging to flash
+#define CSV_LOG_FILE "/track_log.csv" // Log file path in LittleFS
+#define CSV_MAX_FILE_SIZE_KB 3072     // Max log file size (3MB of 4MB available)
+#define CSV_LOG_HEADER "timestamp,msg_id,device,mode,status,lat,lon,dist_m,bearing,battery_v,rssi,snr"
+
+// ─────────────────────────────────────────────
+// Pin mapping (Seeeduino XIAO ESP32S3 + SX1262 B2B)
+// ─────────────────────────────────────────────
 #define LORA_NSS 41
 #define LORA_SCK 7
 #define LORA_MOSI 9
@@ -41,1035 +114,1413 @@
 #define LORA_BUSY 40
 #define LORA_DIO1 39
 
-#define GPS_RX 44
-#define GPS_TX 43
-#define GPS_BAUD 9600
-#define GPS_SLEEP_WAKE 1
-#define GPS_RESET 3
+#define GPS_RX D7
+#define GPS_TX D6
+#define GPS_EN 1 // D2 → GPS Enable (HIGH = ON)
+#define LED_PIN 48
 
-#define STATUS_BUTTON_PIN GPIO_NUM_21
-#define STATUS_LED_PIN 48
-
-// ═══════════════════════════════════════════════
-// Home Location
-// ═══════════════════════════════════════════════
-#define HOME_LAT 51.87370573411073
-#define HOME_LON -2.2396017778476716
-#define HOME_RADIUS_M 20.0
-
-// ═══════════════════════════════════════════════
-// Timing
-// ═══════════════════════════════════════════════
-#define COMMAND_LISTEN_MS 2000 // Listen window after each TX
-
-// ═══════════════════════════════════════════════
-// ANSI Color Codes
-// ═══════════════════════════════════════════════
-#define ANSI_RED "\033[31m"
-#define ANSI_GREEN "\033[32m"
-#define ANSI_YELLOW "\033[33m"
-#define ANSI_BLUE "\033[34m"
-#define ANSI_MAGENTA "\033[35m"
-#define ANSI_CYAN "\033[36m"
-#define ANSI_WHITE "\033[37m"
-#define ANSI_BRIGHT_RED "\033[91m"
-#define ANSI_BRIGHT_GREEN "\033[92m"
-#define ANSI_BRIGHT_YELLOW "\033[93m"
-#define ANSI_BRIGHT_BLUE "\033[94m"
-#define ANSI_BRIGHT_MAGENTA "\033[95m"
-#define ANSI_BRIGHT_CYAN "\033[96m"
-#define ANSI_BRIGHT_WHITE "\033[97m"
-#define ANSI_BOLD "\033[1m"
-#define ANSI_RESET "\033[0m"
-
-// ═══════════════════════════════════════════════
-// Forward Declarations
-// ═══════════════════════════════════════════════
-void colorPrint(const String &message, const char *color = ANSI_RESET);
-void printStatusReport();
-void gpsWake();
-void gpsSleep();
-void processGps();
-void performTransmissionSequence();
-void goToLightSleep();
-bool scanForHomeBeacon(uint32_t scanDurationSeconds);
-void handleWakeupReason();
-void handleLoraReception();
-
-// Binary protocol functions
-void sendTelemetry();
-void sendModeAck(uint32_t cmdMsgSeq);
-void sendStatusResponse(uint32_t cmdMsgSeq);
-void sendLostModeTimeoutAlert();
-void listenForCommands();
-void handleReceivedCommand(const uint8_t *buf, uint8_t len);
-void applyProfile(bp_profile_t profile);
-void transmitBinaryPacket(uint8_t *buf, uint8_t len);
-
-// LED functions
-void flickerShort();
-void flickerMedium();
-void flickerLong();
-void ledBeacon();
-
-// ═══════════════════════════════════════════════
-// Hardware Instances
-// ═══════════════════════════════════════════════
+// ─────────────────────────────────────────────
+// LoRa / GPS globals
+// ─────────────────────────────────────────────
 SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, LoRaSPI);
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
 
-// ═══════════════════════════════════════════════
-// BLE
-// ═══════════════════════════════════════════════
-BLEScan *pBLEScan = nullptr;
-volatile bool isHome = false;
-uint8_t homeCycleCount = 0; // Consecutive BLE home detections
+// Debug serial for battery operation
+#if DEBUG_SERIAL_ENABLED
+HardwareSerial DebugSerial(2); // Use UART2
+#define DEBUG_PRINT(x) DebugSerial.print(x)
+#define DEBUG_PRINTLN(x) DebugSerial.println(x)
+#define DEBUG_PRINTF(...) DebugSerial.printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(x)
+#define DEBUG_PRINTLN(x)
+#define DEBUG_PRINTF(...)
+#endif
 
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+// ─────────────────────────────────────────────
+// RTOS primitives: queues + event bits
+// ─────────────────────────────────────────────
+struct GpsFix
 {
-  void onResult(BLEAdvertisedDevice advertisedDevice)
-  {
-    if (advertisedDevice.haveName() && advertisedDevice.getName() == BEACON_NAME)
-    {
-      colorPrint("[BLE] Found Home Beacon! (" + String(BEACON_NAME) + ")", ANSI_BRIGHT_GREEN);
-      isHome = true;
-      if (pBLEScan != nullptr)
-      {
-        pBLEScan->stop();
-        colorPrint("[BLE] Scan stopped early.", ANSI_BLUE);
-      }
-    }
-  }
+  double lat = 0;
+  double lon = 0;
+  bool valid = false;
+  char dateTime[24] = ""; // Format: "YYYY-MM-DD HH:MM:SS"
 };
-MyAdvertisedDeviceCallbacks bleCallbacks;
 
-// ═══════════════════════════════════════════════
-// Global State
-// ═══════════════════════════════════════════════
-bool gpsIsAwake = true;
-bool gpsWarmStart = false; // Track if GPS has had a previous fix
-static uint32_t messageSeq = 0;
-RTC_DATA_ATTR int bootFlag = 0;
-
-// Operating mode state
-const OperatingMode *currentMode = &MODE_NORMAL;
-bp_profile_t currentProfile = PROFILE_NORMAL;
-
-// Lost mode tracking
-unsigned long lostModeStartTime = 0;
-bool inLostMode = false;
-
-// Timed loop (sleep disabled for debugging)
-unsigned long lastSendTime = 0;
-
-// ═══════════════════════════════════════════════
-// LED Functions
-// ═══════════════════════════════════════════════
-void flickerShort()
+struct TxReq
 {
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  for (int i = 0; i < 3; i++)
+  char json[320];
+};
+
+static QueueHandle_t gpsFixQ;     // latest fix (overwrite)
+static QueueHandle_t txReqQ;      // TX requests
+static EventGroupHandle_t evBits; // state flags
+
+#define EV_FIX (1 << 0)      // have recent valid GPS fix
+#define EV_HOME (1 << 1)     // BLE beacon seen this cycle
+#define EV_TXDONE (1 << 2)   // LoRa TX finished
+#define EV_LORA_CMD (1 << 3) // LoRa command received (HIGHEST PRIORITY)
+
+// Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
+RTC_DATA_ATTR uint32_t g_msgCounter = 0;
+RTC_DATA_ATTR bool g_gpsWarmedUp = false;        // Tracks if GPS has achieved initial lock
+RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0;    // Count consecutive cycles at home (BLE detected)
+RTC_DATA_ATTR char g_currentMode[16] = "normal"; // Current operating mode name
+// V3 fix: previously stored a millis()-based timestamp ("g_lostModeStartTime"),
+// but millis() resets every deep-sleep wake, so the 2-hour timeout never fired
+// correctly. Track total seconds in lost mode by ACCUMULATING across wakes
+// instead. Incremented by (this wake's runtime + upcoming sleep) right before
+// each deep_sleep_start. Cleared on mode change.
+RTC_DATA_ATTR uint32_t g_lostModeAccumS = 0;     // Total seconds spent in lost mode (0 = not in lost mode)
+
+// Current active mode (loaded from NVS/RTC on boot)
+const OperatingMode *g_activeMode = &MODE_NORMAL;
+
+// NVS backup for msg counter (Flash memory - survives any reset including USB resets)
+Preferences prefs;
+
+// LoRa RX interrupt flag
+volatile bool rxFlag = false;
+
+// ─────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────
+// (cardinalDirection removed in V3 — the receiver computes the cardinal from
+// the bearing once it has done its own haversine. Collars no longer need it.)
+
+// LED flicker for successful transmission
+static void led_flicker()
+{
+  uint8_t flashCount = g_activeMode->led_flash_count;
+  for (int i = 0; i < flashCount; i++)
   {
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    delay(30);
-    digitalWrite(STATUS_LED_PIN, LOW);
-    delay(30);
+    digitalWrite(LED_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    digitalWrite(LED_PIN, LOW);
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-void flickerMedium()
+// LED beacon mode (continuous flashing for lost mode)
+static void led_beacon_pulse()
 {
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  for (int i = 0; i < currentMode->led_flash_count; i++)
+  if (g_activeMode->led_beacon_mode)
   {
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    delay(50);
-    digitalWrite(STATUS_LED_PIN, LOW);
-    delay(50);
+    digitalWrite(LED_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    digitalWrite(LED_PIN, LOW);
   }
 }
 
-void flickerLong()
+// LoRa RX interrupt handler (ISR - keep minimal!)
+void IRAM_ATTR setRxFlag(void)
 {
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  for (int i = 0; i < 12; i++)
-  {
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    delay(80);
-    digitalWrite(STATUS_LED_PIN, LOW);
-    delay(80);
-  }
+  rxFlag = true;
 }
 
-void ledBeacon()
+// Load operating mode from NVS or use default
+static void loadOperatingMode()
 {
-  if (currentMode->led_beacon_mode)
-  {
-    pinMode(STATUS_LED_PIN, OUTPUT);
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    delay(100);
-    digitalWrite(STATUS_LED_PIN, LOW);
-  }
+  prefs.begin("cattracker", true); // Read-only
+  String modeName = prefs.getString("op_mode", "normal");
+  prefs.end();
+
+  // Update RTC-backed mode name
+  strncpy(g_currentMode, modeName.c_str(), sizeof(g_currentMode) - 1);
+  g_currentMode[sizeof(g_currentMode) - 1] = '\0';
+
+  // Set active mode pointer
+  g_activeMode = getModeByName(g_currentMode);
+
+  Serial.printf("[MODE] Loaded: %s (Power: %ddBm, Sleep: %ds)\n",
+                g_activeMode->name, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
+  DEBUG_PRINTF("[MODE] %s P%d S%d\n",
+               g_activeMode->name, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
 }
 
-// ═══════════════════════════════════════════════
-// SETUP
-// ═══════════════════════════════════════════════
-void setup()
+// Save operating mode to NVS
+static void saveOperatingMode(const char *modeName)
 {
-  Serial.begin(115200);
-  delay(1000);
+  prefs.begin("cattracker", false);
+  prefs.putString("op_mode", modeName);
+  prefs.end();
 
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (bootFlag == 1 && (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER ||
-                        wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 ||
-                        wakeup_reason == ESP_SLEEP_WAKEUP_GPIO))
+  // Update RTC mode
+  strncpy(g_currentMode, modeName, sizeof(g_currentMode) - 1);
+  g_currentMode[sizeof(g_currentMode) - 1] = '\0';
+
+  // Update active mode
+  g_activeMode = getModeByName(modeName);
+
+  Serial.printf("[MODE] Saved: %s\n", modeName);
+  DEBUG_PRINTF("[MODE] Saved: %s\n", modeName);
+}
+
+// Check lost mode timeout and auto-revert if needed.
+//
+// Called once near the top of each wake (after RTC vars are restored). Uses
+// the accumulator g_lostModeAccumS, which is incremented before deep_sleep_start
+// (see accumulateLostModeTime()). This survives deep sleep correctly — millis()
+// alone does not, because it resets to 0 on every wake.
+static void checkLostModeTimeout()
+{
+  if (strcmp(g_currentMode, "lost") != 0)
   {
-    colorPrint("[WAKE] Woke from sleep, skipping full setup...", ANSI_BRIGHT_YELLOW);
-    bootFlag = 0;
+    g_lostModeAccumS = 0; // Not in lost mode — reset the accumulator
     return;
   }
 
-  bootFlag = 0;
-  Serial.println("\n[BOOT] Serial connection established. Starting setup...");
-  delay(200);
-  colorPrint("[BOOT] Initialising CAT TRACKER TX v3 (Binary TLV Protocol)...");
-  colorPrint("[BOOT] Device: " + String(getDeviceName(MY_DEVICE_ID)) +
-             " (ID: 0x" + String(MY_DEVICE_ID, HEX) + ")", ANSI_BRIGHT_CYAN);
-  flickerShort();
-  delay(200);
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  pinMode(STATUS_BUTTON_PIN, INPUT_PULLUP);
-
-  // --- GPS Init ---
-  pinMode(GPS_RESET, OUTPUT);
-  digitalWrite(GPS_RESET, HIGH);
-  pinMode(GPS_SLEEP_WAKE, OUTPUT);
-  digitalWrite(GPS_SLEEP_WAKE, HIGH);
-  gpsIsAwake = true;
-
-  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-  delay(100);
-  colorPrint("[GPS] Waking up GPS module for initial setup...");
-
-  colorPrint("[GPS] Checking for initial serial activity...", ANSI_YELLOW);
-  delay(1000);
-  if (gpsSerial.available() > 0)
+  if (g_lostModeAccumS >= LOST_MODE_MAX_DURATION_S)
   {
-    colorPrint("[GPS] Serial data detected! Module appears awake.", ANSI_BRIGHT_GREEN);
-    while (gpsSerial.available() > 0)
-      gpsSerial.read();
+    uint32_t elapsedTime = g_lostModeAccumS;
+    Serial.printf("[MODE] Lost mode timeout after %u seconds - reverting to %s\n",
+                  elapsedTime, LOST_MODE_FALLBACK_MODE);
+    DEBUG_PRINTF("[MODE] Lost timeout -> %s\n", LOST_MODE_FALLBACK_MODE);
+
+    // Silent revert. We do NOT send a special "alert" packet — the previous
+    // version did, but that packet had no `status` field, so the receiver's
+    // JSON normaliser tagged it "Error" and the cat dropped off the map.
+    // The next routine telemetry packet (with status "outanabout" or similar
+    // and now mode="active") tells the receiver everything it needs to know.
+    saveOperatingMode(LOST_MODE_FALLBACK_MODE);
+    g_lostModeAccumS = 0;
   }
   else
   {
-    colorPrint("[GPS] No serial data detected after 1s. Check wiring/power.", ANSI_BRIGHT_RED);
+    Serial.printf("[MODE] Lost mode active: %u / %u s\n",
+                  g_lostModeAccumS, (uint32_t)LOST_MODE_MAX_DURATION_S);
+  }
+}
+
+// Accumulate time spent in lost mode. Call this immediately before
+// esp_deep_sleep_start so we account for this wake's runtime and the upcoming
+// sleep interval. Safe to call when not in lost mode — it's a no-op.
+static void accumulateLostModeTime(uint32_t upcomingSleepS)
+{
+  if (strcmp(g_currentMode, "lost") != 0) return;
+  uint32_t thisWakeS = millis() / 1000;
+  g_lostModeAccumS += thisWakeS + upcomingSleepS;
+  Serial.printf("[MODE] Lost mode accum: +%u (wake) +%u (sleep) = %u / %u s\n",
+                thisWakeS, upcomingSleepS, g_lostModeAccumS,
+                (uint32_t)LOST_MODE_MAX_DURATION_S);
+}
+
+// ─────────────────────────────────────────────
+// CSV Logging Functions
+// ─────────────────────────────────────────────
+
+// Initialize LittleFS and create CSV header if needed
+static bool initCSVLogging()
+{
+#if CSV_LOG_ENABLED
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("[CSV] LittleFS mount failed!");
+    DEBUG_PRINTLN("[CSV] Mount failed");
+    return false;
   }
 
-  // GPS warmup with stabilization
-  colorPrint("[GPS] Warming up GPS (waiting for fix)...");
-  unsigned long gpsWarmupStart = millis();
-  bool fixFound = false;
-  bool firstFixDetected = false;
-  unsigned long firstFixTimestamp = 0;
+  Serial.printf("[CSV] LittleFS mounted - Total: %d KB, Used: %d KB\n",
+                LittleFS.totalBytes() / 1024, LittleFS.usedBytes() / 1024);
+  DEBUG_PRINTF("[CSV] FS: %dKB/%dKB\n", LittleFS.usedBytes() / 1024, LittleFS.totalBytes() / 1024);
 
-  while (millis() - gpsWarmupStart < GPS_COLD_START_TIMEOUT)
+  // Check if log file exists
+  if (!LittleFS.exists(CSV_LOG_FILE))
   {
-    processGps();
-    if (!firstFixDetected && gps.location.isValid() && gps.location.age() < 5000)
+    // Create new file with header
+    File logFile = LittleFS.open(CSV_LOG_FILE, "w");
+    if (!logFile)
     {
-      firstFixDetected = true;
-      firstFixTimestamp = millis();
-      colorPrint("[GPS] Initial valid fix obtained! Waiting for stability...", ANSI_BRIGHT_GREEN);
+      Serial.println("[CSV] Failed to create log file");
+      DEBUG_PRINTLN("[CSV] Create failed");
+      return false;
     }
-    if (firstFixDetected && (millis() - firstFixTimestamp >= GPS_STABILISE_MS))
+    logFile.println(CSV_LOG_HEADER);
+    logFile.close();
+    Serial.println("[CSV] Created new log file with header");
+    DEBUG_PRINTLN("[CSV] New log created");
+  }
+  else
+  {
+    // Check file size and rotate if needed
+    File logFile = LittleFS.open(CSV_LOG_FILE, "r");
+    if (logFile)
     {
-      colorPrint("[GPS] Stabilization period complete.", ANSI_BRIGHT_GREEN);
-      fixFound = true;
-      gpsWarmStart = true;
+      size_t fileSize = logFile.size();
+      logFile.close();
+
+      if (fileSize > (CSV_MAX_FILE_SIZE_KB * 1024))
+      {
+        Serial.printf("[CSV] Log file too large (%d KB), rotating...\n", fileSize / 1024);
+        DEBUG_PRINTLN("[CSV] Rotating log");
+
+        // Backup old log
+        LittleFS.remove("/track_log_old.csv");
+        LittleFS.rename(CSV_LOG_FILE, "/track_log_old.csv");
+
+        // Create new log with header
+        File newLog = LittleFS.open(CSV_LOG_FILE, "w");
+        if (newLog)
+        {
+          newLog.println(CSV_LOG_HEADER);
+          newLog.close();
+          Serial.println("[CSV] Log rotated successfully");
+        }
+      }
+      else
+      {
+        Serial.printf("[CSV] Log file ready (%d KB)\n", fileSize / 1024);
+        DEBUG_PRINTF("[CSV] Log: %dKB\n", fileSize / 1024);
+      }
+    }
+  }
+
+  return true;
+#else
+  return false;
+#endif
+}
+
+// Log transmission to CSV file
+static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0)
+{
+#if CSV_LOG_ENABLED
+  // Parse the JSON to extract fields
+  StaticJsonDocument<320> doc;
+  DeserializationError error = deserializeJson(doc, json);
+
+  if (error)
+  {
+    Serial.printf("[CSV] JSON parse error: %s\n", error.c_str());
+    return;
+  }
+
+  // Open file in append mode
+  File logFile = LittleFS.open(CSV_LOG_FILE, "a");
+  if (!logFile)
+  {
+    Serial.println("[CSV] Failed to open log file for append");
+    DEBUG_PRINTLN("[CSV] Append failed");
+    return;
+  }
+
+  // Build CSV line: timestamp,msg_id,device,mode,status,lat,lon,dist_m,bearing,battery_v,rssi,snr
+  char csvLine[256];
+
+  // Get current time from GPS if available, otherwise use uptime
+  const char *timestamp = doc["time"] | "";
+  if (strlen(timestamp) == 0)
+  {
+    snprintf(csvLine, sizeof(csvLine), "%lu,", millis() / 1000); // Uptime in seconds
+  }
+  else
+  {
+    snprintf(csvLine, sizeof(csvLine), "%s,", timestamp);
+  }
+
+  // Add remaining fields
+  char temp[200];
+  snprintf(temp, sizeof(temp), "%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
+           doc["msg_id"] | 0,
+           doc["id"] | (const char *)g_senderName,
+           g_currentMode,
+           doc["status"] | "unknown",
+           doc["lat"] | 0.0,
+           doc["lon"] | 0.0,
+           doc["dist_m"] | 0.0,
+           doc["bearing"] | "0-N",
+           0.0, // battery_v (TODO: add battery monitoring)
+           rssi,
+           snr);
+
+  strcat(csvLine, temp);
+
+  // Write to file
+  logFile.println(csvLine);
+  logFile.close();
+
+  Serial.printf("[CSV] Logged: msg_id=%u, status=%s\n",
+                doc["msg_id"] | 0, doc["status"] | "?");
+  DEBUG_PRINTF("[CSV] Log: %u\n", doc["msg_id"] | 0);
+
+#endif
+}
+
+// Get CSV log file info (for status requests)
+static void getCSVLogInfo(char *info, size_t maxLen)
+{
+#if CSV_LOG_ENABLED
+  if (!LittleFS.exists(CSV_LOG_FILE))
+  {
+    snprintf(info, maxLen, "No log file");
+    return;
+  }
+
+  File logFile = LittleFS.open(CSV_LOG_FILE, "r");
+  if (!logFile)
+  {
+    snprintf(info, maxLen, "Cannot open log");
+    return;
+  }
+
+  size_t fileSize = logFile.size();
+  int lineCount = 0;
+
+  // Count lines
+  while (logFile.available())
+  {
+    if (logFile.read() == '\n')
+      lineCount++;
+  }
+  logFile.close();
+
+  snprintf(info, maxLen, "%d entries, %d KB", lineCount - 1, fileSize / 1024); // -1 for header
+#else
+  snprintf(info, maxLen, "Logging disabled");
+#endif
+}
+
+// Parse and handle mode change command from base station
+static bool handleModeCommand(const char *json)
+{
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, json);
+
+  if (error)
+  {
+    Serial.printf("[RX] JSON parse error: %s\n", error.c_str());
+    DEBUG_PRINTLN("[RX] Parse error");
+    return false;
+  }
+
+  // V3 device targeting: ignore commands not addressed to this collar.
+  // Accepted forms:
+  //   "device":"<current name>"  -> only this collar acts
+  //   "device":"broadcast"       -> every collar acts
+  //   "device_id":<DEVICE_ID_INT> -> match by immutable numeric id (useful
+  //                                 when the current name is unknown, e.g.
+  //                                 right after a flash, or for set_name)
+  //   (missing "device" + "device_id") -> accepted for legacy clients, logged
+  bool targeted = false, matched = false;
+  if (doc["device_id"].is<int>())
+  {
+    targeted = true;
+    if (doc["device_id"].as<int>() == DEVICE_ID_INT) matched = true;
+  }
+  if (doc["device"].is<const char *>())
+  {
+    targeted = true;
+    const char *target = doc["device"];
+    if (strcmp(target, g_senderName) == 0 || strcmp(target, "broadcast") == 0)
+    {
+      matched = true;
+    }
+  }
+  if (targeted && !matched)
+  {
+    Serial.printf("[RX] Command not for me (I am '%s' id=%d); ignoring\n",
+                  g_senderName, DEVICE_ID_INT);
+    DEBUG_PRINTF("[RX] Not for me\n");
+    return false;
+  }
+  if (!targeted)
+  {
+    Serial.println("[RX] No device/device_id field on command — accepting (legacy client)");
+  }
+
+  const char *cmd = doc["cmd"];
+  if (!cmd)
+  {
+    Serial.println("[RX] Missing 'cmd' field");
+    return false;
+  }
+
+  // Handle mode change command
+  if (strcmp(cmd, "mode") == 0)
+  {
+    const char *profile = doc["profile"];
+    if (!profile)
+    {
+      Serial.println("[RX] Missing 'profile' field");
+      return false;
+    }
+
+    // Validate profile name
+    const OperatingMode *newMode = getModeByName(profile);
+    if (newMode == nullptr)
+    {
+      Serial.printf("[RX] Unknown profile: %s\n", profile);
+      DEBUG_PRINTF("[RX] Unknown: %s\n", profile);
+      return false;
+    }
+
+    // Save new mode
+    saveOperatingMode(profile);
+
+    // Reset lost mode accumulator when entering lost mode so the 2-hour
+    // timeout starts from this moment, not the leftover of a previous session.
+    if (strcmp(profile, "lost") == 0)
+    {
+      g_lostModeAccumS = 0;
+    }
+
+    // Send ACK
+    StaticJsonDocument<192> ack;
+    ack["ack"] = "mode";
+    ack["profile"] = profile;
+    ack["power"] = newMode->lora_power_dbm;
+    ack["sleep"] = newMode->sleep_interval_s;
+    ack["device"] = (const char *)g_senderName;
+
+    TxReq req{};
+    serializeJson(ack, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.printf("[MODE] Changed to '%s' (ACK queued)\n", profile);
+    DEBUG_PRINTF("[MODE] -> %s\n", profile);
+
+    return true;
+  }
+
+  // Handle status request
+  else if (strcmp(cmd, "get_status") == 0)
+  {
+    char logInfo[64];
+    getCSVLogInfo(logInfo, sizeof(logInfo));
+
+    StaticJsonDocument<320> status;
+    status["status"] = "ok";
+    status["device"] = (const char *)g_senderName;
+    status["mode"] = g_currentMode;
+    status["power"] = g_activeMode->lora_power_dbm;
+    status["sleep"] = g_activeMode->sleep_interval_s;
+    status["msg_id"] = g_msgCounter;
+    status["gps_warm"] = g_gpsWarmedUp;
+    status["home_cycles"] = g_homeBeaconCycles;
+    status["home_rssi_threshold"] = HOME_RSSI_THRESHOLD_DBM; // for tuning visibility
+    status["log"] = logInfo;
+
+    if (strcmp(g_currentMode, "lost") == 0)
+    {
+      // Reflect total time in lost mode: prior wakes' accumulator + this wake's runtime
+      status["lost_mode_s"] = g_lostModeAccumS + (uint32_t)(millis() / 1000);
+    }
+
+    TxReq req{};
+    serializeJson(status, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.println("[RX] Status request - response queued");
+    DEBUG_PRINTLN("[RX] Status sent");
+
+    return true;
+  }
+
+  // V3: rename the collar. Wire format:
+  //   {"cmd":"set_name","device_id":4,"name":"Podge","msg_id":N}
+  // device_id is REQUIRED (we'd reject this above if it didn't match us, but
+  // we double-check here so a missing field can't accidentally rename every
+  // collar via the legacy "no device field = accept" backward-compat path).
+  else if (strcmp(cmd, "set_name") == 0)
+  {
+    if (!doc["device_id"].is<int>() || doc["device_id"].as<int>() != DEVICE_ID_INT)
+    {
+      Serial.println("[RX] set_name without matching device_id — refusing");
+      return false;
+    }
+    if (!doc["name"].is<const char *>())
+    {
+      Serial.println("[RX] set_name missing 'name' field");
+      return false;
+    }
+    const char *newName = doc["name"];
+    if (!saveSenderName(newName))
+    {
+      Serial.printf("[RX] set_name rejected: invalid name '%s' (1-15 chars, no commas/quotes/control)\n",
+                    newName);
+      // ACK with failure so the UI sees a response
+      StaticJsonDocument<160> ack;
+      ack["ack"] = "set_name";
+      ack["ok"] = false;
+      ack["device_id"] = DEVICE_ID_INT;
+      ack["device"] = (const char *)g_senderName; // current (unchanged) name
+      if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
+      TxReq req{};
+      serializeJson(ack, req.json, sizeof(req.json));
+      xQueueSend(txReqQ, &req, portMAX_DELAY);
+      return false;
+    }
+
+    Serial.printf("[RX] Name changed to '%s' (device_id=%d)\n", g_senderName, DEVICE_ID_INT);
+    DEBUG_PRINTF("[RX] name -> %s\n", g_senderName);
+
+    // ACK with new name so the receiver UI can confirm immediately
+    StaticJsonDocument<192> ack;
+    ack["ack"] = "set_name";
+    ack["ok"] = true;
+    ack["device_id"] = DEVICE_ID_INT;
+    ack["device"] = (const char *)g_senderName;
+    ack["id"] = (const char *)g_senderName; // also include "id" so receiver's JSON path picks it up
+    if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
+    TxReq req{};
+    serializeJson(ack, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    return true;
+  }
+
+  Serial.printf("[RX] Unknown command: %s\n", cmd);
+  return false;
+}
+
+// ─────────────────────────────────────────────
+// Task handles (for cleanup before sleep)
+// ─────────────────────────────────────────────
+static TaskHandle_t hGPS = nullptr;
+static TaskHandle_t hBLE = nullptr;
+static TaskHandle_t hLoRa = nullptr;
+static TaskHandle_t hPower = nullptr;
+
+// ─────────────────────────────────────────────
+// Task forward declarations (defined later)
+// ─────────────────────────────────────────────
+void TaskGPS(void *);
+void TaskBLE(void *);
+void TaskLoRa(void *);
+void TaskPower(void *);
+
+// ─────────────────────────────────────────────
+// Setup & Main loop
+// ─────────────────────────────────────────────
+void setup()
+{
+  // Check wake reason BEFORE Serial init
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  // Release GPIO hold from deep sleep
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)GPS_EN);
+
+  Serial.begin(115200);
+  delay(100); // Give serial time to initialize
+
+  // Initialize debug serial for battery operation
+#if DEBUG_SERIAL_ENABLED
+  DebugSerial.begin(115200, SERIAL_8N1, -1, DEBUG_TX_PIN); // TX only
+  delay(50);
+  DEBUG_PRINTLN("\n\n=== DEBUG SERIAL ACTIVE ===");
+#endif
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.println("\n\n[BOOT] CatTracker TX (RTOS)");
+  DEBUG_PRINTLN("[BOOT] CatTracker TX (RTOS)");
+  Serial.printf("[BOOT] Reset reason: %d\n", esp_reset_reason());
+  DEBUG_PRINTF("[BOOT] Reset reason: %d\n", esp_reset_reason());
+
+  // Load persistent counter from NVS (survives all resets)
+  prefs.begin("cattracker", false);
+  uint32_t nvsCounter = prefs.getUInt("msg_id", 0);
+
+  switch (wakeup_reason)
+  {
+  case ESP_SLEEP_WAKEUP_TIMER:
+    Serial.printf("[BOOT] ✓ Wake from DEEP SLEEP (RTC msg_id: %d)\n", g_msgCounter);
+    DEBUG_PRINTF("[BOOT] Wake from DEEP SLEEP (msg_id: %d)\n", g_msgCounter);
+    // Use RTC counter if valid (faster), otherwise fall back to NVS
+    if (g_msgCounter < nvsCounter)
+    {
+      g_msgCounter = nvsCounter;
+      Serial.printf("[BOOT] RTC counter was stale, restored from NVS: %d\n", g_msgCounter);
+      DEBUG_PRINTF("[BOOT] Restored from NVS: %d\n", g_msgCounter);
+    }
+    break;
+  case ESP_SLEEP_WAKEUP_UNDEFINED:
+  default:
+    Serial.printf("[BOOT] ✗ POWER-ON RESET (cause: %d)\n", wakeup_reason);
+    DEBUG_PRINTF("[BOOT] POWER-ON RESET (cause: %d)\n", wakeup_reason);
+    // RTC lost, restore from NVS flash
+    g_msgCounter = nvsCounter;
+    g_gpsWarmedUp = false;
+    Serial.printf("[BOOT] Restored msg_id from NVS flash: %d\n", g_msgCounter);
+    DEBUG_PRINTF("[BOOT] msg_id from NVS: %d\n", g_msgCounter);
+    break;
+  }
+  prefs.end();
+
+  // Load operating mode from NVS
+  loadOperatingMode();
+
+  // V3: load friendly name from NVS (default "Device-<id>" if unset)
+  loadSenderName();
+  Serial.printf("[BOOT] Collar identity: name='%s' device_id=%d\n",
+                g_senderName, DEVICE_ID_INT);
+  DEBUG_PRINTF("[BOOT] name=%s id=%d\n", g_senderName, DEVICE_ID_INT);
+
+  // Check lost mode timeout (auto-revert if exceeded)
+  checkLostModeTimeout();
+
+  // Initialize CSV logging (LittleFS)
+  initCSVLogging();
+
+  // Queues & events
+  gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)
+  txReqQ = xQueueCreate(4, sizeof(TxReq));   // TX requests
+  evBits = xEventGroupCreate();              // state flags (EV_FIX, EV_HOME, EV_TXDONE)
+
+  // GPS Enable and UART
+  pinMode(GPS_EN, OUTPUT);
+  digitalWrite(GPS_EN, HIGH); // Power on GPS
+  Serial.println("[INIT] GPS power enabled");
+  DEBUG_PRINTLN("[INIT] GPS power enabled");
+  delay(500); // Let GPS module fully power up and stabilize
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // Flush any stale data in UART buffer from previous session
+  delay(100);
+  while (gpsSerial.available())
+  {
+    gpsSerial.read();
+  }
+  Serial.println("[INIT] GPS UART started and buffer flushed");
+  DEBUG_PRINTLN("[INIT] GPS UART ready");
+
+  // LoRa radio init (will be re-done in TaskLoRa, but SPI setup here)
+  LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+  Serial.println("[LORA] SPI ready");
+
+  // BLE init (scanner only)
+  BLEDevice::init("");
+  Serial.println("[BLE] stack init done");
+
+  // Create tasks
+  xTaskCreatePinnedToCore(TaskGPS, "gps", 4096, nullptr, 2, &hGPS, APP_CPU_NUM); // GPS on APP CPU
+  xTaskCreatePinnedToCore(TaskBLE, "ble", 4096, nullptr, 1, &hBLE, APP_CPU_NUM); // BLE on APP CPU
+  xTaskCreatePinnedToCore(TaskLoRa, "lora", 4096, nullptr, 2, &hLoRa, PRO_CPU_NUM);
+  xTaskCreatePinnedToCore(TaskPower, "power", 4096, nullptr, 3, &hPower, PRO_CPU_NUM);
+
+  Serial.println("[BOOT] RTOS tasks started");
+}
+
+// Post-TX RX window: how long to keep TaskLoRa alive after telemetry has gone
+// out, so the receiver can opportunistically push queued commands now that it
+// knows the collar is awake. Class-A LoRaWAN-style pattern.
+#define POST_TX_LISTEN_MS 5000U  // Base window
+#define POST_TX_EXTEND_MS 3000U  // Extension per command received (so bursts land)
+
+void loop()
+{
+  // Wait for Power task to signal cycle complete
+  EventBits_t bits = xEventGroupWaitBits(evBits, EV_TXDONE, pdFALSE, pdFALSE, portMAX_DELAY);
+
+  if (bits & EV_TXDONE)
+  {
+    // ─────────────────────────────────────────────
+    // POST-TX RX WINDOW
+    // ─────────────────────────────────────────────
+    // The receiver is most likely to send queued commands the instant our
+    // telemetry packet arrives. Hold TaskLoRa alive for a short window so
+    // those commands actually reach us. EV_LORA_CMD is set by TaskLoRa
+    // whenever a command was parsed; each one extends the window so a small
+    // burst of commands (mode + status request, say) all land in one cycle.
+    Serial.printf("[MAIN] TX done — opening %u ms RX window for commands\n",
+                  POST_TX_LISTEN_MS);
+    DEBUG_PRINTF("[MAIN] RX window %ums\n", POST_TX_LISTEN_MS);
+
+    // Clear any stale flag from this cycle's earlier (pre-TX) command checks
+    // so we only react to commands that arrive AFTER the TX.
+    xEventGroupClearBits(evBits, EV_LORA_CMD);
+
+    uint32_t windowStart = millis();
+    uint32_t windowDeadline = windowStart + POST_TX_LISTEN_MS;
+    while (millis() < windowDeadline)
+    {
+      EventBits_t b = xEventGroupGetBits(evBits);
+      if (b & EV_LORA_CMD)
+      {
+        xEventGroupClearBits(evBits, EV_LORA_CMD);
+        // Extend the window so subsequent commands in a burst can still land
+        windowDeadline = millis() + POST_TX_EXTEND_MS;
+        Serial.printf("[MAIN] Command in RX window — extending by %u ms\n",
+                      POST_TX_EXTEND_MS);
+        DEBUG_PRINTLN("[MAIN] RX extend");
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    Serial.printf("[MAIN] RX window closed after %lu ms\n",
+                  (unsigned long)(millis() - windowStart));
+    DEBUG_PRINTLN("[MAIN] RX window done");
+
+    Serial.println("[MAIN] Cycle complete, cleaning up for sleep");
+
+    // Delete all tasks
+    if (hGPS)
+    {
+      vTaskDelete(hGPS);
+      hGPS = nullptr;
+    }
+    if (hBLE)
+    {
+      vTaskDelete(hBLE);
+      hBLE = nullptr;
+    }
+    if (hLoRa)
+    {
+      vTaskDelete(hLoRa);
+      hLoRa = nullptr;
+    }
+    if (hPower)
+    {
+      vTaskDelete(hPower);
+      hPower = nullptr;
+    }
+
+    // Deinitialize BLE to save power
+    BLEDevice::deinit(true);
+
+    // Power off GPS completely
+    digitalWrite(GPS_EN, LOW);
+    Serial.println("[SLEEP] GPS power disabled");
+
+    // End GPS serial to release pins
+    gpsSerial.end();
+    Serial.println("[SLEEP] GPS UART closed");
+
+    // Save msg_id to NVS before sleep (survives USB resets)
+    prefs.begin("cattracker", false);
+    prefs.putUInt("msg_id", g_msgCounter);
+    prefs.end();
+
+    // Hold GPIO states during deep sleep (keeps GPS_EN LOW)
+    gpio_hold_en((gpio_num_t)GPS_EN);
+    gpio_deep_sleep_hold_en();
+
+    // Get sleep interval from active mode
+    uint16_t sleepSeconds = g_activeMode->sleep_interval_s;
+
+    // V3: accumulate lost-mode time across deep-sleep cycles so the 2-hour
+    // auto-revert actually fires. No-op when not in lost mode.
+    accumulateLostModeTime(sleepSeconds);
+
+    // Enter deep sleep
+    Serial.printf("[SLEEP] Deep sleeping for %d s in '%s' mode (msg_id: %d)\n",
+                  sleepSeconds, g_activeMode->name, g_msgCounter);
+    DEBUG_PRINTF("[SLEEP] %ds (%s) msg_id:%d\n", sleepSeconds, g_activeMode->name, g_msgCounter);
+    Serial.flush();
+#if DEBUG_SERIAL_ENABLED
+    DebugSerial.flush();
+#endif
+    delay(100); // Ensure serial buffer is flushed
+
+// Disable USB serial as wakeup source
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+#endif
+
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
+    esp_deep_sleep_start();
+    // Never returns - ESP32 will restart and run setup() again
+  }
+}
+
+// ─────────────────────────────────────────────
+// Task: GPS reader (non‑blocking)
+//  • Continuously parses NMEA and publishes latest fix
+// ─────────────────────────────────────────────
+void TaskGPS(void *)
+{
+  GpsFix fix; // local working copy
+  uint32_t lastCharTime = millis();
+  int charCount = 0;
+
+  for (;;)
+  {
+    int avail = gpsSerial.available();
+    if (avail > 0)
+    {
+      charCount += avail;
+      if (millis() - lastCharTime > 5000)
+      {
+        Serial.printf("[GPS] Received %d chars in last 5s\n", charCount);
+        charCount = 0;
+        lastCharTime = millis();
+      }
+    }
+
+    while (gpsSerial.available())
+    {
+      char c = gpsSerial.read();
+      gps.encode(c);
+    }
+
+    // When location updates, refresh state
+    if (gps.location.isUpdated())
+    {
+      fix.lat = gps.location.lat();
+      fix.lon = gps.location.lng();
+      fix.valid = gps.location.isValid();
+
+      // Format date/time as human-readable string
+      if (gps.date.isValid() && gps.time.isValid())
+      {
+        snprintf(fix.dateTime, sizeof(fix.dateTime),
+                 "%04d-%02d-%02d %02d:%02d:%02d",
+                 gps.date.year(), gps.date.month(), gps.date.day(),
+                 gps.time.hour(), gps.time.minute(), gps.time.second());
+      }
+      else
+      {
+        fix.dateTime[0] = '\0'; // Empty if invalid
+      }
+
+      if (fix.valid)
+      {
+        xEventGroupSetBits(evBits, EV_FIX);
+        Serial.printf("[GPS] Valid fix: %.6f, %.6f\n", fix.lat, fix.lon);
+        DEBUG_PRINTF("[GPS] Fix: %.6f, %.6f\n", fix.lat, fix.lon);
+      }
+      // Overwrite latest fix in queue (drop older value if present)
+      xQueueOverwrite(gpsFixQ, &fix);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ─────────────────────────────────────────────
+// Task: BLE scanner
+//  • Performs initial 10s scan on wake
+//  • Continues scanning during GPS acquisition
+//  • Sets EV_HOME when beacon detected
+// ─────────────────────────────────────────────
+void TaskBLE(void *)
+{
+  BLEScan *scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+
+  for (;;)
+  {
+    BLEScanResults res = scan->start(BLE_SCAN_WINDOW_S, false);
+    for (int i = 0; i < res.getCount(); i++)
+    {
+      BLEAdvertisedDevice dev = res.getDevice(i);
+      if (!dev.haveName()) continue;
+      if (String(dev.getName().c_str()) != BEACON_NAME) continue;
+
+      // V3 RSSI gate: don't count a faint distant beacon as "home". The
+      // beacon transmits at -12 dBm intentionally; the threshold corresponds
+      // to "you should be inside the building". See config.h to tune.
+      int rssi = dev.haveRSSI() ? dev.getRSSI() : -127;
+      if (rssi < HOME_RSSI_THRESHOLD_DBM)
+      {
+        Serial.printf("[BLE] 'Home' beacon seen but RSSI %d dBm < threshold %d dBm — ignoring\n",
+                      rssi, HOME_RSSI_THRESHOLD_DBM);
+        DEBUG_PRINTF("[BLE] Home faint: %d\n", rssi);
+        continue;
+      }
+
+      xEventGroupSetBits(evBits, EV_HOME);
+      Serial.printf("[BLE] 'Home' beacon detected! RSSI=%d dBm (>= %d)\n",
+                    rssi, HOME_RSSI_THRESHOLD_DBM);
+      DEBUG_PRINTF("[BLE] Home OK %d\n", rssi);
       break;
     }
-    delay(1);
+    scan->clearResults();
+
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short delay between scans
+  }
+}
+
+// ─────────────────────────────────────────────
+// Task: LoRa owner
+//  • Receives mode commands from base station
+//  • Transmits packets with mode-based power
+//  • Handles RX and TX
+// ─────────────────────────────────────────────
+void TaskLoRa(void *)
+{
+  // Initialize LoRa radio (sole owner) - use mode-based power
+  Serial.println("[LoRa] Initializing radio...");
+  int s = lora.begin(LORA_FREQ_MHZ);
+  if (s != RADIOLIB_ERR_NONE)
+  {
+    Serial.printf("[LORA] init failed (%d)\n", s);
+    vTaskDelete(nullptr);
+    return;
   }
 
-  if (fixFound)
-  {
-    colorPrint("[GPS] Initialized with stabilized fix.", ANSI_GREEN);
-    processGps();
-  }
-  else if (firstFixDetected)
-  {
-    colorPrint("[GPS] Initialized with early fix (stabilization incomplete).", ANSI_YELLOW);
-    processGps();
-  }
-  else
-  {
-    colorPrint("[GPS] Warmup expired without getting fix.", ANSI_RED);
-  }
-
-  // --- LoRa Init ---
-  pinMode(LORA_DIO1, INPUT);
-  LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
-  colorPrint("[INIT] Setting up SPI for LoRa...");
-  int initState = lora.begin(LORA_FREQ_MHZ);
-  if (initState != RADIOLIB_ERR_NONE)
-  {
-    colorPrint("[ERROR] LoRa failed to initialise. Code: " + String(initState), ANSI_RED);
-    flickerLong();
-    while (true)
-      ;
-  }
-
-  colorPrint("[OK] LoRa initialised successfully");
-  lora.setOutputPower(currentMode->lora_power_dbm);
+  // Use power from active mode
+  lora.setOutputPower(g_activeMode->lora_power_dbm);
   lora.setSpreadingFactor(LORA_SF);
   lora.setBandwidth(LORA_BW_KHZ);
   lora.setCodingRate(LORA_CR);
   lora.setCRC(LORA_USE_CRC);
   lora.setPreambleLength(LORA_PREAMBLE);
   lora.setSyncWord(LORA_SYNC_WORD);
-  colorPrint("[INIT] LoRa params: " + String(LORA_FREQ_MHZ) + "MHz SF" +
-             String(LORA_SF) + " BW" + String(LORA_BW_KHZ) + "kHz CR4/" +
-             String(LORA_CR) + " Preamble:" + String(LORA_PREAMBLE) +
-             " Power:" + String(currentMode->lora_power_dbm) + "dBm", ANSI_BLUE);
 
-  // --- BLE Init ---
-  colorPrint("[INIT] Initializing BLE...", ANSI_BLUE);
-  BLEDevice::init("");
-  pBLEScan = BLEDevice::getScan();
-  if (pBLEScan == nullptr)
-  {
-    colorPrint("[INIT ERROR] Failed to get BLE Scanner instance!", ANSI_RED);
-    flickerLong();
-  }
-  else
-  {
-    pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks);
-    pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99);
-    colorPrint("[INIT] BLE Scanner Initialized. Beacon name: \"" + String(BEACON_NAME) + "\"", ANSI_BLUE);
-  }
+  Serial.printf("[LORA] configured (SF%d, BW%.0f, PWR%d dBm)\n",
+                LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
+  DEBUG_PRINTF("[LORA] SF%d BW%.0f P%d\n", LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
 
-  colorPrint("════════════════════════════════════════", ANSI_BOLD);
-  colorPrint("SETUP COMPLETE - Binary TLV Protocol Active", ANSI_BOLD);
-  colorPrint("════════════════════════════════════════", ANSI_BOLD);
-
-  // First transmission after a short delay
-  lastSendTime = millis() - (currentMode->sleep_interval_s * 1000UL) + 5000;
-  delay(1000);
-  lora.standby();
-  bootFlag = 1;
-}
-
-// ═══════════════════════════════════════════════
-// MAIN LOOP
-// ═══════════════════════════════════════════════
-void loop()
-{
-  unsigned long currentTime = millis();
-  unsigned long intervalMs = (unsigned long)currentMode->sleep_interval_s * 1000UL;
-
-  // Heartbeat every 5 seconds
-  static unsigned long lastHeartbeat = 0;
-  if (currentTime - lastHeartbeat >= 5000)
-  {
-    long secsLeft = (long)(intervalMs - (currentTime - lastSendTime)) / 1000;
-    if (secsLeft < 0) secsLeft = 0;
-    colorPrint("[HB] Active | Mode: " + String(currentMode->name) +
-               " | Next TX in " + String(secsLeft) + "s", ANSI_BLUE);
-    lastHeartbeat = currentTime;
-  }
-
-  // Lost mode timeout check
-  if (inLostMode && (currentTime - lostModeStartTime >= (unsigned long)LOST_MODE_MAX_DURATION_S * 1000UL))
-  {
-    colorPrint("[LOST] Lost mode timeout! Reverting to active...", ANSI_BRIGHT_RED);
-    sendLostModeTimeoutAlert();
-    applyProfile(PROFILE_ACTIVE);
-  }
-
-  // LED beacon in lost mode
-  if (inLostMode && currentMode->led_beacon_mode)
-  {
-    static unsigned long lastBeacon = 0;
-    if (currentTime - lastBeacon >= currentMode->led_beacon_interval_ms)
-    {
-      ledBeacon();
-      lastBeacon = currentTime;
-    }
-  }
-
-  // Time to transmit?
-  if (currentTime - lastSendTime >= intervalMs)
-  {
-    colorPrint("\n=== TRANSMISSION CYCLE START ===", ANSI_BRIGHT_GREEN);
-    performTransmissionSequence();
-    lastSendTime = currentTime;
-    colorPrint("=== TRANSMISSION CYCLE COMPLETE ===\n", ANSI_BRIGHT_GREEN);
-  }
-
-  processGps();
-  delay(100);
-}
-
-// ═══════════════════════════════════════════════
-// Transmission Sequence
-// ═══════════════════════════════════════════════
-void performTransmissionSequence()
-{
-  colorPrint("[SEQ] Starting Transmission Sequence...", ANSI_MAGENTA);
-
-  // Reset home status for fresh scan
-  isHome = false;
-
-  // 1. BLE Home Beacon Scan
-  colorPrint("[SEQ] Scanning for Home Beacon (" + String(BLE_INITIAL_SCAN_S) + "s)...", ANSI_YELLOW);
-  bool foundHome = scanForHomeBeacon(BLE_INITIAL_SCAN_S);
-
-  if (foundHome)
-  {
-    homeCycleCount++;
-    colorPrint("[SEQ] Home detected. Consecutive cycles: " + String(homeCycleCount), ANSI_BRIGHT_GREEN);
-  }
-  else
-  {
-    homeCycleCount = 0;
-    colorPrint("[SEQ] Home not detected.", ANSI_YELLOW);
-  }
-
-  // 2. GPS Fix Attempt (only if not at home)
-  if (!foundHome)
-  {
-    gpsWake();
-    colorPrint("[SEQ] Attempting GPS fix (max " + String(GPS_COLD_START_TIMEOUT / 1000) + "s)...", ANSI_YELLOW);
-    unsigned long fixStart = millis();
-    bool fixObtained = false;
-    bool firstFix = false;
-    unsigned long firstFixTime = 0;
-    unsigned long timeout = gpsWarmStart ? GPS_WARM_START_TIMEOUT : GPS_COLD_START_TIMEOUT;
-
-    while (millis() - fixStart < timeout)
-    {
-      processGps();
-      if (!firstFix && gps.location.isValid() && gps.location.age() < 5000)
-      {
-        firstFix = true;
-        firstFixTime = millis();
-        gpsWarmStart = true;
-        colorPrint("[SEQ] GPS fix detected! Stabilizing...", ANSI_GREEN);
-      }
-      if (firstFix && (millis() - firstFixTime >= GPS_STABILISE_MS))
-      {
-        fixObtained = true;
-        break;
-      }
-      delay(1);
-    }
-
-    if (fixObtained)
-    {
-      colorPrint("[SEQ] Proceeding with stabilized GPS fix.", ANSI_GREEN);
-      processGps();
-    }
-    else if (firstFix)
-    {
-      colorPrint("[SEQ] Proceeding with initial GPS fix (stabilization incomplete).", ANSI_YELLOW);
-      processGps();
-    }
-    else
-    {
-      colorPrint("[SEQ] GPS fix timeout. Proceeding without valid fix.", ANSI_YELLOW);
-    }
-  }
-  else
-  {
-    colorPrint("[SEQ] Home Beacon detected. Skipping GPS fix.", ANSI_BRIGHT_GREEN);
-  }
-
-  // 3. Send binary telemetry
-  sendTelemetry();
-
-  // 4. Listen for commands from base station
-  listenForCommands();
-
-  colorPrint("[SEQ] Transmission Sequence Complete.", ANSI_MAGENTA);
-}
-
-// ═══════════════════════════════════════════════
-// Binary Protocol — Send Telemetry (PKT_TELEMETRY)
-// ═══════════════════════════════════════════════
-void sendTelemetry()
-{
-  messageSeq++;
-
-  // Determine status
-  bp_status_t status;
-  uint16_t flags = PKT_TELEMETRY;
-
-  bool locValid = gps.location.isValid();
-  unsigned long locAge = gps.location.age();
-  bool isStale = locValid && locAge > 60000;
-
-  if (isHome)
-  {
-    status = STATUS_BLE_HOME;
-    flags |= FLAG_BLE_HOME | FLAG_HAS_GPS; // Include GPS flag since we send home coords
-  }
-  else if (locValid && !isStale)
-  {
-    double dist = TinyGPSPlus::distanceBetween(
-        gps.location.lat(), gps.location.lng(), HOME_LAT, HOME_LON);
-    if (dist <= HOME_RADIUS_M)
-      status = STATUS_BLE_HOME; // GPS-based home detection
-    else
-      status = STATUS_OUT_AND_ABOUT;
-    flags |= FLAG_HAS_GPS;
-  }
-  else
-  {
-    status = STATUS_INVALID_GPS;
-  }
-
-  if (gpsWarmStart)
-    flags |= FLAG_GPS_WARM;
-
-  // Build timestamp
-  uint32_t unixTime = 0;
-  if (gps.time.isValid() && gps.date.isValid() && gps.time.age() < 60000)
-  {
-    unixTime = gpsToUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
-                             gps.time.hour(), gps.time.minute(), gps.time.second());
-  }
-
-  // Build packet
-  uint8_t buf[BP_MAX_PACKET_SIZE];
-  pkt_init(buf, MY_DEVICE_ID, messageSeq, unixTime, status, flags);
-
-  // GPS fields
-  if (isHome)
-  {
-    // BLE home detected — use home coordinates
-    int32_t lat_e7 = (int32_t)(HOME_LAT * 1e7);
-    int32_t lon_e7 = (int32_t)(HOME_LON * 1e7);
-    pkt_set_gps(buf, lat_e7, lon_e7, 0, 0);
-  }
-  else if (flags & FLAG_HAS_GPS)
-  {
-    int32_t lat_e7 = (int32_t)(gps.location.lat() * 1e7);
-    int32_t lon_e7 = (int32_t)(gps.location.lng() * 1e7);
-    double dist = TinyGPSPlus::distanceBetween(
-        gps.location.lat(), gps.location.lng(), HOME_LAT, HOME_LON);
-    double bearing = TinyGPSPlus::courseTo(
-        gps.location.lat(), gps.location.lng(), HOME_LAT, HOME_LON);
-    uint16_t dist_m = (uint16_t)min(dist, 65535.0);
-    uint16_t bearing_deg = (uint16_t)bearing;
-
-    pkt_set_gps(buf, lat_e7, lon_e7, dist_m, bearing_deg);
-
-    // Speed (cm/s)
-    if (gps.speed.isValid())
-    {
-      uint16_t speed_cms = (uint16_t)(gps.speed.mps() * 100.0);
-      memcpy(&buf[28], &speed_cms, 2);
-    }
-
-    // Fix age (seconds)
-    uint16_t fixAge_s = (uint16_t)(locAge / 1000);
-    memcpy(&buf[26], &fixAge_s, 2);
-  }
-
-  // Battery (placeholder — no ADC reading yet)
-  uint16_t batt_mV = 3700;
-  memcpy(&buf[22], &batt_mV, 2);
-
-  // TLV payload
-  pkt_add_tlv_u8(buf, TLV_PROFILE, currentProfile);
-  pkt_add_tlv_i8(buf, TLV_TX_POWER, currentMode->lora_power_dbm);
-  pkt_add_tlv_u16(buf, TLV_SLEEP_INTERVAL, currentMode->sleep_interval_s);
-  pkt_add_tlv_u8(buf, TLV_GPS_WARM, gpsWarmStart ? 1 : 0);
-  pkt_add_tlv_u8(buf, TLV_HOME_CYCLES, homeCycleCount);
-
-  if (inLostMode)
-  {
-    uint32_t lostElapsed = (millis() - lostModeStartTime) / 1000;
-    pkt_add_tlv_u32(buf, TLV_LOST_MODE_S, lostElapsed);
-  }
-
-  uint8_t pktLen = pkt_finalize(buf);
-
-  colorPrint("[TX] Sending PKT_TELEMETRY | Status: " +
-             String(statusToDisplayString(status)) +
-             " | Seq: " + String(messageSeq) +
-             " | Size: " + String(pktLen) + "B", ANSI_BRIGHT_CYAN);
-  pkt_print_hex(buf, pktLen);
-
-  transmitBinaryPacket(buf, pktLen);
-}
-
-// ═══════════════════════════════════════════════
-// Binary Protocol — Send Mode ACK (PKT_MODE_ACK)
-// ═══════════════════════════════════════════════
-void sendModeAck(uint32_t cmdMsgSeq)
-{
-  messageSeq++;
-
-  uint8_t buf[BP_MAX_PACKET_SIZE];
-  pkt_init(buf, MY_DEVICE_ID, messageSeq, 0, STATUS_OK, PKT_MODE_ACK);
-
-  pkt_add_tlv_u8(buf, TLV_PROFILE, currentProfile);
-  pkt_add_tlv_i8(buf, TLV_TX_POWER, currentMode->lora_power_dbm);
-  pkt_add_tlv_u16(buf, TLV_SLEEP_INTERVAL, currentMode->sleep_interval_s);
-  pkt_add_tlv_u32(buf, TLV_CMD_MSG_ID, cmdMsgSeq);
-
-  uint8_t pktLen = pkt_finalize(buf);
-
-  colorPrint("[TX] Sending PKT_MODE_ACK for cmd seq " + String(cmdMsgSeq) +
-             " | New mode: " + String(currentMode->name), ANSI_BRIGHT_CYAN);
-  pkt_print_hex(buf, pktLen);
-
-  transmitBinaryPacket(buf, pktLen);
-}
-
-// ═══════════════════════════════════════════════
-// Binary Protocol — Send Status Response (PKT_STATUS_RESP)
-// ═══════════════════════════════════════════════
-void sendStatusResponse(uint32_t cmdMsgSeq)
-{
-  messageSeq++;
-
-  uint8_t buf[BP_MAX_PACKET_SIZE];
-  pkt_init(buf, MY_DEVICE_ID, messageSeq, 0, STATUS_OK, PKT_STATUS_RESP);
-
-  pkt_add_tlv_u8(buf, TLV_PROFILE, currentProfile);
-  pkt_add_tlv_i8(buf, TLV_TX_POWER, currentMode->lora_power_dbm);
-  pkt_add_tlv_u16(buf, TLV_SLEEP_INTERVAL, currentMode->sleep_interval_s);
-  pkt_add_tlv_u8(buf, TLV_GPS_WARM, gpsWarmStart ? 1 : 0);
-  pkt_add_tlv_u8(buf, TLV_HOME_CYCLES, homeCycleCount);
-  pkt_add_tlv_u32(buf, TLV_CMD_MSG_ID, cmdMsgSeq);
-
-  uint8_t pktLen = pkt_finalize(buf);
-
-  colorPrint("[TX] Sending PKT_STATUS_RESP for cmd seq " + String(cmdMsgSeq), ANSI_BRIGHT_CYAN);
-  pkt_print_hex(buf, pktLen);
-
-  transmitBinaryPacket(buf, pktLen);
-}
-
-// ═══════════════════════════════════════════════
-// Binary Protocol — Send Lost Mode Timeout Alert (PKT_ALERT)
-// ═══════════════════════════════════════════════
-void sendLostModeTimeoutAlert()
-{
-  messageSeq++;
-
-  uint8_t buf[BP_MAX_PACKET_SIZE];
-  pkt_init(buf, MY_DEVICE_ID, messageSeq, 0, STATUS_LOST_TIMEOUT, PKT_ALERT);
-
-  uint32_t duration = (millis() - lostModeStartTime) / 1000;
-  pkt_add_tlv_u32(buf, TLV_DURATION_S, duration);
-  pkt_add_tlv_u8(buf, TLV_NEW_MODE, PROFILE_ACTIVE);
-
-  uint8_t pktLen = pkt_finalize(buf);
-
-  colorPrint("[TX] Sending PKT_ALERT: Lost mode timeout after " +
-             String(duration) + "s, reverting to active", ANSI_BRIGHT_RED);
-  pkt_print_hex(buf, pktLen);
-
-  transmitBinaryPacket(buf, pktLen);
-}
-
-// ═══════════════════════════════════════════════
-// Listen for Commands (2-second RX window)
-// ═══════════════════════════════════════════════
-void listenForCommands()
-{
-  colorPrint("[RX] Opening " + String(COMMAND_LISTEN_MS) + "ms receive window...", ANSI_MAGENTA);
-
+  // Enable RX mode with interrupt
+  lora.setDio1Action(setRxFlag);
   int rxState = lora.startReceive();
-  if (rxState != RADIOLIB_ERR_NONE)
+  if (rxState == RADIOLIB_ERR_NONE)
   {
-    colorPrint("[RX] Failed to start receive: " + String(rxState), ANSI_RED);
-    return;
+    Serial.println("[LORA] RX mode active - listening for commands");
+    DEBUG_PRINTLN("[LORA] RX active");
+  }
+  else
+  {
+    Serial.printf("[LORA] RX start failed: %d\n", rxState);
   }
 
-  unsigned long listenStart = millis();
-  while (millis() - listenStart < COMMAND_LISTEN_MS)
+  for (;;)
   {
-    // Check if a packet was received
-    int irqFlags = lora.getIrqStatus();
-    if (irqFlags & RADIOLIB_SX126X_IRQ_RX_DONE)
+    // ─────────────────────────────────────────────
+    // PRIORITY 1: Check for LoRa RX commands (HIGHEST)
+    // ─────────────────────────────────────────────
+    if (rxFlag)
     {
-      uint8_t rxBuf[BP_MAX_PACKET_SIZE];
-      size_t rxLen = 0;
+      rxFlag = false;
+
+      uint8_t rxBuf[256];
       int state = lora.readData(rxBuf, sizeof(rxBuf));
+
       if (state == RADIOLIB_ERR_NONE)
       {
-        rxLen = lora.getPacketLength();
-        colorPrint("[RX] Received " + String(rxLen) + " bytes", ANSI_BRIGHT_MAGENTA);
-        pkt_print_hex(rxBuf, rxLen);
+        rxBuf[255] = '\0'; // Ensure null termination
 
-        // Check if it's a binary protocol packet
-        if (rxLen >= BP_MIN_PACKET_SIZE && rxBuf[0] == BP_PROTOCOL_VERSION)
+        Serial.printf("[RX] Command received (%d bytes): %s\n",
+                      lora.getPacketLength(), (char *)rxBuf);
+        DEBUG_PRINTF("[RX] CMD: %s\n", (char *)rxBuf);
+
+        // Parse and handle command
+        if (handleModeCommand((char *)rxBuf))
         {
-          handleReceivedCommand(rxBuf, rxLen);
+          // Set high-priority flag to override BLE home detection
+          xEventGroupSetBits(evBits, EV_LORA_CMD);
+
+          Serial.println("[RX] Command processed - will override BLE home sleep");
+          DEBUG_PRINTLN("[RX] CMD priority set");
+        }
+      }
+      else if (state == RADIOLIB_ERR_CRC_MISMATCH)
+      {
+        Serial.println("[RX] CRC error - packet corrupted");
+        DEBUG_PRINTLN("[RX] CRC fail");
+      }
+
+      // Return to RX mode
+      lora.startReceive();
+    }
+
+    // ─────────────────────────────────────────────
+    // PRIORITY 2: LED beacon pulse in lost mode
+    // ─────────────────────────────────────────────
+    if (g_activeMode->led_beacon_mode)
+    {
+      static uint32_t lastBeacon = 0;
+      if (millis() - lastBeacon >= g_activeMode->led_beacon_interval_ms)
+      {
+        led_beacon_pulse();
+        lastBeacon = millis();
+      }
+    }
+
+    // ─────────────────────────────────────────────
+    // PRIORITY 3: Handle TX requests
+    // ─────────────────────────────────────────────
+    TxReq req;
+    if (xQueueReceive(txReqQ, &req, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+      lora.standby();
+
+#if LBT_ENABLED
+      // Listen Before Talk: check if channel is clear
+      bool channelClear = false;
+      int retryCount = 0;
+
+      while (!channelClear && retryCount < LBT_MAX_RETRIES)
+      {
+        // Start channel activity detection (CAD)
+        int scanResult = lora.scanChannel();
+
+        if (scanResult == RADIOLIB_CHANNEL_FREE)
+        {
+          channelClear = true;
+          Serial.println("[LoRa] LBT: Channel clear, proceeding with TX");
+          DEBUG_PRINTLN("[LoRa] LBT: Clear");
+        }
+        else if (scanResult == RADIOLIB_PREAMBLE_DETECTED)
+        {
+          retryCount++;
+          // Random backoff to avoid synchronized retries from multiple devices
+          int delayMs = random(LBT_RETRY_DELAY_MIN_MS, LBT_RETRY_DELAY_MAX_MS);
+          Serial.printf("[LoRa] LBT: Channel busy (retry %d/%d), waiting %d ms\n",
+                        retryCount, LBT_MAX_RETRIES, delayMs);
+          DEBUG_PRINTF("[LoRa] LBT: Busy, retry %d\n", retryCount);
+          vTaskDelay(pdMS_TO_TICKS(delayMs));
         }
         else
         {
-          colorPrint("[RX] Not a binary protocol packet (ignoring)", ANSI_YELLOW);
+          // Scan failed - proceed anyway but log it
+          Serial.printf("[LoRa] LBT: Scan error (%d), proceeding with TX\n", scanResult);
+          DEBUG_PRINTLN("[LoRa] LBT: Error");
+          channelClear = true; // Fail-safe: transmit anyway
+        }
+      }
+
+      if (!channelClear)
+      {
+        Serial.printf("[LoRa] LBT: Channel still busy after %d retries, transmitting anyway\n",
+                      LBT_MAX_RETRIES);
+        DEBUG_PRINTLN("[LoRa] LBT: Forced TX");
+      }
+#endif
+
+      int ts = lora.transmit(req.json);
+      if (ts == RADIOLIB_ERR_NONE)
+      {
+        xEventGroupSetBits(evBits, EV_TXDONE);
+
+        // LED flicker to indicate successful transmission
+        led_flicker();
+
+        Serial.println(String("[LoRa] TX SUCCESS: ") + req.json);
+        DEBUG_PRINTLN(String("[TX] ") + req.json);
+        Serial.printf("[LoRa] Next msg_id will be: %d\n", g_msgCounter);
+        DEBUG_PRINTF("[TX] Next msg_id: %d\n", g_msgCounter);
+
+        // Get RSSI and SNR after transmission
+        int16_t rssi = lora.getRSSI();
+        float snr = lora.getSNR();
+
+        // Log transmission to CSV file
+        logTransmissionToCSV(req.json, rssi, snr);
+
+        // Save to NVS every 10 messages to reduce flash wear
+        if (g_msgCounter % 10 == 0)
+        {
+          prefs.begin("cattracker", false);
+          prefs.putUInt("msg_id", g_msgCounter);
+          prefs.end();
+          Serial.printf("[LoRa] Saved msg_id to NVS: %d\n", g_msgCounter);
         }
       }
       else
       {
-        colorPrint("[RX] Read error: " + String(state), ANSI_RED);
+        Serial.print("[LoRa] TX error: ");
+        Serial.println(ts);
       }
-      break; // Process one packet per listen window
-    }
-    delay(10);
-  }
 
-  lora.standby();
-  colorPrint("[RX] Receive window closed.", ANSI_MAGENTA);
+      // Return to RX mode after TX
+      lora.startReceive();
+      Serial.println("[LoRa] Returned to RX mode");
+      DEBUG_PRINTLN("[LoRa] RX resume");
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 }
 
-// ═══════════════════════════════════════════════
-// Handle Received Binary Command
-// ═══════════════════════════════════════════════
-void handleReceivedCommand(const uint8_t *buf, uint8_t len)
+// ─────────────────────────────────────────────
+// Task: Power / Orchestrator
+//  • New power-saving strategy:
+//    1) Wake → BLE scan 10s for 'Home' beacon
+//    2) If Home detected → sleep immediately (skip GPS/TX)
+//       - After 5 consecutive home cycles, transmit "BLEHome" status
+//    3) If no Home → enable GPS, continue BLE scanning during GPS acquisition
+//       - If Home appears during GPS → abort TX and sleep
+//       - If no Home → transmit with GPS data and "outanabout" status
+// ─────────────────────────────────────────────
+void TaskPower(void *)
 {
-  // Validate CRC
-  if (!pkt_validate_crc(buf, len))
-  {
-    colorPrint("[RX] Binary CRC validation failed! Dropping packet.", ANSI_RED);
-    return;
-  }
+  // Reset cycle state
+  xEventGroupClearBits(evBits, EV_FIX | EV_HOME | EV_TXDONE);
 
-  // Check device ID — must be for us or broadcast
-  uint16_t targetId = pkt_device_id(buf);
-  if (targetId != MY_DEVICE_ID && targetId != DEVICE_ID_BROADCAST)
-  {
-    colorPrint("[RX] Packet not for us (target: 0x" + String(targetId, HEX) +
-               "), ignoring.", ANSI_YELLOW);
-    return;
-  }
+  Serial.println("\n[POWER] === New wake cycle ===");
+  DEBUG_PRINTLN("\n[POWER] Wake cycle");
 
-  uint16_t pktType = pkt_pkt_type(buf);
-  uint32_t cmdSeq = pkt_msg_seq(buf);
+  // ─────────────────────────────────────────────
+  // PHASE 1: Initial 10-second BLE + LoRa RX scan
+  // ─────────────────────────────────────────────
+  Serial.printf("[POWER] Phase 1: BLE + LoRa RX scan for %d seconds...\n", BLE_INITIAL_SCAN_S);
+  DEBUG_PRINTF("[POWER] BLE+LoRa scan %ds\n", BLE_INITIAL_SCAN_S);
 
-  switch (pktType)
+  uint32_t bleStartTime = millis();
+  bool homeDetectedInitial = false;
+  bool loraCommandReceived = false;
+
+  while (millis() - bleStartTime < (BLE_INITIAL_SCAN_S * 1000))
   {
-  case PKT_CMD_MODE:
-  {
-    colorPrint("[RX] Received PKT_CMD_MODE (seq: " + String(cmdSeq) + ")", ANSI_BRIGHT_MAGENTA);
-    uint8_t newProfile;
-    if (pkt_tlv_get_u8(buf, TLV_PROFILE, &newProfile))
+    EventBits_t bits = xEventGroupGetBits(evBits);
+
+    // PRIORITY 1: Check for LoRa command (overrides everything)
+    if (bits & EV_LORA_CMD)
     {
-      bp_profile_t requestedProfile = (bp_profile_t)newProfile;
-      colorPrint("[RX] Requested profile: " + String(profileToName(requestedProfile)), ANSI_BRIGHT_MAGENTA);
-      if (requestedProfile == PROFILE_UNKNOWN)
-      {
-        colorPrint("[RX] Rejecting unknown profile in PKT_CMD_MODE.", ANSI_RED);
-      }
-      else
-      {
-        applyProfile(requestedProfile);
-        sendModeAck(cmdSeq);
-      }
+      loraCommandReceived = true;
+      Serial.printf("[POWER] LoRa command received after %d ms - PRIORITY MODE\n", millis() - bleStartTime);
+      DEBUG_PRINTLN("[POWER] LoRa CMD priority");
+      break; // Exit scan immediately
+    }
+
+    // PRIORITY 2: Check for BLE home
+    if (bits & EV_HOME)
+    {
+      homeDetectedInitial = true;
+      Serial.printf("[POWER] Home beacon detected after %d ms\n", millis() - bleStartTime);
+      DEBUG_PRINTLN("[POWER] Home found (initial)");
+      // Don't break - continue scanning for LoRa commands
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  // ─────────────────────────────────────────────
+  // PHASE 2: Priority Decision Logic
+  // ─────────────────────────────────────────────
+
+  // CASE 1: LoRa command received - apply settings and continue cycle normally
+  if (loraCommandReceived)
+  {
+    Serial.println("[POWER] LoRa command takes precedence - continuing cycle with new settings");
+    DEBUG_PRINTLN("[POWER] LoRa CMD applied");
+
+    // Clear the command flag
+    xEventGroupClearBits(evBits, EV_LORA_CMD);
+
+    // Settings already applied by handleModeCommand()
+    // Continue to GPS acquisition phase (don't sleep even if home detected)
+    homeDetectedInitial = false; // Override BLE home detection
+  }
+
+  // CASE 2: Home detected (and NO LoRa command)
+  if (homeDetectedInitial && !loraCommandReceived)
+  {
+    g_homeBeaconCycles++;
+    Serial.printf("[POWER] At home (cycle %d/%d)\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
+    DEBUG_PRINTF("[POWER] Home cycle %d/%d\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
+
+    if (g_homeBeaconCycles >= HOME_SLEEP_CYCLES)
+    {
+      // 5th cycle at home - transmit with "BLEHome" status
+      Serial.println("[POWER] 5th home cycle - transmitting 'BLEHome' status");
+      DEBUG_PRINTLN("[POWER] TX BLEHome");
+
+      StaticJsonDocument<320> doc;
+      doc["msg_id"] = g_msgCounter++;
+      doc["device_id"] = DEVICE_ID_INT;
+      doc["id"] = (const char *)g_senderName;
+      doc["status"] = "BLEHome";
+      doc["mode"] = g_currentMode;
+
+      TxReq req{};
+      serializeJson(doc, req.json, sizeof(req.json));
+      xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+      // Reset counter for next home detection sequence
+      g_homeBeaconCycles = 0;
+
+      // Wait for TX completion before sleep
+      Serial.println("[POWER] Waiting for TX completion...");
     }
     else
     {
-      colorPrint("[RX] PKT_CMD_MODE missing TLV_PROFILE!", ANSI_RED);
-    }
-    break;
-  }
-  case PKT_CMD_STATUS:
-  {
-    colorPrint("[RX] Received PKT_CMD_STATUS (seq: " + String(cmdSeq) + ")", ANSI_BRIGHT_MAGENTA);
-    sendStatusResponse(cmdSeq);
-    break;
-  }
-  default:
-    colorPrint("[RX] Unknown packet type: 0x" + String(pktType, HEX), ANSI_YELLOW);
-    break;
-  }
-}
+      // Cycles 1-4: skip GPS and TX, go straight to sleep
+      Serial.println("[POWER] Skipping GPS/TX, going to sleep");
+      DEBUG_PRINTLN("[POWER] Sleep (home)");
 
-// ═══════════════════════════════════════════════
-// Apply Operating Profile
-// ═══════════════════════════════════════════════
-void applyProfile(bp_profile_t profile)
-{
-  if (profile == PROFILE_UNKNOWN)
-  {
-    colorPrint("[MODE] Ignoring invalid/unknown profile request.", ANSI_RED);
+      // Signal sleep without TX
+      xEventGroupSetBits(evBits, EV_TXDONE);
+    }
+
+    // Task done - will be deleted by main loop
+    vTaskSuspend(nullptr);
     return;
   }
 
-  const char *name = profileToName(profile);
-  const OperatingMode *mode = getModeByName(name);
+  // ─────────────────────────────────────────────
+  // PHASE 3: Not at home - enable GPS and continue
+  // ─────────────────────────────────────────────
+  Serial.println("[POWER] No home beacon - starting GPS acquisition");
+  DEBUG_PRINTLN("[POWER] GPS start");
 
-  colorPrint("[MODE] Changing from " + String(currentMode->name) +
-             " to " + String(name), ANSI_BRIGHT_YELLOW);
-
-  currentProfile = profile;
-  currentMode = mode;
-
-  // Apply LoRa TX power
-  lora.setOutputPower(currentMode->lora_power_dbm);
-  colorPrint("[MODE] TX Power: " + String(currentMode->lora_power_dbm) + "dBm", ANSI_BLUE);
-  colorPrint("[MODE] Sleep interval: " + String(currentMode->sleep_interval_s) + "s", ANSI_BLUE);
-
-  // Handle lost mode tracking
-  if (profile == PROFILE_LOST)
+  // Reset home beacon counter (device has left home)
+  if (g_homeBeaconCycles > 0)
   {
-    if (!inLostMode)
+    Serial.printf("[POWER] Leaving home (was at home for %d cycles)\n", g_homeBeaconCycles);
+    DEBUG_PRINTLN("[POWER] Left home");
+    g_homeBeaconCycles = 0;
+  }
+
+  // GPS is already powered on from setup(), just wait for fix
+  GpsFix fix{};
+
+  // Adaptive GPS acquisition: Cold start vs Warm start
+  uint32_t timeout = g_gpsWarmedUp ? GPS_WARM_START_TIMEOUT : GPS_COLD_START_TIMEOUT;
+  Serial.printf("[POWER] Waiting for GPS fix (%s start, %d s timeout)...\n",
+                g_gpsWarmedUp ? "WARM" : "COLD", timeout / 1000);
+  DEBUG_PRINTF("[POWER] GPS %s (%ds)\n", g_gpsWarmedUp ? "warm" : "cold", timeout / 1000);
+
+  uint32_t gpsStartTime = millis();
+  int validCount = 0;
+  bool gotStableFix = false;
+  bool homeDetectedDuringGPS = false;
+
+  // Wait for required number of consecutive valid fixes
+  while (millis() - gpsStartTime < timeout)
+  {
+    // Check if home beacon appeared during GPS acquisition
+    EventBits_t bits = xEventGroupGetBits(evBits);
+    if (bits & EV_HOME)
     {
-      inLostMode = true;
-      lostModeStartTime = millis();
-      colorPrint("[MODE] Lost mode ACTIVATED. Timer started.", ANSI_BRIGHT_RED);
+      homeDetectedDuringGPS = true;
+      Serial.printf("[POWER] Home beacon appeared during GPS (after %d ms) - aborting TX\n",
+                    millis() - gpsStartTime);
+      DEBUG_PRINTLN("[POWER] Home during GPS - abort");
+      break;
     }
-  }
-  else
-  {
-    if (inLostMode)
+
+    // Check for GPS fix
+    if (xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)) == pdTRUE)
     {
-      colorPrint("[MODE] Lost mode DEACTIVATED.", ANSI_GREEN);
-    }
-    inLostMode = false;
-    lostModeStartTime = 0;
-  }
-}
+      if (fix.valid)
+      {
+        validCount++;
+        Serial.printf("[POWER] GPS valid fix #%d: %.6f, %.6f\n",
+                      validCount, fix.lat, fix.lon);
+        DEBUG_PRINTF("[POWER] Fix #%d\n", validCount);
 
-// ═══════════════════════════════════════════════
-// Transmit Binary Packet via LoRa (with LBT)
-// ═══════════════════════════════════════════════
-void transmitBinaryPacket(uint8_t *buf, uint8_t len)
-{
-  colorPrint("[LORA TX] Transmitting " + String(len) + " bytes...", ANSI_BLUE);
+        if (validCount >= GPS_VALID_COUNT_REQUIRED)
+        {
+          gotStableFix = true;
+          Serial.printf("[POWER] GPS lock stable (%d valid fixes)\n", validCount);
+          DEBUG_PRINTLN("[POWER] GPS locked");
 
-  int state = lora.standby();
-  if (state != RADIOLIB_ERR_NONE)
-  {
-    colorPrint("[LORA TX WARN] Standby failed: " + String(state) + " (continuing)", ANSI_YELLOW);
-  }
-
-  state = lora.transmit(buf, len);
-  if (state == RADIOLIB_ERR_NONE)
-  {
-    colorPrint("[LORA TX] Transmission successful!", ANSI_BRIGHT_GREEN);
-    flickerMedium();
-  }
-  else if (state == RADIOLIB_ERR_PACKET_TOO_LONG)
-  {
-    colorPrint("[LORA TX ERROR] Packet too long!", ANSI_RED);
-    flickerLong();
-  }
-  else if (state == RADIOLIB_ERR_TX_TIMEOUT)
-  {
-    colorPrint("[LORA TX WARN] Timeout (often false positive - check receiver)", ANSI_YELLOW);
-    flickerShort();
-  }
-  else
-  {
-    colorPrint("[LORA TX ERROR] Failed, code: " + String(state), ANSI_RED);
-    flickerLong();
-  }
-}
-
-// ═══════════════════════════════════════════════
-// Wake / Sleep / GPS Helpers
-// ═══════════════════════════════════════════════
-void handleWakeupReason()
-{
-  esp_sleep_wakeup_cause_t reason = esp_sleep_get_wakeup_cause();
-  switch (reason)
-  {
-  case ESP_SLEEP_WAKEUP_TIMER:
-    colorPrint("[WAKE] Reason: Timer", ANSI_CYAN);
-    performTransmissionSequence();
-    break;
-  case ESP_SLEEP_WAKEUP_EXT0:
-    colorPrint("[WAKE] Reason: Button Press", ANSI_BRIGHT_CYAN);
-    printStatusReport();
-    performTransmissionSequence();
-    flickerShort();
-    break;
-  case ESP_SLEEP_WAKEUP_GPIO:
-    colorPrint("[WAKE] Reason: LoRa DIO1 Interrupt", ANSI_BRIGHT_MAGENTA);
-    handleLoraReception();
-    performTransmissionSequence();
-    break;
-  default:
-    colorPrint("[WAKE] Reason: Unknown (" + String(reason) + ")", ANSI_RED);
-    delay(1000);
-    break;
-  }
-}
-
-void handleLoraReception()
-{
-  colorPrint("[LORA RX] Interrupt received. Reading...", ANSI_MAGENTA);
-  uint8_t rxBuf[BP_MAX_PACKET_SIZE];
-  int state = lora.readData(rxBuf, sizeof(rxBuf));
-
-  if (state == RADIOLIB_ERR_NONE)
-  {
-    size_t rxLen = lora.getPacketLength();
-    colorPrint("[LORA RX] Received " + String(rxLen) + " bytes", ANSI_BRIGHT_GREEN);
-    pkt_print_hex(rxBuf, rxLen);
-
-    if (rxLen >= BP_MIN_PACKET_SIZE && rxBuf[0] == BP_PROTOCOL_VERSION)
-    {
-      handleReceivedCommand(rxBuf, rxLen);
-    }
-  }
-  else if (state == RADIOLIB_ERR_CRC_MISMATCH)
-  {
-    colorPrint("[LORA RX] CRC error!", ANSI_RED);
-  }
-  else
-  {
-    colorPrint("[LORA RX] Failed, code: " + String(state), ANSI_RED);
-  }
-}
-
-void processGps()
-{
-  if (gpsIsAwake)
-  {
-    while (gpsSerial.available() > 0)
-    {
-      gps.encode(gpsSerial.read());
-    }
-  }
-}
-
-void gpsWake()
-{
-  if (!gpsIsAwake)
-  {
-    digitalWrite(GPS_SLEEP_WAKE, HIGH);
-    colorPrint("[GPS] Setting wake pin HIGH...", ANSI_YELLOW);
-    gpsIsAwake = true;
-    delay(100);
-    colorPrint("[GPS] GPS awakened.", ANSI_YELLOW);
-    delay(500);
-  }
-}
-
-void gpsSleep()
-{
-  if (gpsIsAwake)
-  {
-    Serial.flush();
-    digitalWrite(GPS_SLEEP_WAKE, LOW);
-    colorPrint("[GPS] Putting GPS module to sleep.", ANSI_YELLOW);
-    gpsIsAwake = false;
-  }
-}
-
-void goToLightSleep()
-{
-  colorPrint("[SLEEP] Preparing for light sleep...", ANSI_BLUE);
-
-  isHome = false;
-
-  // Put LoRa into receive mode for wake-up
-  int rxState = lora.startReceive();
-  if (rxState != RADIOLIB_ERR_NONE)
-    colorPrint("[SLEEP] Failed to start LoRa receive: " + String(rxState), ANSI_RED);
-  else
-    colorPrint("[SLEEP] LoRa is listening.", ANSI_BLUE);
-
-  uint64_t sleepUs = (uint64_t)currentMode->sleep_interval_s * 1000000ULL;
-
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  esp_sleep_enable_timer_wakeup(sleepUs);
-  colorPrint("[SLEEP] Timer wakeup: " + String(currentMode->sleep_interval_s) + "s", ANSI_BLUE);
-
-  esp_sleep_enable_ext0_wakeup(STATUS_BUTTON_PIN, 0);
-  esp_sleep_enable_gpio_wakeup();
-  gpio_wakeup_enable(GPIO_NUM_39, GPIO_INTR_HIGH_LEVEL);
-
-  colorPrint("[SLEEP] Entering light sleep...", ANSI_BOLD);
-  Serial.flush();
-
-  if (pBLEScan != nullptr)
-    pBLEScan->stop();
-
-  bootFlag = 1;
-  esp_light_sleep_start();
-}
-
-// ═══════════════════════════════════════════════
-// BLE Scan
-// ═══════════════════════════════════════════════
-bool scanForHomeBeacon(uint32_t scanDurationSeconds)
-{
-  if (pBLEScan == nullptr)
-  {
-    colorPrint("[BLE ERROR] Scanner not initialized!", ANSI_RED);
-    return false;
-  }
-
-  colorPrint("[BLE] Starting scan for \"" + String(BEACON_NAME) +
-             "\" (" + String(scanDurationSeconds) + "s)...", ANSI_BLUE);
-  isHome = false;
-
-  // Blocking scan call: callback may stop it early if beacon is found.
-  pBLEScan->start(scanDurationSeconds, false);
-
-  if (isHome)
-  {
-    colorPrint("[BLE] Home Beacon FOUND!", ANSI_BRIGHT_GREEN);
-  }
-  else
-  {
-    colorPrint("[BLE] Home Beacon NOT found.", ANSI_YELLOW);
-    if (pBLEScan != nullptr)
-    {
-      delay(50);
-      pBLEScan->stop();
+          // Mark GPS as warmed up for future cycles
+          if (!g_gpsWarmedUp)
+          {
+            g_gpsWarmedUp = true;
+            Serial.println("[POWER] GPS warmup complete - future cycles will be faster");
+            DEBUG_PRINTLN("[POWER] GPS warmed up");
+          }
+          break;
+        }
+      }
+      else
+      {
+        // Reset count if we get an invalid fix
+        if (validCount > 0)
+        {
+          Serial.printf("[POWER] GPS fix lost, resetting count (was %d)\n", validCount);
+          validCount = 0;
+        }
+      }
     }
   }
 
-  return isHome;
-}
+  // ─────────────────────────────────────────────
+  // PHASE 4: Handle GPS result or home abort
+  // ─────────────────────────────────────────────
+  if (homeDetectedDuringGPS)
+  {
+    // Home beacon appeared - abort transmission and sleep
+    g_homeBeaconCycles = 1; // Start counting home cycles
+    Serial.println("[POWER] TX aborted due to home beacon - going to sleep");
+    DEBUG_PRINTLN("[POWER] Abort - sleep");
 
-// ═══════════════════════════════════════════════
-// Status Report
-// ═══════════════════════════════════════════════
-void printStatusReport()
-{
-  colorPrint("──────────── STATUS REPORT ────────────", ANSI_BOLD);
-  Serial.printf("  Device: %s (0x%04X)\n", getDeviceName(MY_DEVICE_ID), MY_DEVICE_ID);
-  Serial.printf("  Mode: %s\n", currentMode->name);
-  Serial.printf("  TX Power: %d dBm\n", currentMode->lora_power_dbm);
-  Serial.printf("  Sleep Interval: %d s\n", currentMode->sleep_interval_s);
-  Serial.printf("  Uptime: %lu s\n", millis() / 1000);
-  Serial.printf("  GPS Awake: %s\n", gpsIsAwake ? "Yes" : "No");
-  Serial.printf("  GPS Warm: %s\n", gpsWarmStart ? "Yes" : "No");
-  if (gps.location.isValid())
-    Serial.printf("  Location: %.6f, %.6f\n", gps.location.lat(), gps.location.lng());
+    // Signal sleep without TX
+    xEventGroupSetBits(evBits, EV_TXDONE);
+    vTaskSuspend(nullptr);
+    return;
+  }
+
+  if (!gotStableFix)
+  {
+    Serial.printf("[POWER] GPS timeout after %d ms (valid count: %d/%d)\n",
+                  millis() - gpsStartTime, validCount, GPS_VALID_COUNT_REQUIRED);
+    DEBUG_PRINTF("[POWER] GPS timeout (%d/%d)\n", validCount, GPS_VALID_COUNT_REQUIRED);
+  }
+
+  if (gotStableFix)
+  {
+    // Stabilization period with continued home beacon check
+    if (GPS_STABILISE_MS > 0)
+    {
+      Serial.printf("[POWER] Stabilizing for %d ms (checking for home beacon)...\n", GPS_STABILISE_MS);
+      DEBUG_PRINTF("[POWER] Stabilize %dms\n", GPS_STABILISE_MS);
+
+      uint32_t stabilizeStart = millis();
+      while (millis() - stabilizeStart < GPS_STABILISE_MS)
+      {
+        EventBits_t bits = xEventGroupGetBits(evBits);
+        if (bits & EV_HOME)
+        {
+          Serial.println("[POWER] Home beacon detected during stabilization - aborting TX");
+          DEBUG_PRINTLN("[POWER] Home in stabilize - abort");
+          g_homeBeaconCycles = 1;
+          xEventGroupSetBits(evBits, EV_TXDONE);
+          vTaskSuspend(nullptr);
+          return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    }
+
+    (void)xQueueReceive(gpsFixQ, &fix, 0); // Get freshest fix
+
+    // Build full JSON with GPS data
+    StaticJsonDocument<320> doc;
+    doc["msg_id"] = g_msgCounter++;
+    doc["device_id"] = DEVICE_ID_INT;
+    doc["id"] = (const char *)g_senderName;
+    doc["status"] = "outanabout";
+    doc["mode"] = g_currentMode; // V3: surface current mode so silent lost-mode revert is visible
+    doc["lat"] = fix.lat;
+    doc["lon"] = fix.lon;
+    if (fix.dateTime[0] != '\0')
+    {
+      doc["time"] = fix.dateTime;
+    }
+
+    // V3: distance & bearing now computed at the receiver from raw lat/lon.
+    // Collar no longer needs to know HOME_LAT/HOME_LON — see handleLoRaPacketJSON()
+    // in BluePawzReceiver/src/main.cpp.
+
+    TxReq req{};
+    serializeJson(doc, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.println("[POWER] GPS fix acquired - queued for transmission");
+    DEBUG_PRINTLN("[POWER] TX queued");
+  }
   else
-    Serial.println("  Location: Invalid");
-  Serial.printf("  Satellites: %s\n",
-                gps.satellites.isValid() ? String(gps.satellites.value()).c_str() : "Invalid");
-  Serial.printf("  Home Cycles: %d\n", homeCycleCount);
-  if (inLostMode)
-    Serial.printf("  Lost Mode: %lu s elapsed\n", (millis() - lostModeStartTime) / 1000);
-  Serial.printf("  Msg Seq: %lu\n", messageSeq);
-  Serial.printf("  Free Heap: %lu\n", ESP.getFreeHeap());
-  colorPrint("───────────────────────────────────────", ANSI_BOLD);
-}
+  {
+    // GPS timeout - send invalid status
+    StaticJsonDocument<192> doc;
+    doc["msg_id"] = g_msgCounter++;
+    doc["device_id"] = DEVICE_ID_INT;
+    doc["id"] = (const char *)g_senderName;
+    doc["status"] = "invalidGPSLoc";
+    doc["mode"] = g_currentMode;
 
-void colorPrint(const String &message, const char *color)
-{
-  Serial.print(color);
-  Serial.println(message);
-  Serial.print(ANSI_RESET);
-  Serial.flush();
+    TxReq req{};
+    serializeJson(doc, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.println("[POWER] GPS timeout - sending invalidGPSLoc");
+    DEBUG_PRINTLN("[POWER] TX invalid");
+  }
+
+  // Wait for TX completion (EV_TXDONE set by TaskLoRa)
+  Serial.println("[POWER] Waiting for TX completion...");
+  DEBUG_PRINTLN("[POWER] Wait TX done");
+
+  // Task done - will be deleted by main loop
+  vTaskSuspend(nullptr);
 }
