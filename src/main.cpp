@@ -31,6 +31,7 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include "config.h" // Operating modes and shared configuration
+#include "protocol.h"
 
 // ─────────────────────────────────────────────
 // Device Identity (per-node configuration)
@@ -43,6 +44,7 @@
 // #define SENDER_ID "Carrie"
 
 #define DEVICE_ID_INT 4 // Numeric device ID (read-only, not changeable via remote)
+#define MY_DEVICE_ID ((uint16_t)DEVICE_ID_INT)
 
 // Debug serial on spare pin (for battery operation monitoring)
 #define DEBUG_SERIAL_ENABLED true // Set to false to disable
@@ -109,7 +111,8 @@ struct GpsFix
 
 struct TxReq
 {
-  char json[320];
+  uint8_t buf[BP_MAX_PACKET_SIZE]; // 66 bytes max
+  uint8_t len;                      // actual packet length
 };
 
 static QueueHandle_t gpsFixQ;     // latest fix (overwrite)
@@ -249,13 +252,12 @@ static void checkLostModeTimeout()
     g_lostModeStartTime = 0;
 
     // Send alert to base station
-    StaticJsonDocument<128> alert;
-    alert["alert"] = "lost_mode_timeout";
-    alert["duration_s"] = elapsedTime;
-    alert["new_mode"] = LOST_MODE_FALLBACK_MODE;
-
     TxReq req{};
-    serializeJson(alert, req.json, sizeof(req.json));
+    pkt_init(req.buf, MY_DEVICE_ID, g_msgCounter++, 0,
+             STATUS_LOST_TIMEOUT, PKT_ALERT);
+    pkt_add_tlv_u32(req.buf, TLV_DURATION_S, elapsedTime);
+    pkt_add_tlv_u8(req.buf, TLV_NEW_MODE, profileFromName(LOST_MODE_FALLBACK_MODE));
+    req.len = pkt_finalize(req.buf);
     xQueueSend(txReqQ, &req, 0); // Non-blocking queue
   }
 }
@@ -337,20 +339,11 @@ static bool initCSVLogging()
 }
 
 // Log transmission to CSV file
-static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0)
+static void logTransmissionToCSV(uint32_t msg_id, const char *status_str,
+                                  double lat, double lon, double dist_m,
+                                  const char *bearing_str, int rssi, float snr)
 {
 #if CSV_LOG_ENABLED
-  // Parse the JSON to extract fields
-  StaticJsonDocument<320> doc;
-  DeserializationError error = deserializeJson(doc, json);
-
-  if (error)
-  {
-    Serial.printf("[CSV] JSON parse error: %s\n", error.c_str());
-    return;
-  }
-
-  // Open file in append mode
   File logFile = LittleFS.open(CSV_LOG_FILE, "a");
   if (!logFile)
   {
@@ -359,45 +352,23 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
     return;
   }
 
-  // Build CSV line: timestamp,msg_id,device,mode,status,lat,lon,dist_m,bearing,battery_v,rssi,snr
   char csvLine[256];
-
-  // Get current time from GPS if available, otherwise use uptime
-  const char *timestamp = doc["time"] | "";
-  if (strlen(timestamp) == 0)
-  {
-    snprintf(csvLine, sizeof(csvLine), "%lu,", millis() / 1000); // Uptime in seconds
-  }
-  else
-  {
-    snprintf(csvLine, sizeof(csvLine), "%s,", timestamp);
-  }
-
-  // Add remaining fields
-  char temp[200];
-  snprintf(temp, sizeof(temp), "%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
-           doc["msg_id"] | 0,
-           doc["id"] | SENDER_ID,
+  snprintf(csvLine, sizeof(csvLine), "%lu,%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
+           millis() / 1000,
+           msg_id,
+           SENDER_ID,
            g_currentMode,
-           doc["status"] | "unknown",
-           doc["lat"] | 0.0,
-           doc["lon"] | 0.0,
-           doc["dist_m"] | 0.0,
-           doc["bearing"] | "0-N",
-           0.0, // battery_v (TODO: add battery monitoring)
-           rssi,
-           snr);
+           status_str,
+           lat, lon, dist_m,
+           bearing_str,
+           0.0, // battery_v (TODO)
+           rssi, snr);
 
-  strcat(csvLine, temp);
-
-  // Write to file
   logFile.println(csvLine);
   logFile.close();
 
-  Serial.printf("[CSV] Logged: msg_id=%u, status=%s\n",
-                doc["msg_id"] | 0, doc["status"] | "?");
-  DEBUG_PRINTF("[CSV] Log: %u\n", doc["msg_id"] | 0);
-
+  Serial.printf("[CSV] Logged: msg_id=%u, status=%s\n", msg_id, status_str);
+  DEBUG_PRINTF("[CSV] Log: %u\n", msg_id);
 #endif
 }
 
@@ -435,8 +406,8 @@ static void getCSVLogInfo(char *info, size_t maxLen)
 #endif
 }
 
-// Parse and handle mode change command from base station
-static bool handleModeCommand(const char *json)
+// Parse and handle mode change command from base station (legacy JSON)
+static bool handleModeCommandJSON(const char *json)
 {
   StaticJsonDocument<256> doc;
   DeserializationError error = deserializeJson(doc, json);
@@ -447,6 +418,19 @@ static bool handleModeCommand(const char *json)
     DEBUG_PRINTLN("[RX] Parse error");
     return false;
   }
+
+  // Device filtering: ignore commands not addressed to this node
+  if (doc["device"].is<const char *>())
+  {
+    const char *targetDevice = doc["device"];
+    if (strcmp(targetDevice, SENDER_ID) != 0 && strcmp(targetDevice, "broadcast") != 0)
+    {
+      Serial.printf("[RX] Command for '%s', ignoring (I am '%s')\n", targetDevice, SENDER_ID);
+      DEBUG_PRINTF("[RX] Not for me: %s\n", targetDevice);
+      return false;
+    }
+  }
+  // If "device" field is missing, accept the command (backward compatibility)
 
   const char *cmd = doc["cmd"];
   if (!cmd)
@@ -483,16 +467,20 @@ static bool handleModeCommand(const char *json)
       g_lostModeStartTime = 0; // Will be initialized on next wake
     }
 
-    // Send ACK
+    // Send ACK (include msg_id from original command for tracking)
     StaticJsonDocument<192> ack;
     ack["ack"] = "mode";
     ack["profile"] = profile;
     ack["power"] = newMode->lora_power_dbm;
     ack["sleep"] = newMode->sleep_interval_s;
     ack["device"] = SENDER_ID;
+    if (doc["msg_id"].is<uint32_t>())
+    {
+      ack["msg_id"] = doc["msg_id"].as<uint32_t>();
+    }
 
     TxReq req{};
-    serializeJson(ack, req.json, sizeof(req.json));
+    req.len = serializeJson(ack, (char *)req.buf, sizeof(req.buf));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
     Serial.printf("[MODE] Changed to '%s' (ACK queued)\n", profile);
@@ -525,7 +513,7 @@ static bool handleModeCommand(const char *json)
     }
 
     TxReq req{};
-    serializeJson(status, req.json, sizeof(req.json));
+    req.len = serializeJson(status, (char *)req.buf, sizeof(req.buf));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
     Serial.println("[RX] Status request - response queued");
@@ -535,6 +523,127 @@ static bool handleModeCommand(const char *json)
   }
 
   Serial.printf("[RX] Unknown command: %s\n", cmd);
+  return false;
+}
+
+// Parse and handle binary command packet from base station
+static bool handleModeCommand(const uint8_t *buf, uint8_t pkt_len)
+{
+  // Validate CRC
+  if (!pkt_validate_crc(buf, pkt_len))
+  {
+    Serial.println("[RX] CRC validation failed");
+    DEBUG_PRINTLN("[RX] CRC fail");
+    return false;
+  }
+
+  // Device filtering
+  uint16_t target = pkt_device_id(buf);
+  if (target != MY_DEVICE_ID && target != DEVICE_ID_BROADCAST)
+  {
+    Serial.printf("[RX] Not for me (target=%u, I am %u)\n", target, MY_DEVICE_ID);
+    DEBUG_PRINTF("[RX] Not for me: %u\n", target);
+    return false;
+  }
+
+  uint16_t ptype = pkt_pkt_type(buf);
+  uint32_t cmd_seq = pkt_msg_seq(buf);
+
+  if (ptype == PKT_CMD_MODE)
+  {
+    uint8_t profile_enum;
+    if (!pkt_tlv_get_u8(buf, TLV_PROFILE, &profile_enum))
+    {
+      Serial.println("[RX] Missing profile TLV");
+      DEBUG_PRINTLN("[RX] No profile");
+      return false;
+    }
+
+    const char *profile_name = profileToName((bp_profile_t)profile_enum);
+    const OperatingMode *newMode = getModeByName(profile_name);
+    if (newMode == nullptr)
+    {
+      Serial.printf("[RX] Unknown profile: %s\n", profile_name);
+      DEBUG_PRINTF("[RX] Unknown: %s\n", profile_name);
+      return false;
+    }
+
+    // Save new mode
+    saveOperatingMode(profile_name);
+
+    // Reset lost mode timer if switching to lost mode
+    if (strcmp(profile_name, "lost") == 0)
+    {
+      g_lostModeStartTime = 0; // Will be initialized on next wake
+    }
+
+    // Send binary ACK
+    TxReq req{};
+    pkt_init(req.buf, MY_DEVICE_ID, g_msgCounter++, 0,
+             STATUS_OK, PKT_MODE_ACK);
+    pkt_add_tlv_u8(req.buf, TLV_PROFILE, profile_enum);
+    pkt_add_tlv_i8(req.buf, TLV_TX_POWER, newMode->lora_power_dbm);
+    pkt_add_tlv_u16(req.buf, TLV_SLEEP_INTERVAL, newMode->sleep_interval_s);
+    if (cmd_seq > 0)
+    {
+      pkt_add_tlv_u32(req.buf, TLV_CMD_MSG_ID, cmd_seq);
+    }
+    req.len = pkt_finalize(req.buf);
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.printf("[MODE] Changed to '%s' (binary ACK queued, %d bytes)\n", profile_name, req.len);
+    DEBUG_PRINTF("[MODE] -> %s\n", profile_name);
+    pkt_print_hex(req.buf, req.len);
+    return true;
+  }
+  else if (ptype == PKT_CMD_STATUS)
+  {
+    // Build binary status response
+    TxReq req{};
+    pkt_init(req.buf, MY_DEVICE_ID, g_msgCounter++, 0,
+             STATUS_OK, PKT_STATUS_RESP);
+    pkt_add_tlv_u8(req.buf, TLV_PROFILE, profileFromName(g_currentMode));
+    pkt_add_tlv_i8(req.buf, TLV_TX_POWER, g_activeMode->lora_power_dbm);
+    pkt_add_tlv_u16(req.buf, TLV_SLEEP_INTERVAL, g_activeMode->sleep_interval_s);
+    pkt_add_tlv_u8(req.buf, TLV_GPS_WARM, g_gpsWarmedUp ? 1 : 0);
+    pkt_add_tlv_u8(req.buf, TLV_HOME_CYCLES, g_homeBeaconCycles);
+
+    // CSV log info
+    uint16_t logEntries = 0, logSizeKB = 0;
+#if CSV_LOG_ENABLED
+    if (LittleFS.exists(CSV_LOG_FILE))
+    {
+      File logFile = LittleFS.open(CSV_LOG_FILE, "r");
+      if (logFile)
+      {
+        logSizeKB = logFile.size() / 1024;
+        while (logFile.available())
+        {
+          if (logFile.read() == '\n') logEntries++;
+        }
+        if (logEntries > 0) logEntries--; // Subtract header line
+        logFile.close();
+      }
+    }
+#endif
+    pkt_add_tlv_log_info(req.buf, logEntries, logSizeKB);
+
+    if (g_lostModeStartTime > 0)
+    {
+      uint32_t elapsed = (millis() / 1000) - g_lostModeStartTime;
+      pkt_add_tlv_u32(req.buf, TLV_LOST_MODE_S, elapsed);
+    }
+
+    req.len = pkt_finalize(req.buf);
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.printf("[RX] Status response queued (%d bytes)\n", req.len);
+    DEBUG_PRINTLN("[RX] Status sent");
+    pkt_print_hex(req.buf, req.len);
+    return true;
+  }
+
+  Serial.printf("[RX] Unknown binary packet type: 0x%02X\n", ptype);
   return false;
 }
 
@@ -897,8 +1006,20 @@ void TaskLoRa(void *)
                       lora.getPacketLength(), (char *)rxBuf);
         DEBUG_PRINTF("[RX] CMD: %s\n", (char *)rxBuf);
 
-        // Parse and handle command
-        if (handleModeCommand((char *)rxBuf))
+        // Detect JSON vs binary protocol
+        bool cmdHandled = false;
+        if (rxBuf[0] == '{')
+        {
+          // Legacy JSON command
+          cmdHandled = handleModeCommandJSON((char *)rxBuf);
+        }
+        else
+        {
+          // Binary protocol
+          cmdHandled = handleModeCommand(rxBuf, lora.getPacketLength());
+        }
+
+        if (cmdHandled)
         {
           // Set high-priority flag to override BLE home detection
           xEventGroupSetBits(evBits, EV_LORA_CMD);
@@ -981,7 +1102,7 @@ void TaskLoRa(void *)
       }
 #endif
 
-      int ts = lora.transmit(req.json);
+      int ts = lora.transmit(req.buf, req.len);
       if (ts == RADIOLIB_ERR_NONE)
       {
         xEventGroupSetBits(evBits, EV_TXDONE);
@@ -989,17 +1110,16 @@ void TaskLoRa(void *)
         // LED flicker to indicate successful transmission
         led_flicker();
 
-        Serial.println(String("[LoRa] TX SUCCESS: ") + req.json);
-        DEBUG_PRINTLN(String("[TX] ") + req.json);
+        Serial.printf("[LoRa] TX SUCCESS (%d bytes)\n", req.len);
+        pkt_print_hex(req.buf, req.len);
         Serial.printf("[LoRa] Next msg_id will be: %d\n", g_msgCounter);
-        DEBUG_PRINTF("[TX] Next msg_id: %d\n", g_msgCounter);
+        DEBUG_PRINTF("[TX] %d bytes\n", req.len);
 
         // Get RSSI and SNR after transmission
         int16_t rssi = lora.getRSSI();
         float snr = lora.getSNR();
 
-        // Log transmission to CSV file
-        logTransmissionToCSV(req.json, rssi, snr);
+        // CSV logging now done at build sites
 
         // Save to NVS every 10 messages to reduce flash wear
         if (g_msgCounter % 10 == 0)
@@ -1109,14 +1229,10 @@ void TaskPower(void *)
       Serial.println("[POWER] 5th home cycle - transmitting 'BLEHome' status");
       DEBUG_PRINTLN("[POWER] TX BLEHome");
 
-      StaticJsonDocument<320> doc;
-      doc["msg_id"] = g_msgCounter++;
-      doc["device_id"] = DEVICE_ID_INT;
-      doc["id"] = SENDER_ID;
-      doc["status"] = "BLEHome";
-
       TxReq req{};
-      serializeJson(doc, req.json, sizeof(req.json));
+      pkt_init(req.buf, MY_DEVICE_ID, g_msgCounter++, 0,
+               STATUS_BLE_HOME, PKT_TELEMETRY | FLAG_BLE_HOME);
+      req.len = pkt_finalize(req.buf);
       xQueueSend(txReqQ, &req, portMAX_DELAY);
 
       // Reset counter for next home detection sequence
@@ -1270,29 +1386,34 @@ void TaskPower(void *)
 
     (void)xQueueReceive(gpsFixQ, &fix, 0); // Get freshest fix
 
-    // Build full JSON with GPS data
-    StaticJsonDocument<320> doc;
-    doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = SENDER_ID;
-    doc["status"] = "outanabout";
-    doc["lat"] = fix.lat;
-    doc["lon"] = fix.lon;
-    if (fix.dateTime[0] != '\0')
+    // Convert GPS time to Unix epoch
+    uint32_t unix_time = 0;
+    if (gps.date.isValid() && gps.time.isValid())
     {
-      doc["time"] = fix.dateTime;
+      unix_time = gpsToUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
+                                 gps.time.hour(), gps.time.minute(), gps.time.second());
     }
 
-    // Distance & bearing to home
+    // Convert coordinates
+    int32_t lat_e7 = (int32_t)(fix.lat * 1e7);
+    int32_t lon_e7 = (int32_t)(fix.lon * 1e7);
+
+    // Distance and bearing
     double dist = TinyGPSPlus::distanceBetween(fix.lat, fix.lon, HOME_LAT, HOME_LON);
     double brng = TinyGPSPlus::courseTo(fix.lat, fix.lon, HOME_LAT, HOME_LON);
-    String dir = String((int)brng) + "-" + cardinalDirection(brng);
-    doc["dist_m"] = dist;
-    doc["bearing"] = dir;
+    uint16_t dist_m = (dist > 65535.0) ? 65535 : (uint16_t)dist;
+    uint16_t bearing = (uint16_t)((int)brng % 360);
 
     TxReq req{};
-    serializeJson(doc, req.json, sizeof(req.json));
+    pkt_init(req.buf, MY_DEVICE_ID, g_msgCounter++, unix_time,
+             STATUS_OUT_AND_ABOUT, PKT_TELEMETRY | FLAG_HAS_GPS);
+    pkt_set_gps(req.buf, lat_e7, lon_e7, dist_m, bearing);
+    req.len = pkt_finalize(req.buf);
     xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    // CSV logging
+    String dir = String((int)brng) + "-" + cardinalDirection(brng);
+    logTransmissionToCSV(g_msgCounter - 1, "outanabout", fix.lat, fix.lon, dist, dir.c_str(), 0, 0.0);
 
     Serial.println("[POWER] GPS fix acquired - queued for transmission");
     DEBUG_PRINTLN("[POWER] TX queued");
@@ -1300,15 +1421,13 @@ void TaskPower(void *)
   else
   {
     // GPS timeout - send invalid status
-    StaticJsonDocument<192> doc;
-    doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = SENDER_ID;
-    doc["status"] = "invalidGPSLoc";
-
     TxReq req{};
-    serializeJson(doc, req.json, sizeof(req.json));
+    pkt_init(req.buf, MY_DEVICE_ID, g_msgCounter++, 0,
+             STATUS_INVALID_GPS, PKT_TELEMETRY);
+    req.len = pkt_finalize(req.buf);
     xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    logTransmissionToCSV(g_msgCounter - 1, "invalidGPSLoc", 0.0, 0.0, 0.0, "0-N", 0, 0.0);
 
     Serial.println("[POWER] GPS timeout - sending invalidGPSLoc");
     DEBUG_PRINTLN("[POWER] TX invalid");
