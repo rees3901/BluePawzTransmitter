@@ -48,9 +48,10 @@
 #define DEBUG_SERIAL_ENABLED true // Set to false to disable
 #define DEBUG_TX_PIN 6            // D5 - Connect to RX of USB-Serial adapter
 
-// Home location (for distance/bearing when available)
-const double HOME_LAT = 51.87370573411073;
-const double HOME_LON = -2.2396017778476716;
+// V3: home location lives on the receiver. The collar only sends raw lat/lon;
+// the receiver computes distance/bearing on each inbound packet. This keeps
+// every collar agnostic to where "home" is — change it once at the base station
+// and every cat tracks against the new value with no reflash needed.
 
 // ─────────────────────────────────────────────
 // CSV Logging Configuration
@@ -126,7 +127,12 @@ RTC_DATA_ATTR uint32_t g_msgCounter = 0;
 RTC_DATA_ATTR bool g_gpsWarmedUp = false;        // Tracks if GPS has achieved initial lock
 RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0;    // Count consecutive cycles at home (BLE detected)
 RTC_DATA_ATTR char g_currentMode[16] = "normal"; // Current operating mode name
-RTC_DATA_ATTR uint32_t g_lostModeStartTime = 0;  // Timestamp when lost mode activated (0 = not in lost mode)
+// V3 fix: previously stored a millis()-based timestamp ("g_lostModeStartTime"),
+// but millis() resets every deep-sleep wake, so the 2-hour timeout never fired
+// correctly. Track total seconds in lost mode by ACCUMULATING across wakes
+// instead. Incremented by (this wake's runtime + upcoming sleep) right before
+// each deep_sleep_start. Cleared on mode change.
+RTC_DATA_ATTR uint32_t g_lostModeAccumS = 0;     // Total seconds spent in lost mode (0 = not in lost mode)
 
 // Current active mode (loaded from NVS/RTC on boot)
 const OperatingMode *g_activeMode = &MODE_NORMAL;
@@ -217,40 +223,36 @@ static void saveOperatingMode(const char *modeName)
   DEBUG_PRINTF("[MODE] Saved: %s\n", modeName);
 }
 
-// Check lost mode timeout and auto-revert if needed
+// Check lost mode timeout and auto-revert if needed.
+//
+// Called once near the top of each wake (after RTC vars are restored). Uses
+// the accumulator g_lostModeAccumS, which is incremented before deep_sleep_start
+// (see accumulateLostModeTime()). This survives deep sleep correctly — millis()
+// alone does not, because it resets to 0 on every wake.
 static void checkLostModeTimeout()
 {
   if (strcmp(g_currentMode, "lost") != 0)
   {
-    g_lostModeStartTime = 0; // Not in lost mode
+    g_lostModeAccumS = 0; // Not in lost mode — reset the accumulator
     return;
   }
 
-  // If lost mode start time not set, initialize it
-  if (g_lostModeStartTime == 0)
+  if (g_lostModeAccumS >= LOST_MODE_MAX_DURATION_S)
   {
-    g_lostModeStartTime = millis() / 1000; // Store in seconds
-    Serial.printf("[MODE] Lost mode activated at uptime %d s\n", g_lostModeStartTime);
-    DEBUG_PRINTLN("[MODE] Lost mode started");
-    return;
-  }
-
-  // Check if timeout exceeded
-  uint32_t currentTime = millis() / 1000;
-  uint32_t elapsedTime = currentTime - g_lostModeStartTime;
-
-  if (elapsedTime >= LOST_MODE_MAX_DURATION_S)
-  {
-    Serial.printf("[MODE] Lost mode timeout after %d seconds - reverting to %s\n",
+    uint32_t elapsedTime = g_lostModeAccumS;
+    Serial.printf("[MODE] Lost mode timeout after %u seconds - reverting to %s\n",
                   elapsedTime, LOST_MODE_FALLBACK_MODE);
     DEBUG_PRINTF("[MODE] Lost timeout -> %s\n", LOST_MODE_FALLBACK_MODE);
 
     saveOperatingMode(LOST_MODE_FALLBACK_MODE);
-    g_lostModeStartTime = 0;
+    g_lostModeAccumS = 0;
 
-    // Send alert to base station
-    StaticJsonDocument<128> alert;
+    // Send alert to base station so the UI can reflect the auto-revert.
+    // Include `device` so the receiver can attribute it correctly.
+    StaticJsonDocument<160> alert;
     alert["alert"] = "lost_mode_timeout";
+    alert["device"] = SENDER_ID;
+    alert["id"] = SENDER_ID; // receiver's JSON path keys on "id"
     alert["duration_s"] = elapsedTime;
     alert["new_mode"] = LOST_MODE_FALLBACK_MODE;
 
@@ -258,6 +260,24 @@ static void checkLostModeTimeout()
     serializeJson(alert, req.json, sizeof(req.json));
     xQueueSend(txReqQ, &req, 0); // Non-blocking queue
   }
+  else
+  {
+    Serial.printf("[MODE] Lost mode active: %u / %u s\n",
+                  g_lostModeAccumS, (uint32_t)LOST_MODE_MAX_DURATION_S);
+  }
+}
+
+// Accumulate time spent in lost mode. Call this immediately before
+// esp_deep_sleep_start so we account for this wake's runtime and the upcoming
+// sleep interval. Safe to call when not in lost mode — it's a no-op.
+static void accumulateLostModeTime(uint32_t upcomingSleepS)
+{
+  if (strcmp(g_currentMode, "lost") != 0) return;
+  uint32_t thisWakeS = millis() / 1000;
+  g_lostModeAccumS += thisWakeS + upcomingSleepS;
+  Serial.printf("[MODE] Lost mode accum: +%u (wake) +%u (sleep) = %u / %u s\n",
+                thisWakeS, upcomingSleepS, g_lostModeAccumS,
+                (uint32_t)LOST_MODE_MAX_DURATION_S);
 }
 
 // ─────────────────────────────────────────────
@@ -477,10 +497,11 @@ static bool handleModeCommand(const char *json)
     // Save new mode
     saveOperatingMode(profile);
 
-    // Reset lost mode timer if switching to lost mode
+    // Reset lost mode accumulator when entering lost mode so the 2-hour
+    // timeout starts from this moment, not the leftover of a previous session.
     if (strcmp(profile, "lost") == 0)
     {
-      g_lostModeStartTime = 0; // Will be initialized on next wake
+      g_lostModeAccumS = 0;
     }
 
     // Send ACK
@@ -518,10 +539,10 @@ static bool handleModeCommand(const char *json)
     status["home_cycles"] = g_homeBeaconCycles;
     status["log"] = logInfo;
 
-    if (g_lostModeStartTime > 0)
+    if (strcmp(g_currentMode, "lost") == 0)
     {
-      uint32_t elapsed = (millis() / 1000) - g_lostModeStartTime;
-      status["lost_mode_s"] = elapsed;
+      // Reflect total time in lost mode: prior wakes' accumulator + this wake's runtime
+      status["lost_mode_s"] = g_lostModeAccumS + (uint32_t)(millis() / 1000);
     }
 
     TxReq req{};
@@ -716,6 +737,10 @@ void loop()
 
     // Get sleep interval from active mode
     uint16_t sleepSeconds = g_activeMode->sleep_interval_s;
+
+    // V3: accumulate lost-mode time across deep-sleep cycles so the 2-hour
+    // auto-revert actually fires. No-op when not in lost mode.
+    accumulateLostModeTime(sleepSeconds);
 
     // Enter deep sleep
     Serial.printf("[SLEEP] Deep sleeping for %d s in '%s' mode (msg_id: %d)\n",
@@ -1283,12 +1308,9 @@ void TaskPower(void *)
       doc["time"] = fix.dateTime;
     }
 
-    // Distance & bearing to home
-    double dist = TinyGPSPlus::distanceBetween(fix.lat, fix.lon, HOME_LAT, HOME_LON);
-    double brng = TinyGPSPlus::courseTo(fix.lat, fix.lon, HOME_LAT, HOME_LON);
-    String dir = String((int)brng) + "-" + cardinalDirection(brng);
-    doc["dist_m"] = dist;
-    doc["bearing"] = dir;
+    // V3: distance & bearing now computed at the receiver from raw lat/lon.
+    // Collar no longer needs to know HOME_LAT/HOME_LON — see handleLoRaPacketJSON()
+    // in BluePawzReceiver/src/main.cpp.
 
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));
