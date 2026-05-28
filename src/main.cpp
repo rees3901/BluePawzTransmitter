@@ -1,25 +1,93 @@
 /*
-  ┌─────────────────────────────────────────────────────────────┐
-  │  CAT TRACKER TX (ESP32S3 + FreeRTOS)                       │
-  │  SX1262 LoRa + TinyGPSPlus + BLE "Home" beacon             │
-  │  Behaviour: wake → GPS/ BLE → build JSON → LoRa TX → sleep │
-  │  JSON fields: msg_id, device_id, id, status, lat/lon/time… │
-  └─────────────────────────────────────────────────────────────┘
-
-  High‑level RTOS design
-  ───────────────────────
-  • TaskGPS  : reads UART1, feeds TinyGPSPlus, publishes latest fix.
-  • TaskBLE  : short active scan window; sets Event bit when beacon "Home" seen.
-  • TaskLoRa : sole owner of RadioLib; sends payloads queued by the Power task; handles RX later.
-  • TaskPower: orchestrates one acquisition/decision cycle then enters sleep.
-
-  Sleep policy
-  ────────────
-  • Uses deep sleep via timer wake (default 30 s). Adjust SLEEP_SECONDS below.
-  • All state that must persist across deep sleep uses RTC_DATA_ATTR.
-
-  NOTE: Keep RadioLib access in a single task (TaskLoRa). Do not use RadioLib
-  from ISRs. If you later need LoRa RX commands, push them into a queue.
+  ╔═══════════════════════════════════════════════════════════════════╗
+  ║                                                                   ║
+  ║  BLUEPAWZ TRANSMITTER  —  V3 (JSON, FreeRTOS, ESP32-S3)           ║
+  ║                                                                   ║
+  ║  Battery-powered collar firmware. Wakes on RTC timer, acquires    ║
+  ║  GPS + BLE state, transmits one JSON telemetry packet over LoRa   ║
+  ║  to the base station, listens briefly for commands, sleeps again. ║
+  ║                                                                   ║
+  ║  ─────────────────────────────────────────────────────────────    ║
+  ║  EXECUTION MODEL  —  FreeRTOS, four tasks                         ║
+  ║                                                                   ║
+  ║    TaskGPS    UART1 reader, feeds TinyGPSPlus, publishes latest   ║
+  ║                 fix via gpsFixQ.                                  ║
+  ║    TaskBLE    Active BLE scan, sets EV_HOME when "Home" beacon    ║
+  ║                 detected AT or ABOVE the RSSI threshold.          ║
+  ║    TaskLoRa   SOLE owner of RadioLib (do not touch the SX1262     ║
+  ║                 from any other task or ISR). Sends txReqQ         ║
+  ║                 payloads, dispatches inbound commands.            ║
+  ║    TaskPower  Orchestrator. Runs one acquisition/TX cycle then    ║
+  ║                 hands back to loop() which deep-sleeps.           ║
+  ║                                                                   ║
+  ║  Synchronisation primitives:                                      ║
+  ║                                                                   ║
+  ║    gpsFixQ      length-1 queue (overwrite), latest GpsFix         ║
+  ║    txReqQ       length-4 queue, pending TxReq payloads            ║
+  ║    evBits       EventGroup: EV_FIX, EV_HOME, EV_TXDONE,           ║
+  ║                                EV_LORA_CMD                        ║
+  ║                                                                   ║
+  ║  ─────────────────────────────────────────────────────────────    ║
+  ║  SLEEP & STATE PERSISTENCE                                        ║
+  ║                                                                   ║
+  ║  Deep sleep via timer wake. Sleep interval comes from the         ║
+  ║  current OperatingMode (1 min in active, 5 min normal, 20 min     ║
+  ║  powersave, 30 s lost). On wake the ESP32-S3 restarts setup()     ║
+  ║  fresh — only RTC_DATA_ATTR globals survive.                      ║
+  ║                                                                   ║
+  ║  Three persistence tiers:                                         ║
+  ║                                                                   ║
+  ║    RTC_DATA_ATTR (RTC SRAM)                                       ║
+  ║      Survives deep sleep, lost on reset.                          ║
+  ║      g_msgCounter, g_currentMode, g_lostModeAccumS,               ║
+  ║      g_homeBeaconCycles, g_gpsWarmedUp.                           ║
+  ║                                                                   ║
+  ║    Preferences (NVS in flash)                                     ║
+  ║      Survives reset, lost on full flash erase.                    ║
+  ║      g_senderName, backup of msg_id every 10 packets.             ║
+  ║                                                                   ║
+  ║    LittleFS (/track_log.csv)                                      ║
+  ║      Local CSV breadcrumb log, 3 MB capped.                       ║
+  ║                                                                   ║
+  ║  ─────────────────────────────────────────────────────────────    ║
+  ║  CLASS-A DOWNLINK WINDOW (the receiver pushes commands here)      ║
+  ║                                                                   ║
+  ║  After every successful TX, loop() holds TaskLoRa alive for       ║
+  ║  POST_TX_LISTEN_MS (5000 ms) of RX. Each command that arrives     ║
+  ║  resets the window by POST_TX_EXTEND_MS (3000 ms). The receiver   ║
+  ║  fires queued commands the instant our telemetry packet arrives,  ║
+  ║  so the timing window comfortably catches them.                   ║
+  ║                                                                   ║
+  ║  ─────────────────────────────────────────────────────────────    ║
+  ║  IDENTITY                                                         ║
+  ║                                                                   ║
+  ║    DEVICE_ID_INT     immutable numeric id (set in source per      ║
+  ║                        flash, 1..255). Used for command           ║
+  ║                        targeting; never changes remotely.         ║
+  ║    g_senderName      friendly label (NVS). Defaults to            ║
+  ║                        "Device-<DEVICE_ID_INT>" until renamed     ║
+  ║                        via the set_name command.                  ║
+  ║                                                                   ║
+  ║  ─────────────────────────────────────────────────────────────    ║
+  ║  CRITICAL DOs and DON'Ts                                          ║
+  ║                                                                   ║
+  ║    DO   keep RadioLib access strictly inside TaskLoRa             ║
+  ║    DO   use the EventGroup to coordinate tasks; queues to pass    ║
+  ║           data; never poll shared state from multiple tasks.      ║
+  ║    DON'T touch RadioLib from an ISR (DIO1 just sets a flag).      ║
+  ║    DON'T use millis() to time anything that needs to survive      ║
+  ║           deep sleep — millis() resets to 0 on every wake.        ║
+  ║           Use RTC_DATA_ATTR accumulators instead (see             ║
+  ║           g_lostModeAccumS for the canonical pattern).            ║
+  ║                                                                   ║
+  ║  ─────────────────────────────────────────────────────────────    ║
+  ║  SEE ALSO                                                         ║
+  ║                                                                   ║
+  ║    README.md          quickstart, hardware, JSON wire formats     ║
+  ║    ARCHITECTURE.md    end-to-end design notes                     ║
+  ║    The receiver repo: rees3901/BluePawzReceiver                   ║
+  ║                                                                   ║
+  ╚═══════════════════════════════════════════════════════════════════╝
 */
 
 #include <Arduino.h>
@@ -483,7 +551,25 @@ static void getCSVLogInfo(char *info, size_t maxLen)
 #endif
 }
 
-// Parse and handle mode change command from base station
+// ─────────────────────────────────────────────────────────────────────
+// Inbound command dispatcher (called from TaskLoRa when a packet arrives)
+//
+// Three command types in V3:
+//   {"cmd":"mode",     "profile":"<name>", "device":"<name>", "msg_id":N}
+//   {"cmd":"get_status","device":"<name>", "msg_id":N}
+//   {"cmd":"set_name", "device_id":N, "name":"<new>", "msg_id":N}
+//
+// Targeting filter runs FIRST so we can reject commands not addressed to
+// us before doing any work. Accepts:
+//   - "device":"<our current name>"     OR
+//   - "device":"broadcast"              OR
+//   - "device_id":<our DEVICE_ID_INT>   OR
+//   - neither field present (legacy backwards-compat, logged)
+//
+// Returns true if the command was applied (caller sets EV_LORA_CMD to
+// signal the Power task to skip BLE-home short-circuit and complete a
+// normal cycle so any settings change takes effect immediately).
+// ─────────────────────────────────────────────────────────────────────
 static bool handleModeCommand(const char *json)
 {
   StaticJsonDocument<256> doc;
@@ -695,6 +781,25 @@ void TaskPower(void *);
 // ─────────────────────────────────────────────
 // Setup & Main loop
 // ─────────────────────────────────────────────
+// setup() runs at the start of EVERY wake (deep-sleep ends → ESP32 restarts
+// from scratch and re-enters here). Anything not RTC_DATA_ATTR or NVS-backed
+// is reinitialised. Boot sequence:
+//
+//   1. Read wake reason BEFORE Serial.begin (some causes lose state quickly)
+//   2. Release GPIO holds set before previous sleep (GPS_EN was held LOW)
+//   3. Serial / debug serial up
+//   4. Load NVS-persisted msg_id (RTC counter is authoritative if non-zero)
+//   5. loadOperatingMode() — read current mode profile from NVS
+//   6. checkLostModeTimeout() — auto-revert if g_lostModeAccumS exceeds limit
+//   7. loadSenderName() — friendly name from NVS, default "Device-<id>"
+//   8. initCSVLogging() — open /track_log.csv on LittleFS
+//   9. Create queues + EventGroup
+//  10. Power on GPS (GPS_EN HIGH), open UART
+//  11. BLE stack init (scanner only — no advertiser)
+//  12. Spawn the four FreeRTOS tasks
+//
+// loop() then waits for EV_TXDONE and handles the post-TX RX window
+// and deep sleep.
 void setup()
 {
   // Check wake reason BEFORE Serial init
@@ -813,6 +918,21 @@ void setup()
 #define POST_TX_LISTEN_MS 5000U  // Base window
 #define POST_TX_EXTEND_MS 3000U  // Extension per command received (so bursts land)
 
+// loop() coordinates the END of each wake cycle. It does NOT do any
+// per-cycle work itself — the FreeRTOS tasks do that. loop() blocks
+// indefinitely on EV_TXDONE (set either by TaskLoRa after a successful
+// TX, or by TaskPower if there was no telemetry to send), then runs
+// the Class-A downlink window and the deep-sleep tear-down.
+//
+// Why is this in loop() and not in TaskPower?
+//   - Deep-sleep should be the very last thing the firmware does, and
+//     it must happen exactly once per wake. Centralising it here
+//     prevents subtle bugs from a task racing to sleep first.
+//   - loop() runs at Arduino's lowest priority — by the time it gets
+//     scheduled the GPS/BLE/LoRa tasks have run as much as they were
+//     going to.
+//   - vTaskDelete() of the tasks from within loop() is safe because
+//     loop() is not one of the tasks being deleted.
 void loop()
 {
   // Wait for Power task to signal cycle complete
@@ -928,10 +1048,20 @@ void loop()
   }
 }
 
-// ─────────────────────────────────────────────
-// Task: GPS reader (non‑blocking)
-//  • Continuously parses NMEA and publishes latest fix
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// Task: GPS reader (non-blocking, runs continuously while awake)
+//
+// Reads bytes from UART1 as the GPS module emits NMEA, feeds them to
+// TinyGPSPlus's incremental parser, and pushes the latest valid fix
+// into gpsFixQ (length-1, overwrite semantics — only the freshest fix
+// matters).
+//
+// Sets EV_FIX once GPS_VALID_COUNT_REQUIRED (5) consecutive valid
+// fixes have been seen. TaskPower watches that bit to decide when GPS
+// acquisition is "stable enough" to transmit.
+//
+// Killed by loop() before deep sleep via vTaskDelete(hGPS).
+// ─────────────────────────────────────────────────────────────────────
 void TaskGPS(void *)
 {
   GpsFix fix; // local working copy
@@ -992,12 +1122,21 @@ void TaskGPS(void *)
   }
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
 // Task: BLE scanner
-//  • Performs initial 10s scan on wake
-//  • Continues scanning during GPS acquisition
-//  • Sets EV_HOME when beacon detected
-// ─────────────────────────────────────────────
+//
+// Active-scans for the receiver's "Home" beacon. A scan hit only counts
+// as "home" when ALL of:
+//   1. dev.getName() == BEACON_NAME (case-sensitive, hence "Home" not "HOME")
+//   2. dev.haveRSSI()
+//   3. dev.getRSSI() >= HOME_RSSI_THRESHOLD_DBM
+//
+// The RSSI gate is what keeps a faint beacon picked up at the bottom of
+// the garden from registering as "indoors". See ARCHITECTURE.md §6.
+//
+// Sets EV_HOME when a qualifying beacon is found. TaskPower uses it to
+// decide between "cat is home, skip the TX" vs "outdoors, acquire GPS".
+// ─────────────────────────────────────────────────────────────────────
 void TaskBLE(void *)
 {
   BLEScan *scan = BLEDevice::getScan();
@@ -1037,11 +1176,28 @@ void TaskBLE(void *)
 }
 
 // ─────────────────────────────────────────────
-// Task: LoRa owner
-//  • Receives mode commands from base station
-//  • Transmits packets with mode-based power
-//  • Handles RX and TX
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// Task: LoRa radio owner — the SOLE caller of RadioLib in this firmware
+//
+// Lifecycle:
+//   1. lora.begin() + parameter setup (must match the receiver byte-for-byte)
+//   2. attach DIO1 interrupt → setRxFlag → rxFlag = true (no RadioLib in ISR)
+//   3. infinite loop, three priorities:
+//        P1  rxFlag set → readData → handleModeCommand → set EV_LORA_CMD
+//        P2  led_beacon_pulse() if the current mode wants one (lost mode)
+//        P3  drain txReqQ — Listen-Before-Talk then transmit
+//
+// LBT (Listen Before Talk):
+//   scanChannel() returns RADIOLIB_CHANNEL_FREE / PREAMBLE_DETECTED / error.
+//   On busy we back off a random delay (LBT_RETRY_DELAY_MIN/MAX) and retry
+//   up to LBT_MAX_RETRIES. On scan failure we transmit anyway — failsafe
+//   for hardware quirks. This stops 5 collars stomping on each other when
+//   they happen to wake within a few hundred ms of each other.
+//
+// After every successful TX the task sets EV_TXDONE; loop() then drains
+// EV_LORA_CMD events for POST_TX_LISTEN_MS before deleting this task and
+// deep-sleeping.
+// ─────────────────────────────────────────────────────────────────────
 void TaskLoRa(void *)
 {
   // Initialize LoRa radio (sole owner) - use mode-based power
@@ -1228,16 +1384,37 @@ void TaskLoRa(void *)
   }
 }
 
-// ─────────────────────────────────────────────
-// Task: Power / Orchestrator
-//  • New power-saving strategy:
-//    1) Wake → BLE scan 10s for 'Home' beacon
-//    2) If Home detected → sleep immediately (skip GPS/TX)
-//       - After 5 consecutive home cycles, transmit "BLEHome" status
-//    3) If no Home → enable GPS, continue BLE scanning during GPS acquisition
-//       - If Home appears during GPS → abort TX and sleep
-//       - If no Home → transmit with GPS data and "outanabout" status
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// Task: Power / Orchestrator — drives one wake cycle
+//
+// Decision tree (see ARCHITECTURE.md §3 for the JSON payloads):
+//
+//   1. Wake → 10 s window: BLE scan + listen for inbound LoRa commands.
+//      If EV_LORA_CMD fires, apply the command (mode change etc.) and
+//      override BLE-home detection — we want to honour the new config
+//      this wake, not skip the cycle.
+//
+//   2. If EV_HOME was set during the window:
+//        - Increment g_homeBeaconCycles (RTC-persisted).
+//        - If we've now been "home" for HOME_SLEEP_CYCLES (5) consecutive
+//          wakes, TX a "BLEHome" status packet. Otherwise skip the TX
+//          entirely — there's no point burning battery transmitting
+//          "still home, still home, still home".
+//
+//   3. If no EV_HOME: power on GPS, wait for EV_FIX (or timeout),
+//      build the JSON telemetry packet, queue it on txReqQ.
+//      If EV_HOME fires DURING GPS acquisition (cat came back inside
+//      mid-cycle), abort the TX and sleep.
+//
+//   4. Either way, eventually set EV_TXDONE (or via the no-TX path:
+//      directly), at which point loop() takes over for the post-TX
+//      RX window and the deep sleep.
+//
+// IMPORTANT: this task does NOT call esp_deep_sleep_start itself. It
+// only signals EV_TXDONE. loop() owns the actual sleep + the post-TX
+// RX window. Keeping deep sleep in one place avoids races between this
+// task and TaskLoRa over the SX1262.
+// ─────────────────────────────────────────────────────────────────────
 void TaskPower(void *)
 {
   // Reset cycle state
