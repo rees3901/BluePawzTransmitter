@@ -692,6 +692,12 @@ void setup()
   Serial.println("[BOOT] RTOS tasks started");
 }
 
+// Post-TX RX window: how long to keep TaskLoRa alive after telemetry has gone
+// out, so the receiver can opportunistically push queued commands now that it
+// knows the collar is awake. Class-A LoRaWAN-style pattern.
+#define POST_TX_LISTEN_MS 5000U  // Base window
+#define POST_TX_EXTEND_MS 3000U  // Extension per command received (so bursts land)
+
 void loop()
 {
   // Wait for Power task to signal cycle complete
@@ -699,6 +705,42 @@ void loop()
 
   if (bits & EV_TXDONE)
   {
+    // ─────────────────────────────────────────────
+    // POST-TX RX WINDOW
+    // ─────────────────────────────────────────────
+    // The receiver is most likely to send queued commands the instant our
+    // telemetry packet arrives. Hold TaskLoRa alive for a short window so
+    // those commands actually reach us. EV_LORA_CMD is set by TaskLoRa
+    // whenever a command was parsed; each one extends the window so a small
+    // burst of commands (mode + status request, say) all land in one cycle.
+    Serial.printf("[MAIN] TX done — opening %u ms RX window for commands\n",
+                  POST_TX_LISTEN_MS);
+    DEBUG_PRINTF("[MAIN] RX window %ums\n", POST_TX_LISTEN_MS);
+
+    // Clear any stale flag from this cycle's earlier (pre-TX) command checks
+    // so we only react to commands that arrive AFTER the TX.
+    xEventGroupClearBits(evBits, EV_LORA_CMD);
+
+    uint32_t windowStart = millis();
+    uint32_t windowDeadline = windowStart + POST_TX_LISTEN_MS;
+    while (millis() < windowDeadline)
+    {
+      EventBits_t b = xEventGroupGetBits(evBits);
+      if (b & EV_LORA_CMD)
+      {
+        xEventGroupClearBits(evBits, EV_LORA_CMD);
+        // Extend the window so subsequent commands in a burst can still land
+        windowDeadline = millis() + POST_TX_EXTEND_MS;
+        Serial.printf("[MAIN] Command in RX window — extending by %u ms\n",
+                      POST_TX_EXTEND_MS);
+        DEBUG_PRINTLN("[MAIN] RX extend");
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    Serial.printf("[MAIN] RX window closed after %lu ms\n",
+                  (unsigned long)(millis() - windowStart));
+    DEBUG_PRINTLN("[MAIN] RX window done");
+
     Serial.println("[MAIN] Cycle complete, cleaning up for sleep");
 
     // Delete all tasks
