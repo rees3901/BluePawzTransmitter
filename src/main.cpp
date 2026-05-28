@@ -35,14 +35,56 @@
 // ─────────────────────────────────────────────
 // Device Identity (per-node configuration)
 // ─────────────────────────────────────────────
-// Uncomment ONE device name per tracker
-// #define SENDER_ID "Macy"
-#define SENDER_ID "Podge"
-// #define SENDER_ID "Gizmo"
-// #define SENDER_ID "Simba"
-// #define SENDER_ID "Carrie"
+// V3: only DEVICE_ID_INT is hardcoded per flash. It is the immutable
+// numeric identity of this physical collar — used for command targeting
+// from the base station. The human-friendly NAME ("Podge", "Macy", etc.)
+// is a runtime value (g_senderName) stored in NVS and changed at any time
+// via the `set_name` command from the receiver. Default if NVS is empty:
+// "Device-<DEVICE_ID_INT>".
+#define DEVICE_ID_INT 4 // Numeric device ID — unique per flash, never changes remotely.
 
-#define DEVICE_ID_INT 4 // Numeric device ID (read-only, not changeable via remote)
+#define SENDER_NAME_MAX_LEN 15   // 15 chars + null terminator, matches NVS key length comfortably
+static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
+
+// Load the friendly name from NVS into g_senderName. If empty/unset, derive a
+// sensible default of "Device-<DEVICE_ID_INT>". Safe to call repeatedly.
+static void loadSenderName()
+{
+  Preferences p;
+  if (p.begin("cattracker", true)) // read-only
+  {
+    String stored = p.getString("name", "");
+    p.end();
+    if (stored.length() > 0 && stored.length() <= SENDER_NAME_MAX_LEN)
+    {
+      strncpy(g_senderName, stored.c_str(), SENDER_NAME_MAX_LEN);
+      g_senderName[SENDER_NAME_MAX_LEN] = '\0';
+      return;
+    }
+  }
+  snprintf(g_senderName, sizeof(g_senderName), "Device-%d", DEVICE_ID_INT);
+}
+
+// Validate + persist a new friendly name. Returns true on success.
+// Rejects: empty, too long, contains comma (CSV log safety) or control chars.
+static bool saveSenderName(const char *newName)
+{
+  if (!newName) return false;
+  size_t len = strnlen(newName, SENDER_NAME_MAX_LEN + 2);
+  if (len == 0 || len > SENDER_NAME_MAX_LEN) return false;
+  for (size_t i = 0; i < len; i++)
+  {
+    unsigned char c = (unsigned char)newName[i];
+    if (c < 0x20 || c == ',' || c == '"' || c == '\\') return false;
+  }
+  Preferences p;
+  if (!p.begin("cattracker", false)) return false;
+  p.putString("name", newName);
+  p.end();
+  strncpy(g_senderName, newName, SENDER_NAME_MAX_LEN);
+  g_senderName[SENDER_NAME_MAX_LEN] = '\0';
+  return true;
+}
 
 // Debug serial on spare pin (for battery operation monitoring)
 #define DEBUG_SERIAL_ENABLED true // Set to false to disable
@@ -383,7 +425,7 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
   char temp[200];
   snprintf(temp, sizeof(temp), "%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
            doc["msg_id"] | 0,
-           doc["id"] | SENDER_ID,
+           doc["id"] | (const char *)g_senderName,
            g_currentMode,
            doc["status"] | "unknown",
            doc["lat"] | 0.0,
@@ -456,24 +498,37 @@ static bool handleModeCommand(const char *json)
 
   // V3 device targeting: ignore commands not addressed to this collar.
   // Accepted forms:
-  //   "device":"<SENDER_ID>"  -> only this collar acts
-  //   "device":"broadcast"    -> every collar acts
-  //   (missing "device")      -> accepted for backward compatibility, but
-  //                              logged so we can spot legacy clients
+  //   "device":"<current name>"  -> only this collar acts
+  //   "device":"broadcast"       -> every collar acts
+  //   "device_id":<DEVICE_ID_INT> -> match by immutable numeric id (useful
+  //                                 when the current name is unknown, e.g.
+  //                                 right after a flash, or for set_name)
+  //   (missing "device" + "device_id") -> accepted for legacy clients, logged
+  bool targeted = false, matched = false;
+  if (doc["device_id"].is<int>())
+  {
+    targeted = true;
+    if (doc["device_id"].as<int>() == DEVICE_ID_INT) matched = true;
+  }
   if (doc["device"].is<const char *>())
   {
+    targeted = true;
     const char *target = doc["device"];
-    if (strcmp(target, SENDER_ID) != 0 && strcmp(target, "broadcast") != 0)
+    if (strcmp(target, g_senderName) == 0 || strcmp(target, "broadcast") == 0)
     {
-      Serial.printf("[RX] Command targeted to '%s', ignoring (I am '%s')\n",
-                    target, SENDER_ID);
-      DEBUG_PRINTF("[RX] Not for me: %s\n", target);
-      return false;
+      matched = true;
     }
   }
-  else
+  if (targeted && !matched)
   {
-    Serial.println("[RX] No 'device' field on command — accepting (legacy client)");
+    Serial.printf("[RX] Command not for me (I am '%s' id=%d); ignoring\n",
+                  g_senderName, DEVICE_ID_INT);
+    DEBUG_PRINTF("[RX] Not for me\n");
+    return false;
+  }
+  if (!targeted)
+  {
+    Serial.println("[RX] No device/device_id field on command — accepting (legacy client)");
   }
 
   const char *cmd = doc["cmd"];
@@ -518,7 +573,7 @@ static bool handleModeCommand(const char *json)
     ack["profile"] = profile;
     ack["power"] = newMode->lora_power_dbm;
     ack["sleep"] = newMode->sleep_interval_s;
-    ack["device"] = SENDER_ID;
+    ack["device"] = (const char *)g_senderName;
 
     TxReq req{};
     serializeJson(ack, req.json, sizeof(req.json));
@@ -538,7 +593,7 @@ static bool handleModeCommand(const char *json)
 
     StaticJsonDocument<320> status;
     status["status"] = "ok";
-    status["device"] = SENDER_ID;
+    status["device"] = (const char *)g_senderName;
     status["mode"] = g_currentMode;
     status["power"] = g_activeMode->lora_power_dbm;
     status["sleep"] = g_activeMode->sleep_interval_s;
@@ -559,6 +614,59 @@ static bool handleModeCommand(const char *json)
 
     Serial.println("[RX] Status request - response queued");
     DEBUG_PRINTLN("[RX] Status sent");
+
+    return true;
+  }
+
+  // V3: rename the collar. Wire format:
+  //   {"cmd":"set_name","device_id":4,"name":"Podge","msg_id":N}
+  // device_id is REQUIRED (we'd reject this above if it didn't match us, but
+  // we double-check here so a missing field can't accidentally rename every
+  // collar via the legacy "no device field = accept" backward-compat path).
+  else if (strcmp(cmd, "set_name") == 0)
+  {
+    if (!doc["device_id"].is<int>() || doc["device_id"].as<int>() != DEVICE_ID_INT)
+    {
+      Serial.println("[RX] set_name without matching device_id — refusing");
+      return false;
+    }
+    if (!doc["name"].is<const char *>())
+    {
+      Serial.println("[RX] set_name missing 'name' field");
+      return false;
+    }
+    const char *newName = doc["name"];
+    if (!saveSenderName(newName))
+    {
+      Serial.printf("[RX] set_name rejected: invalid name '%s' (1-15 chars, no commas/quotes/control)\n",
+                    newName);
+      // ACK with failure so the UI sees a response
+      StaticJsonDocument<160> ack;
+      ack["ack"] = "set_name";
+      ack["ok"] = false;
+      ack["device_id"] = DEVICE_ID_INT;
+      ack["device"] = (const char *)g_senderName; // current (unchanged) name
+      if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
+      TxReq req{};
+      serializeJson(ack, req.json, sizeof(req.json));
+      xQueueSend(txReqQ, &req, portMAX_DELAY);
+      return false;
+    }
+
+    Serial.printf("[RX] Name changed to '%s' (device_id=%d)\n", g_senderName, DEVICE_ID_INT);
+    DEBUG_PRINTF("[RX] name -> %s\n", g_senderName);
+
+    // ACK with new name so the receiver UI can confirm immediately
+    StaticJsonDocument<192> ack;
+    ack["ack"] = "set_name";
+    ack["ok"] = true;
+    ack["device_id"] = DEVICE_ID_INT;
+    ack["device"] = (const char *)g_senderName;
+    ack["id"] = (const char *)g_senderName; // also include "id" so receiver's JSON path picks it up
+    if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
+    TxReq req{};
+    serializeJson(ack, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
 
     return true;
   }
@@ -645,6 +753,12 @@ void setup()
 
   // Load operating mode from NVS
   loadOperatingMode();
+
+  // V3: load friendly name from NVS (default "Device-<id>" if unset)
+  loadSenderName();
+  Serial.printf("[BOOT] Collar identity: name='%s' device_id=%d\n",
+                g_senderName, DEVICE_ID_INT);
+  DEBUG_PRINTF("[BOOT] name=%s id=%d\n", g_senderName, DEVICE_ID_INT);
 
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
@@ -1187,7 +1301,7 @@ void TaskPower(void *)
       StaticJsonDocument<320> doc;
       doc["msg_id"] = g_msgCounter++;
       doc["device_id"] = DEVICE_ID_INT;
-      doc["id"] = SENDER_ID;
+      doc["id"] = (const char *)g_senderName;
       doc["status"] = "BLEHome";
       doc["mode"] = g_currentMode;
 
@@ -1350,7 +1464,7 @@ void TaskPower(void *)
     StaticJsonDocument<320> doc;
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = SENDER_ID;
+    doc["id"] = (const char *)g_senderName;
     doc["status"] = "outanabout";
     doc["mode"] = g_currentMode; // V3: surface current mode so silent lost-mode revert is visible
     doc["lat"] = fix.lat;
@@ -1377,7 +1491,7 @@ void TaskPower(void *)
     StaticJsonDocument<192> doc;
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = SENDER_ID;
+    doc["id"] = (const char *)g_senderName;
     doc["status"] = "invalidGPSLoc";
     doc["mode"] = g_currentMode;
 
