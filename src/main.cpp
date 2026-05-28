@@ -600,6 +600,7 @@ static bool handleModeCommand(const char *json)
     status["msg_id"] = g_msgCounter;
     status["gps_warm"] = g_gpsWarmedUp;
     status["home_cycles"] = g_homeBeaconCycles;
+    status["home_rssi_threshold"] = HOME_RSSI_THRESHOLD_DBM; // for tuning visibility
     status["log"] = logInfo;
 
     if (strcmp(g_currentMode, "lost") == 0)
@@ -1008,13 +1009,26 @@ void TaskBLE(void *)
     for (int i = 0; i < res.getCount(); i++)
     {
       BLEAdvertisedDevice dev = res.getDevice(i);
-      if (dev.haveName() && String(dev.getName().c_str()) == BEACON_NAME)
+      if (!dev.haveName()) continue;
+      if (String(dev.getName().c_str()) != BEACON_NAME) continue;
+
+      // V3 RSSI gate: don't count a faint distant beacon as "home". The
+      // beacon transmits at -12 dBm intentionally; the threshold corresponds
+      // to "you should be inside the building". See config.h to tune.
+      int rssi = dev.haveRSSI() ? dev.getRSSI() : -127;
+      if (rssi < HOME_RSSI_THRESHOLD_DBM)
       {
-        xEventGroupSetBits(evBits, EV_HOME);
-        Serial.println("[BLE] 'Home' beacon detected!");
-        DEBUG_PRINTLN("[BLE] Home detected");
-        break;
+        Serial.printf("[BLE] 'Home' beacon seen but RSSI %d dBm < threshold %d dBm — ignoring\n",
+                      rssi, HOME_RSSI_THRESHOLD_DBM);
+        DEBUG_PRINTF("[BLE] Home faint: %d\n", rssi);
+        continue;
       }
+
+      xEventGroupSetBits(evBits, EV_HOME);
+      Serial.printf("[BLE] 'Home' beacon detected! RSSI=%d dBm (>= %d)\n",
+                    rssi, HOME_RSSI_THRESHOLD_DBM);
+      DEBUG_PRINTF("[BLE] Home OK %d\n", rssi);
+      break;
     }
     scan->clearResults();
 

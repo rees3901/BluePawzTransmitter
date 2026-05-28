@@ -39,8 +39,16 @@
 
 #define BLE_INITIAL_SCAN_S 10 // Initial BLE scan on wake
 #define BLE_SCAN_WINDOW_S 3   // BLE scan window during GPS
-#define BEACON_NAME "Home"    // BLE beacon device name
+#define BEACON_NAME "Home"    // BLE beacon device name (case-sensitive match!)
 #define HOME_SLEEP_CYCLES 5   // Cycles at home before "BLEHome" TX
+
+// V3: RSSI gate for the "Home" beacon. The beacon advertises at -12 dBm and
+// the collar only counts it as "home" when received signal is >= this value.
+// A higher (less negative) value means the cat must be physically closer to
+// the base station to register as home. Walk-test to tune. Starting point
+// chosen for indoor 3–8 m range; bump down to -75 if you find cats drop off
+// home detection too easily on the far side of the house.
+#define HOME_RSSI_THRESHOLD_DBM (-65)
 
 // ─────────────────────────────────────────────
 // Operating Mode Profiles
