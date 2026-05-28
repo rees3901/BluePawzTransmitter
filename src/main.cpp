@@ -146,14 +146,8 @@ volatile bool rxFlag = false;
 // ─────────────────────────────────────────────
 // Utilities
 // ─────────────────────────────────────────────
-static String cardinalDirection(double bearing)
-{
-  static const char *dirs[] = {
-      "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-      "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
-  int idx = (int)((bearing + 11.25) / 22.5) % 16;
-  return String(dirs[idx]);
-}
+// (cardinalDirection removed in V3 — the receiver computes the cardinal from
+// the bearing once it has done its own haversine. Collars no longer need it.)
 
 // LED flicker for successful transmission
 static void led_flicker()
@@ -244,21 +238,13 @@ static void checkLostModeTimeout()
                   elapsedTime, LOST_MODE_FALLBACK_MODE);
     DEBUG_PRINTF("[MODE] Lost timeout -> %s\n", LOST_MODE_FALLBACK_MODE);
 
+    // Silent revert. We do NOT send a special "alert" packet — the previous
+    // version did, but that packet had no `status` field, so the receiver's
+    // JSON normaliser tagged it "Error" and the cat dropped off the map.
+    // The next routine telemetry packet (with status "outanabout" or similar
+    // and now mode="active") tells the receiver everything it needs to know.
     saveOperatingMode(LOST_MODE_FALLBACK_MODE);
     g_lostModeAccumS = 0;
-
-    // Send alert to base station so the UI can reflect the auto-revert.
-    // Include `device` so the receiver can attribute it correctly.
-    StaticJsonDocument<160> alert;
-    alert["alert"] = "lost_mode_timeout";
-    alert["device"] = SENDER_ID;
-    alert["id"] = SENDER_ID; // receiver's JSON path keys on "id"
-    alert["duration_s"] = elapsedTime;
-    alert["new_mode"] = LOST_MODE_FALLBACK_MODE;
-
-    TxReq req{};
-    serializeJson(alert, req.json, sizeof(req.json));
-    xQueueSend(txReqQ, &req, 0); // Non-blocking queue
   }
   else
   {
@@ -466,6 +452,28 @@ static bool handleModeCommand(const char *json)
     Serial.printf("[RX] JSON parse error: %s\n", error.c_str());
     DEBUG_PRINTLN("[RX] Parse error");
     return false;
+  }
+
+  // V3 device targeting: ignore commands not addressed to this collar.
+  // Accepted forms:
+  //   "device":"<SENDER_ID>"  -> only this collar acts
+  //   "device":"broadcast"    -> every collar acts
+  //   (missing "device")      -> accepted for backward compatibility, but
+  //                              logged so we can spot legacy clients
+  if (doc["device"].is<const char *>())
+  {
+    const char *target = doc["device"];
+    if (strcmp(target, SENDER_ID) != 0 && strcmp(target, "broadcast") != 0)
+    {
+      Serial.printf("[RX] Command targeted to '%s', ignoring (I am '%s')\n",
+                    target, SENDER_ID);
+      DEBUG_PRINTF("[RX] Not for me: %s\n", target);
+      return false;
+    }
+  }
+  else
+  {
+    Serial.println("[RX] No 'device' field on command — accepting (legacy client)");
   }
 
   const char *cmd = doc["cmd"];
@@ -1139,6 +1147,7 @@ void TaskPower(void *)
       doc["device_id"] = DEVICE_ID_INT;
       doc["id"] = SENDER_ID;
       doc["status"] = "BLEHome";
+      doc["mode"] = g_currentMode;
 
       TxReq req{};
       serializeJson(doc, req.json, sizeof(req.json));
@@ -1301,6 +1310,7 @@ void TaskPower(void *)
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = SENDER_ID;
     doc["status"] = "outanabout";
+    doc["mode"] = g_currentMode; // V3: surface current mode so silent lost-mode revert is visible
     doc["lat"] = fix.lat;
     doc["lon"] = fix.lon;
     if (fix.dateTime[0] != '\0')
@@ -1327,6 +1337,7 @@ void TaskPower(void *)
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = SENDER_ID;
     doc["status"] = "invalidGPSLoc";
+    doc["mode"] = g_currentMode;
 
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));
