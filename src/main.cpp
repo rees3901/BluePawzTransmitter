@@ -96,6 +96,7 @@
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
+#include <BLEAdvertising.h>   // V3.1: lost-mode beacon advertising
 #include <Preferences.h>
 #include <LittleFS.h>
 #include "config.h" // Operating modes and shared configuration
@@ -1142,8 +1143,61 @@ void TaskBLE(void *)
   BLEScan *scan = BLEDevice::getScan();
   scan->setActiveScan(true);
 
+  // V3.1: lost-mode advertising state. When we enter lost mode we stop
+  // scanning for the Home beacon and start advertising as 'BLUEPAWZ-<id>'
+  // so a mobile base station can find us by BLE. Build the advertising
+  // payload once, lazily, the first time lost mode is entered this wake.
+  BLEAdvertising *pAdv = nullptr;
+  bool advActive = false;
+  char advName[24];
+  snprintf(advName, sizeof(advName), "BLUEPAWZ-%d", DEVICE_ID_INT);
+
   for (;;)
   {
+    bool inLostMode = (strcmp(g_currentMode, "lost") == 0);
+
+    if (inLostMode)
+    {
+      // ── LOST MODE: advertise as BLUEPAWZ-<id>, don't scan for Home ──
+      if (!advActive)
+      {
+        // Lazy init the advertiser on first lost-mode iteration.
+        if (!pAdv) pAdv = BLEDevice::getAdvertising();
+        BLEAdvertisementData advData;
+        advData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+        advData.setName(advName);
+        pAdv->setAdvertisementData(advData);
+        pAdv->setScanResponse(false);
+        pAdv->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+        // Faster advertising interval than the receiver's Home beacon —
+        // we want the searcher's scanner to catch us quickly.
+        // 320 units * 0.625 ms = 200 ms
+        pAdv->setMinInterval(0x0140);
+        pAdv->setMaxInterval(0x0140);
+        // Punch up TX power in lost mode for range — the searcher might be
+        // 10-30 m away. ESP_PWR_LVL_P9 = +9 dBm (max for adv role).
+        esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+        BLEDevice::startAdvertising();
+        advActive = true;
+        Serial.printf("[BLE] LOST mode: advertising as '%s' @ +9dBm\n", advName);
+        DEBUG_PRINTF("[BLE] Adv on: %s\n", advName);
+      }
+      // Don't scan for Home in lost mode — it's pointless (the cat is
+      // missing) and would burn battery. Just sleep and let the radio
+      // do its advertising thing.
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // ── NORMAL MODES: stop adv (if active) and scan for Home beacon ──
+    if (advActive)
+    {
+      BLEDevice::stopAdvertising();
+      advActive = false;
+      Serial.println("[BLE] Left lost mode — stopped advertising");
+      DEBUG_PRINTLN("[BLE] Adv off");
+    }
+
     BLEScanResults res = scan->start(BLE_SCAN_WINDOW_S, false);
     for (int i = 0; i < res.getCount(); i++)
     {
