@@ -176,6 +176,14 @@ RTC_DATA_ATTR char g_currentMode[16] = "normal"; // Current operating mode name
 // each deep_sleep_start. Cleared on mode change.
 RTC_DATA_ATTR uint32_t g_lostModeAccumS = 0;     // Total seconds spent in lost mode (0 = not in lost mode)
 
+// Geofence state (persisted across deep sleep)
+RTC_DATA_ATTR bool g_geofenceEnabled = false;
+RTC_DATA_ATTR double g_geofenceLat = 0.0;
+RTC_DATA_ATTR double g_geofenceLon = 0.0;
+RTC_DATA_ATTR float g_geofenceRadiusM = GEOFENCE_DEFAULT_RADIUS_M;
+RTC_DATA_ATTR bool g_outsideGeofence = false;
+RTC_DATA_ATTR char g_preGeofenceMode[16] = "";   // Mode before geofence auto-escalation
+
 // Current active mode (loaded from NVS/RTC on boot)
 const OperatingMode *g_activeMode = &MODE_NORMAL;
 
@@ -306,6 +314,137 @@ static void accumulateLostModeTime(uint32_t upcomingSleepS)
   Serial.printf("[MODE] Lost mode accum: +%u (wake) +%u (sleep) = %u / %u s\n",
                 thisWakeS, upcomingSleepS, g_lostModeAccumS,
                 (uint32_t)LOST_MODE_MAX_DURATION_S);
+}
+
+// ─────────────────────────────────────────────
+// Geofence Functions
+// ─────────────────────────────────────────────
+
+static double haversineDistanceM(double lat1, double lon1, double lat2, double lon2)
+{
+  const double R = 6371000.0; // Earth radius in metres
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(radians(lat1)) * cos(radians(lat2)) *
+             sin(dLon / 2) * sin(dLon / 2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+static void loadGeofence()
+{
+  Preferences p;
+  if (!p.begin("cattracker", true)) return;
+  g_geofenceEnabled = p.getBool("gf_on", false);
+  if (g_geofenceEnabled)
+  {
+    // Preferences doesn't have getDouble, so store as string
+    String latStr = p.getString("gf_lat", "0");
+    String lonStr = p.getString("gf_lon", "0");
+    g_geofenceLat = atof(latStr.c_str());
+    g_geofenceLon = atof(lonStr.c_str());
+    g_geofenceRadiusM = p.getFloat("gf_rad", GEOFENCE_DEFAULT_RADIUS_M);
+  }
+  p.end();
+
+  if (g_geofenceEnabled)
+  {
+    Serial.printf("[GEOFENCE] Loaded: center=%.6f,%.6f radius=%.0fm\n",
+                  g_geofenceLat, g_geofenceLon, g_geofenceRadiusM);
+    DEBUG_PRINTF("[GF] on %.6f,%.6f r%.0f\n", g_geofenceLat, g_geofenceLon, g_geofenceRadiusM);
+  }
+}
+
+static bool saveGeofence(double lat, double lon, float radiusM, bool enabled)
+{
+  Preferences p;
+  if (!p.begin("cattracker", false)) return false;
+  p.putBool("gf_on", enabled);
+  if (enabled)
+  {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%.8f", lat);
+    p.putString("gf_lat", buf);
+    snprintf(buf, sizeof(buf), "%.8f", lon);
+    p.putString("gf_lon", buf);
+    p.putFloat("gf_rad", radiusM);
+  }
+  p.end();
+
+  g_geofenceEnabled = enabled;
+  g_geofenceLat = lat;
+  g_geofenceLon = lon;
+  g_geofenceRadiusM = radiusM;
+
+  if (enabled)
+  {
+    Serial.printf("[GEOFENCE] Saved: center=%.6f,%.6f radius=%.0fm\n", lat, lon, radiusM);
+    DEBUG_PRINTF("[GF] saved %.6f,%.6f r%.0f\n", lat, lon, radiusM);
+  }
+  else
+  {
+    Serial.println("[GEOFENCE] Disabled");
+    DEBUG_PRINTLN("[GF] off");
+    g_outsideGeofence = false;
+    g_preGeofenceMode[0] = '\0';
+  }
+  return true;
+}
+
+// Check a GPS fix against the geofence. Returns "inside", "outside", or nullptr
+// if geofence is disabled. Handles auto-escalation and de-escalation.
+static const char *checkGeofence(double lat, double lon)
+{
+  if (!g_geofenceEnabled) return nullptr;
+
+  double dist = haversineDistanceM(lat, lon, g_geofenceLat, g_geofenceLon);
+  Serial.printf("[GEOFENCE] Distance: %.1fm (radius: %.0fm)\n", dist, g_geofenceRadiusM);
+  DEBUG_PRINTF("[GF] dist=%.0f/%.0f\n", dist, g_geofenceRadiusM);
+
+  bool wasOutside = g_outsideGeofence;
+
+  if (dist > g_geofenceRadiusM)
+  {
+    g_outsideGeofence = true;
+
+    if (!wasOutside)
+    {
+      Serial.println("[GEOFENCE] BREACH — cat left the geofence");
+      DEBUG_PRINTLN("[GF] BREACH");
+
+      // Auto-escalate if in a low-urgency mode
+      if (strcmp(g_currentMode, "normal") == 0 || strcmp(g_currentMode, "powersave") == 0)
+      {
+        strncpy(g_preGeofenceMode, g_currentMode, sizeof(g_preGeofenceMode) - 1);
+        g_preGeofenceMode[sizeof(g_preGeofenceMode) - 1] = '\0';
+        saveOperatingMode(GEOFENCE_ESCALATE_MODE);
+        Serial.printf("[GEOFENCE] Auto-escalated from '%s' to '%s'\n",
+                      g_preGeofenceMode, GEOFENCE_ESCALATE_MODE);
+        DEBUG_PRINTF("[GF] escalate -> %s\n", GEOFENCE_ESCALATE_MODE);
+      }
+    }
+    return "outside";
+  }
+  else if (dist < (g_geofenceRadiusM - GEOFENCE_HYSTERESIS_M))
+  {
+    // Inside with hysteresis margin — de-escalate if we previously auto-escalated
+    g_outsideGeofence = false;
+
+    if (wasOutside && g_preGeofenceMode[0] != '\0')
+    {
+      Serial.printf("[GEOFENCE] Returned inside — reverting to '%s'\n", g_preGeofenceMode);
+      DEBUG_PRINTF("[GF] revert -> %s\n", g_preGeofenceMode);
+      saveOperatingMode(g_preGeofenceMode);
+      g_preGeofenceMode[0] = '\0';
+    }
+    return "inside";
+  }
+  else
+  {
+    // In hysteresis band — keep current state
+    return g_outsideGeofence ? "outside" : "inside";
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -591,7 +730,7 @@ static bool handleModeCommand(const char *json)
     char logInfo[64];
     getCSVLogInfo(logInfo, sizeof(logInfo));
 
-    StaticJsonDocument<320> status;
+    StaticJsonDocument<384> status;
     status["status"] = "ok";
     status["device"] = (const char *)g_senderName;
     status["mode"] = g_currentMode;
@@ -605,8 +744,15 @@ static bool handleModeCommand(const char *json)
 
     if (strcmp(g_currentMode, "lost") == 0)
     {
-      // Reflect total time in lost mode: prior wakes' accumulator + this wake's runtime
       status["lost_mode_s"] = g_lostModeAccumS + (uint32_t)(millis() / 1000);
+    }
+
+    // Geofence info
+    status["geofence_on"] = g_geofenceEnabled;
+    if (g_geofenceEnabled)
+    {
+      status["gf_radius"] = g_geofenceRadiusM;
+      status["gf_outside"] = g_outsideGeofence;
     }
 
     TxReq req{};
@@ -669,6 +815,67 @@ static bool handleModeCommand(const char *json)
     serializeJson(ack, req.json, sizeof(req.json));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
+    return true;
+  }
+
+  // Handle geofence configuration from base station
+  else if (strcmp(cmd, "set_geofence") == 0)
+  {
+    bool enabled = doc["enabled"] | true; // default true if field missing
+    StaticJsonDocument<256> ack;
+    ack["ack"] = "set_geofence";
+    ack["device"] = (const char *)g_senderName;
+    ack["device_id"] = DEVICE_ID_INT;
+    if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
+
+    if (!enabled)
+    {
+      saveGeofence(0, 0, 0, false);
+      ack["ok"] = true;
+      ack["enabled"] = false;
+    }
+    else
+    {
+      if (!doc["lat"].is<double>() || !doc["lon"].is<double>())
+      {
+        Serial.println("[RX] set_geofence missing lat/lon");
+        ack["ok"] = false;
+        ack["error"] = "missing lat/lon";
+        TxReq req{};
+        serializeJson(ack, req.json, sizeof(req.json));
+        xQueueSend(txReqQ, &req, portMAX_DELAY);
+        return false;
+      }
+
+      double lat = doc["lat"].as<double>();
+      double lon = doc["lon"].as<double>();
+      float radius = doc["radius_m"] | (float)GEOFENCE_DEFAULT_RADIUS_M;
+
+      if (radius < 50.0f || radius > 10000.0f)
+      {
+        Serial.printf("[RX] set_geofence radius out of range: %.0f\n", radius);
+        ack["ok"] = false;
+        ack["error"] = "radius must be 50-10000m";
+        TxReq req{};
+        serializeJson(ack, req.json, sizeof(req.json));
+        xQueueSend(txReqQ, &req, portMAX_DELAY);
+        return false;
+      }
+
+      saveGeofence(lat, lon, radius, true);
+      ack["ok"] = true;
+      ack["enabled"] = true;
+      ack["lat"] = lat;
+      ack["lon"] = lon;
+      ack["radius_m"] = radius;
+    }
+
+    TxReq req{};
+    serializeJson(ack, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.printf("[RX] Geofence %s (ACK queued)\n", enabled ? "configured" : "disabled");
+    DEBUG_PRINTF("[GF] %s\n", enabled ? "set" : "off");
     return true;
   }
 
@@ -760,6 +967,9 @@ void setup()
   Serial.printf("[BOOT] Collar identity: name='%s' device_id=%d\n",
                 g_senderName, DEVICE_ID_INT);
   DEBUG_PRINTF("[BOOT] name=%s id=%d\n", g_senderName, DEVICE_ID_INT);
+
+  // Load geofence configuration from NVS
+  loadGeofence();
 
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
@@ -1489,8 +1699,13 @@ void TaskPower(void *)
     }
 
     // V3: distance & bearing now computed at the receiver from raw lat/lon.
-    // Collar no longer needs to know HOME_LAT/HOME_LON — see handleLoRaPacketJSON()
-    // in BluePawzReceiver/src/main.cpp.
+
+    // Geofence check — adds "geofence" field and may auto-escalate mode
+    const char *gfStatus = checkGeofence(fix.lat, fix.lon);
+    if (gfStatus)
+    {
+      doc["geofence"] = gfStatus;
+    }
 
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));

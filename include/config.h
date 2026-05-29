@@ -112,6 +112,13 @@ const OperatingMode MODE_LOST = {
 #define LOST_MODE_FALLBACK_MODE "active" // Revert to active mode after timeout
 
 // ─────────────────────────────────────────────
+// Geofence Configuration
+// ─────────────────────────────────────────────
+#define GEOFENCE_DEFAULT_RADIUS_M 500.0  // Default radius in metres
+#define GEOFENCE_ESCALATE_MODE "active"  // Auto-escalate to this mode when outside fence
+#define GEOFENCE_HYSTERESIS_M 20.0       // Must re-enter by this margin to avoid flapping
+
+// ─────────────────────────────────────────────
 // Remote Command Protocol
 // ─────────────────────────────────────────────
 
@@ -121,10 +128,13 @@ const OperatingMode MODE_LOST = {
 // {"cmd":"mode","profile":"active"}
 // {"cmd":"mode","profile":"powersave"}
 // {"cmd":"get_status"}           // Request current mode/battery/GPS status
+// {"cmd":"set_geofence","device_id":N,"lat":XX.X,"lon":YY.Y,"radius_m":500}
+// {"cmd":"set_geofence","device_id":N,"enabled":false}  // Disable geofence
 
 // Response structure (node → base station):
 // {"ack":"mode","profile":"lost","power":22,"sleep":30}
 // {"status":"ok","mode":"normal","battery":3.7,"gps":"locked","uptime":3600}
+// {"ack":"set_geofence","ok":true,"lat":XX.X,"lon":YY.Y,"radius_m":500}
 
 // ─────────────────────────────────────────────
 // Helper Function: Get Mode by Name
