@@ -953,8 +953,10 @@ void setup()
     // RTC lost, restore from NVS flash
     g_msgCounter = nvsCounter;
     g_gpsWarmedUp = false;
-    Serial.printf("[BOOT] Restored msg_id from NVS flash: %d\n", g_msgCounter);
-    DEBUG_PRINTF("[BOOT] msg_id from NVS: %d\n", g_msgCounter);
+    g_homeBeaconCycles = prefs.getUChar("home_cycles", 0);
+    Serial.printf("[BOOT] Restored from NVS: msg_id=%d, home_cycles=%d\n",
+                  g_msgCounter, g_homeBeaconCycles);
+    DEBUG_PRINTF("[BOOT] NVS: msg_id=%d hc=%d\n", g_msgCounter, g_homeBeaconCycles);
     break;
   }
   prefs.end();
@@ -1101,9 +1103,10 @@ void loop()
     gpsSerial.end();
     Serial.println("[SLEEP] GPS UART closed");
 
-    // Save msg_id to NVS before sleep (survives USB resets)
+    // Save persistent state to NVS before sleep (survives USB resets)
     prefs.begin("cattracker", false);
     prefs.putUInt("msg_id", g_msgCounter);
+    prefs.putUChar("home_cycles", g_homeBeaconCycles);
     prefs.end();
 
     // Hold GPIO states during deep sleep (keeps GPS_EN LOW)
@@ -1465,6 +1468,7 @@ void TaskPower(void *)
   uint32_t bleStartTime = millis();
   bool homeDetectedInitial = false;
   bool loraCommandReceived = false;
+  uint32_t lastHomePrintTime = 0;
 
   while (millis() - bleStartTime < (BLE_INITIAL_SCAN_S * 1000))
   {
@@ -1482,9 +1486,18 @@ void TaskPower(void *)
     // PRIORITY 2: Check for BLE home
     if (bits & EV_HOME)
     {
-      homeDetectedInitial = true;
-      Serial.printf("[POWER] Home beacon detected after %d ms\n", millis() - bleStartTime);
-      DEBUG_PRINTLN("[POWER] Home found (initial)");
+      if (!homeDetectedInitial)
+      {
+        homeDetectedInitial = true;
+        lastHomePrintTime = millis();
+        Serial.printf("[POWER] Home beacon detected after %d ms\n", millis() - bleStartTime);
+        DEBUG_PRINTLN("[POWER] Home found (initial)");
+      }
+      else if (millis() - lastHomePrintTime >= 5000)
+      {
+        lastHomePrintTime = millis();
+        Serial.printf("[POWER] Home beacon still present (%d ms elapsed)\n", millis() - bleStartTime);
+      }
       // Don't break - continue scanning for LoRa commands
     }
 
