@@ -184,6 +184,10 @@ RTC_DATA_ATTR float g_geofenceRadiusM = GEOFENCE_DEFAULT_RADIUS_M;
 RTC_DATA_ATTR bool g_outsideGeofence = false;
 RTC_DATA_ATTR char g_preGeofenceMode[16] = "";   // Mode before geofence auto-escalation
 
+// First boot flag — forces full GPS acquisition + TX regardless of BLE home,
+// so the base station discovers this collar and its initial location.
+static bool g_firstBoot = false;
+
 // Current active mode (loaded from NVS/RTC on boot)
 const OperatingMode *g_activeMode = &MODE_NORMAL;
 
@@ -943,10 +947,18 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  Serial.println("\n\n[BOOT] CatTracker TX (RTOS)");
+  Serial.println("\n\n╔═══════════════════════════════════════════╗");
+  Serial.println("║   BluePawz CatTracker TX (FreeRTOS)       ║");
+  Serial.println("╚═══════════════════════════════════════════╝");
   DEBUG_PRINTLN("[BOOT] CatTracker TX (RTOS)");
-  Serial.printf("[BOOT] Reset reason: %d\n", esp_reset_reason());
-  DEBUG_PRINTF("[BOOT] Reset reason: %d\n", esp_reset_reason());
+
+  Serial.printf("[BOOT] Chip: %s  Rev: %d  Cores: %d\n",
+                ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
+  Serial.printf("[BOOT] Flash: %d KB  Heap free: %d bytes\n",
+                ESP.getFlashChipSize() / 1024, ESP.getFreeHeap());
+  Serial.printf("[BOOT] Reset reason: %d  Wakeup cause: %d\n",
+                esp_reset_reason(), wakeup_reason);
+  DEBUG_PRINTF("[BOOT] Reset: %d  Wake: %d\n", esp_reset_reason(), wakeup_reason);
 
   // Load persistent counter from NVS (survives all resets)
   prefs.begin("cattracker", false);
@@ -955,8 +967,9 @@ void setup()
   switch (wakeup_reason)
   {
   case ESP_SLEEP_WAKEUP_TIMER:
-    Serial.printf("[BOOT] ✓ Wake from DEEP SLEEP (RTC msg_id: %d)\n", g_msgCounter);
+    Serial.printf("[BOOT] Wake from DEEP SLEEP (RTC msg_id: %d)\n", g_msgCounter);
     DEBUG_PRINTF("[BOOT] Wake from DEEP SLEEP (msg_id: %d)\n", g_msgCounter);
+    g_firstBoot = false;
     // Use RTC counter if valid (faster), otherwise fall back to NVS
     if (g_msgCounter < nvsCounter)
     {
@@ -967,8 +980,10 @@ void setup()
     break;
   case ESP_SLEEP_WAKEUP_UNDEFINED:
   default:
-    Serial.printf("[BOOT] ✗ POWER-ON RESET (cause: %d)\n", wakeup_reason);
-    DEBUG_PRINTF("[BOOT] POWER-ON RESET (cause: %d)\n", wakeup_reason);
+    Serial.println("[BOOT] *** FIRST BOOT / POWER-ON RESET ***");
+    Serial.println("[BOOT] Will force full GPS acquisition + TX so base station discovers this collar");
+    DEBUG_PRINTLN("[BOOT] FIRST BOOT - forced TX");
+    g_firstBoot = true;
     // RTC lost, restore from NVS flash
     g_msgCounter = nvsCounter;
     g_gpsWarmedUp = false;
@@ -985,9 +1000,6 @@ void setup()
 
   // V3: load friendly name from NVS (default "Device-<id>" if unset)
   loadSenderName();
-  Serial.printf("[BOOT] Collar identity: name='%s' device_id=%d\n",
-                g_senderName, DEVICE_ID_INT);
-  DEBUG_PRINTF("[BOOT] name=%s id=%d\n", g_senderName, DEVICE_ID_INT);
 
   // Load geofence configuration from NVS
   loadGeofence();
@@ -997,6 +1009,27 @@ void setup()
 
   // Initialize CSV logging (LittleFS)
   initCSVLogging();
+
+  // ── Boot config summary ──
+  Serial.println("[BOOT] ─── Configuration ───");
+  Serial.printf("[BOOT]   Name:       %s\n", g_senderName);
+  Serial.printf("[BOOT]   Device ID:  %d\n", DEVICE_ID_INT);
+  Serial.printf("[BOOT]   Mode:       %s (TX %d dBm, sleep %d s)\n",
+                g_activeMode->name, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
+  Serial.printf("[BOOT]   LoRa:       SF%d BW%.0f CR4/%d  Freq %.1f MHz\n",
+                LORA_SF, LORA_BW_KHZ, LORA_CR, LORA_FREQ_MHZ);
+  Serial.printf("[BOOT]   BLE:        Beacon '%s'  RSSI threshold %d dBm\n",
+                BEACON_NAME, HOME_RSSI_THRESHOLD_DBM);
+  Serial.printf("[BOOT]   GPS:        Cold %ds  Warm %ds  Fixes needed %d\n",
+                GPS_COLD_START_TIMEOUT / 1000, GPS_WARM_START_TIMEOUT / 1000, GPS_VALID_COUNT_REQUIRED);
+  Serial.printf("[BOOT]   GPS warmed: %s\n", g_gpsWarmedUp ? "yes" : "no");
+  Serial.printf("[BOOT]   Geofence:   %s", g_geofenceEnabled ? "ON" : "OFF");
+  if (g_geofenceEnabled)
+    Serial.printf(" (%.6f, %.6f  r=%.0fm)", g_geofenceLat, g_geofenceLon, g_geofenceRadiusM);
+  Serial.println();
+  Serial.printf("[BOOT]   msg_id:     %d\n", g_msgCounter);
+  Serial.printf("[BOOT]   First boot: %s\n", g_firstBoot ? "YES — will force TX" : "no");
+  Serial.println("[BOOT] ────────────────────");
 
   // Queues & events
   gpsFixQ = xQueueCreate(1, sizeof(GpsFix)); // latest fix (overwrite)
@@ -1553,6 +1586,15 @@ void TaskPower(void *)
   }
 
   // CASE 2: Home detected (and NO LoRa command)
+  // On first boot, skip home shortcut — always acquire GPS and TX so the
+  // base station discovers this collar and its initial location.
+  if (g_firstBoot && homeDetectedInitial)
+  {
+    Serial.println("[POWER] First boot — ignoring home beacon, forcing GPS acquisition + TX");
+    DEBUG_PRINTLN("[POWER] First boot override");
+    homeDetectedInitial = false;
+  }
+
   if (homeDetectedInitial && !loraCommandReceived)
   {
     g_homeBeaconCycles++;
@@ -1628,9 +1670,20 @@ void TaskPower(void *)
   // Wait for required number of consecutive valid fixes
   while (millis() - gpsStartTime < timeout)
   {
-    // Check if home beacon appeared during GPS acquisition
     EventBits_t bits = xEventGroupGetBits(evBits);
-    if (bits & EV_HOME)
+
+    // Check for LoRa commands during GPS acquisition
+    if (bits & EV_LORA_CMD)
+    {
+      xEventGroupClearBits(evBits, EV_LORA_CMD);
+      Serial.printf("[POWER] LoRa command received during GPS acquisition (%d ms)\n",
+                    millis() - gpsStartTime);
+      DEBUG_PRINTLN("[POWER] LoRa CMD during GPS");
+    }
+
+    // Check if home beacon appeared during GPS acquisition
+    // (skip on first boot — we must TX regardless so base station sees us)
+    if (!g_firstBoot && (bits & EV_HOME))
     {
       homeDetectedDuringGPS = true;
       Serial.printf("[POWER] Home beacon appeared during GPS (after %d ms) - aborting TX\n",
@@ -1712,7 +1765,7 @@ void TaskPower(void *)
       while (millis() - stabilizeStart < GPS_STABILISE_MS)
       {
         EventBits_t bits = xEventGroupGetBits(evBits);
-        if (bits & EV_HOME)
+        if (!g_firstBoot && (bits & EV_HOME))
         {
           Serial.println("[POWER] Home beacon detected during stabilization - aborting TX");
           DEBUG_PRINTLN("[POWER] Home in stabilize - abort");
@@ -1728,20 +1781,22 @@ void TaskPower(void *)
     (void)xQueueReceive(gpsFixQ, &fix, 0); // Get freshest fix
 
     // Build full JSON with GPS data
-    StaticJsonDocument<320> doc;
+    StaticJsonDocument<384> doc;
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = (const char *)g_senderName;
     doc["status"] = "outanabout";
-    doc["mode"] = g_currentMode; // V3: surface current mode so silent lost-mode revert is visible
+    doc["mode"] = g_currentMode;
     doc["lat"] = fix.lat;
     doc["lon"] = fix.lon;
     if (fix.dateTime[0] != '\0')
     {
       doc["time"] = fix.dateTime;
     }
-
-    // V3: distance & bearing now computed at the receiver from raw lat/lon.
+    if (g_firstBoot)
+    {
+      doc["first_boot"] = true;
+    }
 
     // Geofence check — adds "geofence" field and may auto-escalate mode
     const char *gfStatus = checkGeofence(fix.lat, fix.lon);
@@ -1755,24 +1810,32 @@ void TaskPower(void *)
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
     Serial.println("[POWER] GPS fix acquired - queued for transmission");
+    if (g_firstBoot) Serial.println("[POWER] First boot discovery packet — base station will see this collar");
     DEBUG_PRINTLN("[POWER] TX queued");
+    g_firstBoot = false;
   }
   else
   {
-    // GPS timeout - send invalid status
-    StaticJsonDocument<192> doc;
+    // GPS timeout - send invalid status (still TX so base station sees us)
+    StaticJsonDocument<256> doc;
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = (const char *)g_senderName;
     doc["status"] = "invalidGPSLoc";
     doc["mode"] = g_currentMode;
+    if (g_firstBoot)
+    {
+      doc["first_boot"] = true;
+    }
 
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
     Serial.println("[POWER] GPS timeout - sending invalidGPSLoc");
+    if (g_firstBoot) Serial.println("[POWER] First boot — TX anyway so base station discovers this collar");
     DEBUG_PRINTLN("[POWER] TX invalid");
+    g_firstBoot = false;
   }
 
   // Wait for TX completion (EV_TXDONE set by TaskLoRa)
