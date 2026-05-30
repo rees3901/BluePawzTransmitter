@@ -30,6 +30,7 @@
 #include <BLEScan.h>
 #include <Preferences.h>
 #include <LittleFS.h>
+#include <esp_log.h>
 #include "config.h" // Operating modes and shared configuration
 
 // ─────────────────────────────────────────────
@@ -1084,7 +1085,8 @@ void setup()
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   Serial.println("[LORA] SPI ready");
 
-  // BLE init (scanner only)
+  // BLE init (scanner only) — suppress noisy GAP event warnings
+  esp_log_level_set("BLEScan", ESP_LOG_ERROR);
   BLEDevice::init("");
   Serial.println("[BLE] stack init done");
 
@@ -1232,27 +1234,35 @@ void loop()
 void TaskGPS(void *)
 {
   GpsFix fix; // local working copy
-  uint32_t lastCharTime = millis();
-  int charCount = 0;
+  uint32_t lastStatusTime = millis();
+  bool lastReportedValid = false;
 
   for (;;)
   {
-    int avail = gpsSerial.available();
-    if (avail > 0)
-    {
-      charCount += avail;
-      if (millis() - lastCharTime > 5000)
-      {
-        Serial.printf("[GPS] Received %d chars in last 5s\n", charCount);
-        charCount = 0;
-        lastCharTime = millis();
-      }
-    }
-
     while (gpsSerial.available())
     {
       char c = gpsSerial.read();
       gps.encode(c);
+    }
+
+    // Periodic GPS status update (every 10 seconds)
+    if (millis() - lastStatusTime >= 10000)
+    {
+      lastStatusTime = millis();
+      bool hasLoc = gps.location.isValid();
+      uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+      uint32_t hdop = gps.hdop.isValid() ? gps.hdop.value() : 9999;
+
+      if (hasLoc)
+      {
+        Serial.printf("[GPS] Fix: %.6f, %.6f  Sats: %d  HDOP: %.1f\n",
+                      gps.location.lat(), gps.location.lng(), sats, hdop / 100.0);
+      }
+      else
+      {
+        Serial.printf("[GPS] Acquiring... Sats: %d  HDOP: %.1f  Chars: %lu\n",
+                      sats, hdop / 100.0, gps.charsProcessed());
+      }
     }
 
     // When location updates, refresh state
@@ -1275,11 +1285,16 @@ void TaskGPS(void *)
         fix.dateTime[0] = '\0'; // Empty if invalid
       }
 
-      if (fix.valid)
+      if (fix.valid && !lastReportedValid)
+      {
+        lastReportedValid = true;
+        xEventGroupSetBits(evBits, EV_FIX);
+        Serial.printf("[GPS] *** FIRST FIX: %.6f, %.6f ***\n", fix.lat, fix.lon);
+        DEBUG_PRINTF("[GPS] Fix: %.6f, %.6f\n", fix.lat, fix.lon);
+      }
+      else if (fix.valid)
       {
         xEventGroupSetBits(evBits, EV_FIX);
-        Serial.printf("[GPS] Valid fix: %.6f, %.6f\n", fix.lat, fix.lon);
-        DEBUG_PRINTF("[GPS] Fix: %.6f, %.6f\n", fix.lat, fix.lon);
       }
       // Overwrite latest fix in queue (drop older value if present)
       xQueueOverwrite(gpsFixQ, &fix);
@@ -1391,12 +1406,22 @@ void TaskLoRa(void *)
 
       if (state == RADIOLIB_ERR_NONE)
       {
-        rxBuf[255] = '\0'; // Ensure null termination
+        size_t pktLen = lora.getPacketLength();
+
+        // DIO1 fires on both RX and TX complete — ignore zero-length
+        // "phantom" packets that appear right after our own transmissions.
+        if (pktLen == 0)
+        {
+          lora.startReceive();
+          continue;
+        }
+
+        rxBuf[pktLen] = '\0';
 
         int16_t cmdRssi = lora.getRSSI();
         float cmdSnr = lora.getSNR();
         Serial.printf("[RX] Command received (%d bytes, RSSI %d, SNR %.1f): %s\n",
-                      lora.getPacketLength(), cmdRssi, cmdSnr, (char *)rxBuf);
+                      pktLen, cmdRssi, cmdSnr, (char *)rxBuf);
         DEBUG_PRINTF("[RX] CMD: %s\n", (char *)rxBuf);
 
         // Parse and handle command
