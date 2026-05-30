@@ -33,6 +33,13 @@
 #include <esp_log.h>
 #include "config.h" // Operating modes and shared configuration
 
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "unknown"
+#endif
+#ifndef BUILD_TIMESTAMP
+#define BUILD_TIMESTAMP "unknown"
+#endif
+
 // ─────────────────────────────────────────────
 // Device Identity (per-node configuration)
 // ─────────────────────────────────────────────
