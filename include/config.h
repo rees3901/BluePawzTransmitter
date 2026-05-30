@@ -109,7 +109,7 @@ const OperatingMode MODE_LOST = {
 // Lost Mode Safety
 // ─────────────────────────────────────────────
 #define LOST_MODE_MAX_DURATION_S 7200    // 2 hours (120 minutes)
-#define LOST_MODE_FALLBACK_MODE "active" // Revert to active mode after timeout
+#define LOST_MODE_FALLBACK_MODE "normal" // Revert to normal mode after timeout
 
 // ─────────────────────────────────────────────
 // Geofence Configuration
