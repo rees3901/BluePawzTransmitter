@@ -48,7 +48,7 @@
 // the base station to register as home. Walk-test to tune.
 // Field observation: beacons a few metres apart read -70 to -80 dBm,
 // so -85 gives reliable detection across the house.
-#define HOME_RSSI_THRESHOLD_DBM (-85)
+#define HOME_RSSI_THRESHOLD_DBM (-90)
 
 // ─────────────────────────────────────────────
 // Operating Mode Profiles
