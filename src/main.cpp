@@ -754,8 +754,9 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     char logInfo[64];
     getCSVLogInfo(logInfo, sizeof(logInfo));
 
-    StaticJsonDocument<384> status;
+    StaticJsonDocument<448> status;
     status["status"] = "ok";
+    status["fw"] = FIRMWARE_VERSION;
     status["device"] = (const char *)g_senderName;
     status["mode"] = g_currentMode;
     status["power"] = g_activeMode->lora_power_dbm;
@@ -971,8 +972,10 @@ void setup()
 
   Serial.println("\n\n╔═══════════════════════════════════════════╗");
   Serial.println("║   BluePawz CatTracker TX (FreeRTOS)       ║");
+  Serial.printf( "║   FW: %-36s ║\n", FIRMWARE_VERSION);
+  Serial.printf( "║   Built: %-33s ║\n", BUILD_TIMESTAMP);
   Serial.println("╚═══════════════════════════════════════════╝");
-  DEBUG_PRINTLN("[BOOT] CatTracker TX (RTOS)");
+  DEBUG_PRINTF("[BOOT] FW: %s\n", FIRMWARE_VERSION);
 
   Serial.printf("[BOOT] Chip: %s  Rev: %d  Cores: %d\n",
                 ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
