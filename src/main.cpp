@@ -646,7 +646,7 @@ static void getCSVLogInfo(char *info, size_t maxLen)
 }
 
 // Parse and handle mode change command from base station
-static bool handleModeCommand(const char *json)
+static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr = 0.0)
 {
   StaticJsonDocument<256> doc;
   DeserializationError error = deserializeJson(doc, json);
@@ -785,6 +785,27 @@ static bool handleModeCommand(const char *json)
     Serial.println("[RX] Status request - response queued");
     DEBUG_PRINTLN("[RX] Status sent");
 
+    return true;
+  }
+
+  // Lightweight presence check — minimal packet, fast response
+  else if (strcmp(cmd, "ping") == 0)
+  {
+    StaticJsonDocument<128> pong;
+    pong["pong"] = true;
+    pong["device"] = (const char *)g_senderName;
+    pong["device_id"] = DEVICE_ID_INT;
+    pong["rssi"] = rxRssi;
+    pong["snr"] = rxSnr;
+    pong["uptime_ms"] = millis();
+    if (doc["msg_id"].is<uint32_t>()) pong["msg_id"] = doc["msg_id"].as<uint32_t>();
+
+    TxReq req{};
+    serializeJson(pong, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+
+    Serial.printf("[RX] Ping — pong queued (RSSI %d, SNR %.1f)\n", rxRssi, rxSnr);
+    DEBUG_PRINTLN("[RX] Pong");
     return true;
   }
 
@@ -1372,12 +1393,14 @@ void TaskLoRa(void *)
       {
         rxBuf[255] = '\0'; // Ensure null termination
 
-        Serial.printf("[RX] Command received (%d bytes): %s\n",
-                      lora.getPacketLength(), (char *)rxBuf);
+        int16_t cmdRssi = lora.getRSSI();
+        float cmdSnr = lora.getSNR();
+        Serial.printf("[RX] Command received (%d bytes, RSSI %d, SNR %.1f): %s\n",
+                      lora.getPacketLength(), cmdRssi, cmdSnr, (char *)rxBuf);
         DEBUG_PRINTF("[RX] CMD: %s\n", (char *)rxBuf);
 
         // Parse and handle command
-        if (handleModeCommand((char *)rxBuf))
+        if (handleModeCommand((char *)rxBuf, cmdRssi, cmdSnr))
         {
           // Set high-priority flag to override BLE home detection
           xEventGroupSetBits(evBits, EV_LORA_CMD);

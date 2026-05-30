@@ -128,6 +128,7 @@ const OperatingMode MODE_LOST = {
 // {"cmd":"mode","profile":"active"}
 // {"cmd":"mode","profile":"powersave"}
 // {"cmd":"get_status"}           // Request current mode/battery/GPS status
+// {"cmd":"ping"}                 // Presence check — collar replies with pong + link stats
 // {"cmd":"set_geofence","device_id":N,"lat":XX.X,"lon":YY.Y,"radius_m":500}
 // {"cmd":"set_geofence","device_id":N,"enabled":false}  // Disable geofence
 
@@ -135,6 +136,7 @@ const OperatingMode MODE_LOST = {
 // {"ack":"mode","profile":"lost","power":22,"sleep":30}
 // {"status":"ok","mode":"normal","battery":3.7,"gps":"locked","uptime":3600}
 // {"ack":"set_geofence","ok":true,"lat":XX.X,"lon":YY.Y,"radius_m":500}
+// {"pong":true,"device":"Podge","rssi":-45,"snr":8.5,"uptime_ms":3200}
 
 // ─────────────────────────────────────────────
 // Helper Function: Get Mode by Name
