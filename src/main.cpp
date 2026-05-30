@@ -1046,7 +1046,7 @@ void setup()
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
 
-  // ── Hardware button: hold BOOT for 3s to toggle Developer Mode ──
+  // ── Hardware button: hold USER (GPIO21) for 3s to toggle Developer Mode ──
   if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
   {
     Serial.println("[BOOT] Button held — checking for Developer Mode toggle...");
@@ -1113,11 +1113,11 @@ void setup()
   {
     Serial.println("[BOOT]   *** DEVELOPER MODE ACTIVE ***");
     Serial.println("[BOOT]   Extra diagnostics in telemetry + serial");
-    Serial.println("[BOOT]   Hold BOOT button 3s to return to Normal");
+    Serial.println("[BOOT]   Hold USER button 3s to return to Normal");
   }
   else
   {
-    Serial.println("[BOOT]   Hold BOOT button 3s to enter Developer Mode");
+    Serial.println("[BOOT]   Hold USER button 3s to enter Developer Mode");
   }
   Serial.println("[BOOT] ────────────────────");
 
