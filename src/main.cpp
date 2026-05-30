@@ -1046,27 +1046,28 @@ void setup()
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
 
-  // ── Hardware button: hold USER (GPIO21) for 3s to toggle Developer Mode ──
+  // ── Hardware button: double-press USER (GPIO21) to toggle Developer Mode ──
+  // LED feedback: 2 flashes = Normal, 5 flashes = Developer
   if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
   {
-    Serial.println("[BOOT] Button held — checking for Developer Mode toggle...");
-    uint32_t pressStart = millis();
-    bool longPress = false;
+    // Wait for first press release
+    while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW) delay(10);
 
-    while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
+    // Wait for second press within the window
+    uint32_t releaseTime = millis();
+    bool doublePress = false;
+    while (millis() - releaseTime < DEV_MODE_DOUBLE_PRESS_MS)
     {
-      if (millis() - pressStart >= DEV_MODE_LONG_PRESS_MS)
+      if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
       {
-        longPress = true;
+        doublePress = true;
+        while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW) delay(10); // wait for release
         break;
       }
-      // Rapid LED blink as feedback while holding
-      digitalWrite(LED_PIN, (millis() / 100) % 2);
       delay(10);
     }
-    digitalWrite(LED_PIN, LOW);
 
-    if (longPress)
+    if (doublePress)
     {
       if (isDevMode())
       {
@@ -1078,12 +1079,16 @@ void setup()
         saveOperatingMode("developer");
         Serial.println("[BOOT] *** Developer Mode ON ***");
       }
-      // Triple flash to confirm toggle
-      for (int i = 0; i < 6; i++)
-      {
-        digitalWrite(LED_PIN, i % 2);
-        delay(150);
-      }
+    }
+
+    // LED feedback for current mode (after any toggle)
+    int flashes = isDevMode() ? 5 : 2;
+    for (int i = 0; i < flashes; i++)
+    {
+      digitalWrite(LED_PIN, HIGH);
+      delay(150);
+      digitalWrite(LED_PIN, LOW);
+      delay(150);
     }
   }
 
@@ -1113,11 +1118,11 @@ void setup()
   {
     Serial.println("[BOOT]   *** DEVELOPER MODE ACTIVE ***");
     Serial.println("[BOOT]   Extra diagnostics in telemetry + serial");
-    Serial.println("[BOOT]   Hold USER button 3s to return to Normal");
+    Serial.println("[BOOT]   Double-press USER button to return to Normal");
   }
   else
   {
-    Serial.println("[BOOT]   Hold USER button 3s to enter Developer Mode");
+    Serial.println("[BOOT]   Double-press USER button to enter Developer Mode");
   }
   Serial.println("[BOOT] ────────────────────");
 

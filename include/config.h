@@ -117,8 +117,8 @@ const OperatingMode MODE_DEVELOPER = {
 // ─────────────────────────────────────────────
 // Developer Mode Configuration
 // ─────────────────────────────────────────────
-#define DEV_MODE_BUTTON_PIN 21    // GPIO21 (user button on SX1262 expansion)
-#define DEV_MODE_LONG_PRESS_MS 3000  // Hold 3 seconds to toggle
+#define DEV_MODE_BUTTON_PIN 21       // GPIO21 (user button on SX1262 expansion)
+#define DEV_MODE_DOUBLE_PRESS_MS 500 // Max gap between presses for double-press
 
 // ─────────────────────────────────────────────
 // Lost Mode Safety
