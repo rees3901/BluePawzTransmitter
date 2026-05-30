@@ -105,6 +105,21 @@ const OperatingMode MODE_LOST = {
     .led_beacon_interval_ms = 2000 // Flash every 2 seconds
 };
 
+// DEVELOPER - Rapid cycle for testing and diagnostics
+const OperatingMode MODE_DEVELOPER = {
+    .name = "developer",
+    .lora_power_dbm = 19,   // Normal power for realistic link testing
+    .sleep_interval_s = 60, // 1 minute cycle for fast iteration
+    .led_flash_count = 3,   // Quick triple flash (visually distinct)
+    .led_beacon_mode = false,
+    .led_beacon_interval_ms = 0};
+
+// ─────────────────────────────────────────────
+// Developer Mode Configuration
+// ─────────────────────────────────────────────
+#define DEV_MODE_BUTTON_PIN 0     // GPIO0 (BOOT button on XIAO ESP32S3)
+#define DEV_MODE_LONG_PRESS_MS 3000  // Hold 3 seconds to toggle
+
 // ─────────────────────────────────────────────
 // Lost Mode Safety
 // ─────────────────────────────────────────────
@@ -127,6 +142,7 @@ const OperatingMode MODE_LOST = {
 // {"cmd":"mode","profile":"normal"}
 // {"cmd":"mode","profile":"active"}
 // {"cmd":"mode","profile":"powersave"}
+// {"cmd":"mode","profile":"developer"}
 // {"cmd":"get_status"}           // Request current mode/battery/GPS status
 // {"cmd":"ping"}                 // Presence check — collar replies with pong + link stats
 // {"cmd":"set_geofence","device_id":N,"lat":XX.X,"lon":YY.Y,"radius_m":500}
@@ -151,6 +167,8 @@ inline const OperatingMode *getModeByName(const char *name)
         return &MODE_ACTIVE;
     if (strcmp(name, "lost") == 0)
         return &MODE_LOST;
+    if (strcmp(name, "developer") == 0)
+        return &MODE_DEVELOPER;
     return &MODE_NORMAL; // Default fallback
 }
 

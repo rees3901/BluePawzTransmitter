@@ -196,6 +196,12 @@ RTC_DATA_ATTR char g_preGeofenceMode[16] = "";   // Mode before geofence auto-es
 // so the base station discovers this collar and its initial location.
 static bool g_firstBoot = false;
 
+// Developer mode helper — returns true when the active mode is "developer"
+static inline bool isDevMode()
+{
+  return strcmp(g_currentMode, "developer") == 0;
+}
+
 // Current active mode (loaded from NVS/RTC on boot)
 const OperatingMode *g_activeMode = &MODE_NORMAL;
 
@@ -976,6 +982,7 @@ void setup()
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  pinMode(DEV_MODE_BUTTON_PIN, INPUT_PULLUP);
 
   Serial.println("\n\n╔═══════════════════════════════════════════╗");
   Serial.println("║   BluePawz CatTracker TX (FreeRTOS)       ║");
@@ -1039,6 +1046,47 @@ void setup()
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
 
+  // ── Hardware button: hold BOOT for 3s to toggle Developer Mode ──
+  if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
+  {
+    Serial.println("[BOOT] Button held — checking for Developer Mode toggle...");
+    uint32_t pressStart = millis();
+    bool longPress = false;
+
+    while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
+    {
+      if (millis() - pressStart >= DEV_MODE_LONG_PRESS_MS)
+      {
+        longPress = true;
+        break;
+      }
+      // Rapid LED blink as feedback while holding
+      digitalWrite(LED_PIN, (millis() / 100) % 2);
+      delay(10);
+    }
+    digitalWrite(LED_PIN, LOW);
+
+    if (longPress)
+    {
+      if (isDevMode())
+      {
+        saveOperatingMode("normal");
+        Serial.println("[BOOT] *** Developer Mode OFF — switched to Normal ***");
+      }
+      else
+      {
+        saveOperatingMode("developer");
+        Serial.println("[BOOT] *** Developer Mode ON ***");
+      }
+      // Triple flash to confirm toggle
+      for (int i = 0; i < 6; i++)
+      {
+        digitalWrite(LED_PIN, i % 2);
+        delay(150);
+      }
+    }
+  }
+
   // Initialize CSV logging (LittleFS)
   initCSVLogging();
 
@@ -1061,6 +1109,16 @@ void setup()
   Serial.println();
   Serial.printf("[BOOT]   msg_id:     %d\n", g_msgCounter);
   Serial.printf("[BOOT]   First boot: %s\n", g_firstBoot ? "YES — will force TX" : "no");
+  if (isDevMode())
+  {
+    Serial.println("[BOOT]   *** DEVELOPER MODE ACTIVE ***");
+    Serial.println("[BOOT]   Extra diagnostics in telemetry + serial");
+    Serial.println("[BOOT]   Hold BOOT button 3s to return to Normal");
+  }
+  else
+  {
+    Serial.println("[BOOT]   Hold BOOT button 3s to enter Developer Mode");
+  }
   Serial.println("[BOOT] ────────────────────");
 
   // Queues & events
@@ -1255,8 +1313,9 @@ void TaskGPS(void *)
       gps.encode(c);
     }
 
-    // Periodic GPS status update (every 10 seconds)
-    if (millis() - lastStatusTime >= 10000)
+    // Periodic GPS status update (5s in developer mode, 10s otherwise)
+    uint32_t statusInterval = isDevMode() ? 5000 : 10000;
+    if (millis() - lastStatusTime >= statusInterval)
     {
       lastStatusTime = millis();
       bool hasLoc = gps.location.isValid();
@@ -1272,6 +1331,11 @@ void TaskGPS(void *)
       {
         Serial.printf("[GPS] Acquiring... Sats: %d  HDOP: %.1f  Chars: %lu\n",
                       sats, hdop / 100.0, gps.charsProcessed());
+      }
+      if (isDevMode())
+      {
+        Serial.printf("[DEV] Heap: %d  Sentences: %lu  Failed: %lu\n",
+                      ESP.getFreeHeap(), gps.sentencesWithFix(), gps.failedChecksum());
       }
     }
 
@@ -1671,6 +1735,12 @@ void TaskPower(void *)
       doc["id"] = (const char *)g_senderName;
       doc["status"] = "BLEHome";
       doc["mode"] = g_currentMode;
+      if (isDevMode())
+      {
+        doc["heap"] = ESP.getFreeHeap();
+        doc["uptime_ms"] = millis();
+        doc["fw"] = FIRMWARE_VERSION;
+      }
 
       TxReq req{};
       serializeJson(doc, req.json, sizeof(req.json));
@@ -1863,19 +1933,31 @@ void TaskPower(void *)
       doc["geofence"] = gfStatus;
     }
 
+    // Developer mode: extra diagnostics in telemetry
+    if (isDevMode())
+    {
+      doc["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      doc["hdop"] = gps.hdop.isValid() ? gps.hdop.value() / 100.0 : 99.99;
+      doc["heap"] = ESP.getFreeHeap();
+      doc["uptime_ms"] = millis();
+      doc["fw"] = FIRMWARE_VERSION;
+    }
+
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
     Serial.println("[POWER] GPS fix acquired - queued for transmission");
     if (g_firstBoot) Serial.println("[POWER] First boot discovery packet — base station will see this collar");
+    if (isDevMode()) Serial.printf("[DEV] Packet size: %d bytes  Heap: %d\n",
+                                   strlen(req.json), ESP.getFreeHeap());
     DEBUG_PRINTLN("[POWER] TX queued");
     g_firstBoot = false;
   }
   else
   {
     // GPS timeout - send invalid status (still TX so base station sees us)
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<320> doc;
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = (const char *)g_senderName;
@@ -1885,6 +1967,13 @@ void TaskPower(void *)
     {
       doc["first_boot"] = true;
     }
+    if (isDevMode())
+    {
+      doc["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      doc["heap"] = ESP.getFreeHeap();
+      doc["uptime_ms"] = millis();
+      doc["fw"] = FIRMWARE_VERSION;
+    }
 
     TxReq req{};
     serializeJson(doc, req.json, sizeof(req.json));
@@ -1892,6 +1981,9 @@ void TaskPower(void *)
 
     Serial.println("[POWER] GPS timeout - sending invalidGPSLoc");
     if (g_firstBoot) Serial.println("[POWER] First boot — TX anyway so base station discovers this collar");
+    if (isDevMode()) Serial.printf("[DEV] Packet size: %d bytes  Sats: %d\n",
+                                   strlen(req.json),
+                                   gps.satellites.isValid() ? (int)gps.satellites.value() : 0);
     DEBUG_PRINTLN("[POWER] TX invalid");
     g_firstBoot = false;
   }
