@@ -194,6 +194,25 @@ Preferences prefs;
 volatile bool rxFlag = false;
 
 // ─────────────────────────────────────────────
+// L76K GNSS LED control (proprietary binary commands)
+// ─────────────────────────────────────────────
+static const uint8_t L76K_LED_OFF[] = {
+    0xBA, 0xCE, 0x10, 0x00, 0x06, 0x03, 0x40,
+    0x42, 0x0F, 0x00, 0xA0, 0x86, 0x01, 0x00,
+    0x00,
+    0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0xF0,
+    0xC8, 0x17, 0x08};
+
+static const uint8_t L76K_LED_RECOVER[] = {
+    0xBA, 0xCE, 0x10, 0x00, 0x06, 0x03, 0x40,
+    0x42, 0x0F, 0x00, 0xA0, 0x86, 0x01, 0x00,
+    0x03,
+    0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0xF3,
+    0xC8, 0x17, 0x08};
+
+// ─────────────────────────────────────────────
 // Utilities
 // ─────────────────────────────────────────────
 // (cardinalDirection removed in V3 — the receiver computes the cardinal from
@@ -1002,6 +1021,11 @@ void setup()
   Serial.println("[INIT] GPS UART started and buffer flushed");
   DEBUG_PRINTLN("[INIT] GPS UART ready");
 
+  // Restore L76K LED to 1PPS blink mode (it turns solid-on during sleep)
+  gpsSerial.write(L76K_LED_RECOVER, sizeof(L76K_LED_RECOVER));
+  Serial.println("[INIT] L76K LED restored to 1PPS mode");
+  DEBUG_PRINTLN("[INIT] L76K LED on");
+
   // LoRa radio init (will be re-done in TaskLoRa, but SPI setup here)
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   Serial.println("[LORA] SPI ready");
@@ -1094,6 +1118,12 @@ void loop()
 
     // Deinitialize BLE to save power
     BLEDevice::deinit(true);
+
+    // Turn off L76K LED before sleep (it stays solid-on otherwise)
+    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+    delay(50); // Give UART time to flush the command
+    Serial.println("[SLEEP] L76K LED off");
+    DEBUG_PRINTLN("[SLEEP] L76K LED off");
 
     // Power off GPS completely
     digitalWrite(GPS_EN, LOW);
