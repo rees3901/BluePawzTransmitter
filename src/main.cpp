@@ -31,6 +31,7 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <esp_log.h>
+#include <esp_mac.h>
 #include "config.h" // Operating modes and shared configuration
 
 #ifndef FIRMWARE_VERSION
@@ -43,13 +44,25 @@
 // ─────────────────────────────────────────────
 // Device Identity (per-node configuration)
 // ─────────────────────────────────────────────
-// V3: only DEVICE_ID_INT is hardcoded per flash. It is the immutable
-// numeric identity of this physical collar — used for command targeting
-// from the base station. The human-friendly NAME ("Podge", "Macy", etc.)
-// is a runtime value (g_senderName) stored in NVS and changed at any time
-// via the `set_name` command from the receiver. Default if NVS is empty:
-// "Device-<DEVICE_ID_INT>".
-#define DEVICE_ID_INT 4 // Numeric device ID — unique per flash, never changes remotely.
+// Device ID is derived from the ESP32's factory-burned MAC address on boot,
+// producing a stable 3-digit number (100–999) unique to each physical chip.
+// No manual programming needed — flash the same firmware on any collar and
+// it gets its own ID automatically.
+// The human-friendly NAME ("Podge", "Macy", etc.) is a runtime value
+// (g_senderName) stored in NVS and changed at any time via the `set_name`
+// command from the receiver. Default if NVS is empty: "Device-<id>".
+static uint16_t DEVICE_ID_INT = 0;
+
+static uint8_t g_mac[6];
+
+static void initDeviceId()
+{
+  esp_efuse_mac_get_default(g_mac);
+  uint32_t hash = g_mac[0];
+  for (int i = 1; i < 6; i++)
+    hash = hash * 31 + g_mac[i];
+  DEVICE_ID_INT = 100 + (hash % 900); // 100–999
+}
 
 #define SENDER_NAME_MAX_LEN 15   // 15 chars + null terminator, matches NVS key length comfortably
 static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
@@ -1079,6 +1092,11 @@ void setup()
   Serial.println("╚═══════════════════════════════════════════╝");
   DEBUG_PRINTF("[BOOT] FW: %s\n", FIRMWARE_VERSION);
 
+  // Derive unique device ID from MAC address
+  initDeviceId();
+
+  Serial.printf("[BOOT] Device ID: %d (MAC: %02X:%02X:%02X:%02X:%02X:%02X)\n",
+                DEVICE_ID_INT, g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5]);
   Serial.printf("[BOOT] Chip: %s  Rev: %d  Cores: %d\n",
                 ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
   Serial.printf("[BOOT] Flash: %d KB  Heap free: %d bytes\n",
