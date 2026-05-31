@@ -821,13 +821,18 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
       g_lostModeAccumS = 0;
     }
 
-    // Send ACK
+    // Send ACK. V3.2.3: echo msg_id from the request so the receiver
+    // can pair this ACK to the exact queued command. Without msg_id
+    // the receiver falls back to "oldest AWAITING_ACK for this device"
+    // which works for single-command cases but loses pairing as soon
+    // as multiple commands are queued back-to-back.
     StaticJsonDocument<192> ack;
     ack["ack"] = "mode";
     ack["profile"] = profile;
     ack["power"] = newMode->lora_power_dbm;
     ack["sleep"] = newMode->sleep_interval_s;
     ack["device"] = (const char *)g_senderName;
+    if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
 
     TxReq req{};
     serializeJson(ack, req.json, sizeof(req.json));
@@ -852,7 +857,12 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     status["mode"] = g_currentMode;
     status["power"] = g_activeMode->lora_power_dbm;
     status["sleep"] = g_activeMode->sleep_interval_s;
-    status["msg_id"] = g_msgCounter;
+    status["msg_id"] = g_msgCounter; // our own message counter (NOT the request's)
+    // V3.2.3: echo the requesting command's msg_id under a SEPARATE key
+    // so the receiver can pair this response to the right queued get_status
+    // command. `msg_id` above is the collar's outbound counter — different
+    // ID space — so we need a dedicated field for round-trip pairing.
+    if (doc["msg_id"].is<uint32_t>()) status["req_msg_id"] = doc["msg_id"].as<uint32_t>();
     status["gps_warm"] = g_gpsWarmedUp;
     status["home_cycles"] = g_homeBeaconCycles;
     status["home_rssi_threshold"] = HOME_RSSI_THRESHOLD_DBM; // for tuning visibility
