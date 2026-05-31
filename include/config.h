@@ -40,7 +40,7 @@
 #define BLE_INITIAL_SCAN_S 10 // Initial BLE scan on wake
 #define BLE_SCAN_WINDOW_S 3   // BLE scan window during GPS
 #define BEACON_NAME "Home"    // BLE beacon device name (case-sensitive match!)
-#define HOME_SLEEP_CYCLES 5   // Cycles at home before "BLEHome" TX
+// HOME_SLEEP_CYCLES removed — now per-mode via OperatingMode.home_heartbeat_cycles
 
 // V3: RSSI gate for the "Home" beacon. The beacon advertises at -12 dBm and
 // the collar only counts it as "home" when received signal is >= this value.
@@ -62,6 +62,7 @@ struct OperatingMode
     uint8_t led_flash_count;         // LED flashes per TX success
     bool led_beacon_mode;            // Continuous LED beacon while awake
     uint16_t led_beacon_interval_ms; // Interval between beacon flashes
+    uint8_t home_heartbeat_cycles;   // Home cycles before GPS heartbeat TX
 };
 
 // ─────────────────────────────────────────────
@@ -75,7 +76,8 @@ const OperatingMode MODE_NORMAL = {
     .sleep_interval_s = 300, // 5 minutes (will become 10 min in production)
     .led_flash_count = 5,
     .led_beacon_mode = false,
-    .led_beacon_interval_ms = 0};
+    .led_beacon_interval_ms = 0,
+    .home_heartbeat_cycles = 10};
 
 // POWERSAVE - Maximum battery life at home
 const OperatingMode MODE_POWERSAVE = {
@@ -84,7 +86,8 @@ const OperatingMode MODE_POWERSAVE = {
     .sleep_interval_s = 1200, // 20 minutes
     .led_flash_count = 5,     // Keep standard flash (negligible power)
     .led_beacon_mode = false,
-    .led_beacon_interval_ms = 0};
+    .led_beacon_interval_ms = 0,
+    .home_heartbeat_cycles = 10};
 
 // ACTIVE - Frequent updates for monitoring
 const OperatingMode MODE_ACTIVE = {
@@ -93,7 +96,8 @@ const OperatingMode MODE_ACTIVE = {
     .sleep_interval_s = 60, // 1 minute
     .led_flash_count = 5,
     .led_beacon_mode = false,
-    .led_beacon_interval_ms = 0};
+    .led_beacon_interval_ms = 0,
+    .home_heartbeat_cycles = 5};
 
 // LOST - Emergency mode with visual beacon
 const OperatingMode MODE_LOST = {
@@ -102,7 +106,8 @@ const OperatingMode MODE_LOST = {
     .sleep_interval_s = 30,        // 30 seconds (still need battery conservation!)
     .led_flash_count = 10,         // More flashes on TX
     .led_beacon_mode = true,       // Enable continuous beacon
-    .led_beacon_interval_ms = 2000 // Flash every 2 seconds
+    .led_beacon_interval_ms = 2000, // Flash every 2 seconds
+    .home_heartbeat_cycles = 3
 };
 
 // DEVELOPER - Rapid cycle for testing and diagnostics
@@ -112,7 +117,8 @@ const OperatingMode MODE_DEVELOPER = {
     .sleep_interval_s = 60, // 1 minute cycle for fast iteration
     .led_flash_count = 3,   // Quick triple flash (visually distinct)
     .led_beacon_mode = false,
-    .led_beacon_interval_ms = 0};
+    .led_beacon_interval_ms = 0,
+    .home_heartbeat_cycles = 3};
 
 // ─────────────────────────────────────────────
 // Developer Mode Configuration
