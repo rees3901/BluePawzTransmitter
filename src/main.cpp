@@ -212,6 +212,84 @@ Preferences prefs;
 volatile bool rxFlag = false;
 
 // ─────────────────────────────────────────────
+// Non-blocking double-press button detection
+// ─────────────────────────────────────────────
+// State machine polled from active wait loops throughout the wake cycle.
+// Detects: press → release → press → release within DEV_MODE_DOUBLE_PRESS_MS.
+static enum { BTN_IDLE, BTN_WAIT_RELEASE1, BTN_WAIT_PRESS2, BTN_WAIT_RELEASE2 } g_btnState = BTN_IDLE;
+static uint32_t g_btnTimestamp = 0;
+
+static void pollButtonToggle()
+{
+  bool pressed = (digitalRead(DEV_MODE_BUTTON_PIN) == LOW);
+  uint32_t now = millis();
+
+  switch (g_btnState)
+  {
+  case BTN_IDLE:
+    if (pressed)
+    {
+      g_btnState = BTN_WAIT_RELEASE1;
+      g_btnTimestamp = now;
+    }
+    break;
+
+  case BTN_WAIT_RELEASE1:
+    if (!pressed)
+    {
+      g_btnState = BTN_WAIT_PRESS2;
+      g_btnTimestamp = now;
+    }
+    else if (now - g_btnTimestamp > 2000)
+    {
+      g_btnState = BTN_IDLE; // held too long, reset
+    }
+    break;
+
+  case BTN_WAIT_PRESS2:
+    if (pressed)
+    {
+      g_btnState = BTN_WAIT_RELEASE2;
+    }
+    else if (now - g_btnTimestamp > DEV_MODE_DOUBLE_PRESS_MS)
+    {
+      g_btnState = BTN_IDLE; // timed out waiting for second press
+    }
+    break;
+
+  case BTN_WAIT_RELEASE2:
+    if (!pressed)
+    {
+      // Double-press detected! Toggle developer mode.
+      if (isDevMode())
+      {
+        saveOperatingMode("normal");
+        g_activeMode = getModeByName("normal");
+        Serial.println("[BTN] *** Developer Mode OFF — switched to Normal ***");
+      }
+      else
+      {
+        saveOperatingMode("developer");
+        g_activeMode = getModeByName("developer");
+        Serial.println("[BTN] *** Developer Mode ON ***");
+      }
+
+      int flashes = isDevMode() ? 5 : 2;
+      for (int i = 0; i < flashes; i++)
+      {
+        digitalWrite(LED_PIN, HIGH);
+        delay(150);
+        digitalWrite(LED_PIN, LOW);
+        delay(150);
+      }
+
+      g_btnState = BTN_IDLE;
+    }
+    break;
+  }
+}
+
+// ─────────────────────────────────────────────
 // L76K GNSS LED control (proprietary binary commands)
 // ─────────────────────────────────────────────
 static const uint8_t L76K_LED_OFF[] = {
@@ -1046,51 +1124,8 @@ void setup()
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
 
-  // ── Hardware button: double-press USER (GPIO21) to toggle Developer Mode ──
-  // LED feedback: 2 flashes = Normal, 5 flashes = Developer
-  if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
-  {
-    // Wait for first press release
-    while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW) delay(10);
-
-    // Wait for second press within the window
-    uint32_t releaseTime = millis();
-    bool doublePress = false;
-    while (millis() - releaseTime < DEV_MODE_DOUBLE_PRESS_MS)
-    {
-      if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
-      {
-        doublePress = true;
-        while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW) delay(10); // wait for release
-        break;
-      }
-      delay(10);
-    }
-
-    if (doublePress)
-    {
-      if (isDevMode())
-      {
-        saveOperatingMode("normal");
-        Serial.println("[BOOT] *** Developer Mode OFF — switched to Normal ***");
-      }
-      else
-      {
-        saveOperatingMode("developer");
-        Serial.println("[BOOT] *** Developer Mode ON ***");
-      }
-    }
-
-    // LED feedback for current mode (after any toggle)
-    int flashes = isDevMode() ? 5 : 2;
-    for (int i = 0; i < flashes; i++)
-    {
-      digitalWrite(LED_PIN, HIGH);
-      delay(150);
-      digitalWrite(LED_PIN, LOW);
-      delay(150);
-    }
-  }
+  // Button state machine reset (polled continuously during wake cycle)
+  g_btnState = BTN_IDLE;
 
   // Initialize CSV logging (LittleFS)
   initCSVLogging();
@@ -1118,11 +1153,11 @@ void setup()
   {
     Serial.println("[BOOT]   *** DEVELOPER MODE ACTIVE ***");
     Serial.println("[BOOT]   Extra diagnostics in telemetry + serial");
-    Serial.println("[BOOT]   Double-press USER button to return to Normal");
+    Serial.println("[BOOT]   Double-press USER button anytime to return to Normal");
   }
   else
   {
-    Serial.println("[BOOT]   Double-press USER button to enter Developer Mode");
+    Serial.println("[BOOT]   Double-press USER button anytime to enter Developer Mode");
   }
   Serial.println("[BOOT] ────────────────────");
 
@@ -1215,6 +1250,7 @@ void loop()
                       POST_TX_EXTEND_MS);
         DEBUG_PRINTLN("[MAIN] RX extend");
       }
+      pollButtonToggle();
       vTaskDelay(pdMS_TO_TICKS(50));
     }
     Serial.printf("[MAIN] RX window closed after %lu ms\n",
@@ -1691,6 +1727,7 @@ void TaskPower(void *)
       // Don't break - continue scanning for LoRa commands
     }
 
+    pollButtonToggle();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
@@ -1825,6 +1862,8 @@ void TaskPower(void *)
       break;
     }
 
+    pollButtonToggle();
+
     // Check for GPS fix
     if (xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)) == pdTRUE)
     {
@@ -1907,6 +1946,7 @@ void TaskPower(void *)
           vTaskSuspend(nullptr);
           return;
         }
+        pollButtonToggle();
         vTaskDelay(pdMS_TO_TICKS(100));
       }
     }
