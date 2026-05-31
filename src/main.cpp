@@ -1672,7 +1672,7 @@ void TaskLoRa(void *)
 //  • New power-saving strategy:
 //    1) Wake → BLE scan 10s for 'Home' beacon
 //    2) If Home detected → sleep immediately (skip GPS/TX)
-//       - After 5 consecutive home cycles, transmit "BLEHome" status
+//       - After N home cycles (per mode), acquire GPS and TX "BLEHome" heartbeat
 //    3) If no Home → enable GPS, continue BLE scanning during GPS acquisition
 //       - If Home appears during GPS → abort TX and sleep
 //       - If no Home → transmit with GPS data and "roaming" status
@@ -1759,54 +1759,33 @@ void TaskPower(void *)
     homeDetectedInitial = false;
   }
 
+  bool homeHeartbeat = false; // Flag: this cycle is a home heartbeat with GPS
+
   if (homeDetectedInitial && !loraCommandReceived)
   {
+    uint8_t heartbeatThreshold = g_activeMode->home_heartbeat_cycles;
     g_homeBeaconCycles++;
-    Serial.printf("[POWER] At home (cycle %d/%d)\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
-    DEBUG_PRINTF("[POWER] Home cycle %d/%d\n", g_homeBeaconCycles, HOME_SLEEP_CYCLES);
+    Serial.printf("[POWER] At home (cycle %d/%d)\n", g_homeBeaconCycles, heartbeatThreshold);
+    DEBUG_PRINTF("[POWER] Home cycle %d/%d\n", g_homeBeaconCycles, heartbeatThreshold);
 
-    if (g_homeBeaconCycles >= HOME_SLEEP_CYCLES)
+    if (g_homeBeaconCycles >= heartbeatThreshold)
     {
-      // 5th cycle at home - transmit with "BLEHome" status
-      Serial.println("[POWER] 5th home cycle - transmitting 'BLEHome' status");
-      DEBUG_PRINTLN("[POWER] TX BLEHome");
-
-      StaticJsonDocument<320> doc;
-      doc["msg_id"] = g_msgCounter++;
-      doc["device_id"] = DEVICE_ID_INT;
-      doc["id"] = (const char *)g_senderName;
-      doc["status"] = "BLEHome";
-      doc["mode"] = g_currentMode;
-      if (isDevMode())
-      {
-        doc["heap"] = ESP.getFreeHeap();
-        doc["uptime_ms"] = millis();
-        doc["fw"] = FIRMWARE_VERSION;
-      }
-
-      TxReq req{};
-      serializeJson(doc, req.json, sizeof(req.json));
-      xQueueSend(txReqQ, &req, portMAX_DELAY);
-
-      // Reset counter for next home detection sequence
+      Serial.printf("[POWER] Heartbeat cycle — acquiring GPS for BLEHome location update\n");
+      DEBUG_PRINTLN("[POWER] Heartbeat GPS");
       g_homeBeaconCycles = 0;
-
-      // Wait for TX completion before sleep
-      Serial.println("[POWER] Waiting for TX completion...");
+      homeHeartbeat = true;
+      // Fall through to Phase 3 (GPS acquisition) with BLEHome status
     }
     else
     {
-      // Cycles 1-4: skip GPS and TX, go straight to sleep
       Serial.println("[POWER] Skipping GPS/TX, going to sleep");
       DEBUG_PRINTLN("[POWER] Sleep (home)");
 
-      // Signal sleep without TX
       xEventGroupSetBits(evBits, EV_TXDONE);
-    }
 
-    // Task done - will be deleted by main loop
-    vTaskSuspend(nullptr);
-    return;
+      vTaskSuspend(nullptr);
+      return;
+    }
   }
 
   // ─────────────────────────────────────────────
@@ -1816,7 +1795,7 @@ void TaskPower(void *)
   DEBUG_PRINTLN("[POWER] GPS start");
 
   // Reset home beacon counter (device has left home)
-  if (g_homeBeaconCycles > 0)
+  if (!homeHeartbeat && g_homeBeaconCycles > 0)
   {
     Serial.printf("[POWER] Leaving home (was at home for %d cycles)\n", g_homeBeaconCycles);
     DEBUG_PRINTLN("[POWER] Left home");
@@ -1852,8 +1831,8 @@ void TaskPower(void *)
     }
 
     // Check if home beacon appeared during GPS acquisition
-    // (skip on first boot — we must TX regardless so base station sees us)
-    if (!g_firstBoot && (bits & EV_HOME))
+    // (skip on first boot or heartbeat cycle — we must TX regardless)
+    if (!g_firstBoot && !homeHeartbeat && (bits & EV_HOME))
     {
       homeDetectedDuringGPS = true;
       Serial.printf("[POWER] Home beacon appeared during GPS (after %d ms) - aborting TX\n",
@@ -1937,7 +1916,7 @@ void TaskPower(void *)
       while (millis() - stabilizeStart < GPS_STABILISE_MS)
       {
         EventBits_t bits = xEventGroupGetBits(evBits);
-        if (!g_firstBoot && (bits & EV_HOME))
+        if (!g_firstBoot && !homeHeartbeat && (bits & EV_HOME))
         {
           Serial.println("[POWER] Home beacon detected during stabilization - aborting TX");
           DEBUG_PRINTLN("[POWER] Home in stabilize - abort");
@@ -1958,7 +1937,7 @@ void TaskPower(void *)
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = (const char *)g_senderName;
-    doc["status"] = "roaming";
+    doc["status"] = homeHeartbeat ? "BLEHome" : "roaming";
     doc["mode"] = g_currentMode;
     doc["lat"] = fix.lat;
     doc["lon"] = fix.lon;
