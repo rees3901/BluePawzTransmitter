@@ -211,6 +211,8 @@ Preferences prefs;
 // LoRa RX interrupt flag
 volatile bool rxFlag = false;
 
+static void saveOperatingMode(const char *modeName);
+
 // ─────────────────────────────────────────────
 // Non-blocking double-press button detection
 // ─────────────────────────────────────────────
@@ -1210,7 +1212,7 @@ void setup()
 // Post-TX RX window: how long to keep TaskLoRa alive after telemetry has gone
 // out, so the receiver can opportunistically push queued commands now that it
 // knows the collar is awake. Class-A LoRaWAN-style pattern.
-#define POST_TX_LISTEN_MS 5000U  // Base window
+#define POST_TX_LISTEN_MS 20000U // Base window
 #define POST_TX_EXTEND_MS 3000U  // Extension per command received (so bursts land)
 
 void loop()
