@@ -176,7 +176,7 @@ static EventGroupHandle_t evBits; // state flags
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
 RTC_DATA_ATTR bool g_gpsWarmedUp = false;        // Tracks if GPS has achieved initial lock
 RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0;    // Count consecutive cycles at home (BLE detected)
-RTC_DATA_ATTR char g_currentMode[16] = "normal"; // Current operating mode name
+RTC_DATA_ATTR char g_currentMode[16] = "developer"; // Current operating mode name
 // V3 fix: previously stored a millis()-based timestamp ("g_lostModeStartTime"),
 // but millis() resets every deep-sleep wake, so the 2-hour timeout never fired
 // correctly. Track total seconds in lost mode by ACCUMULATING across wakes
@@ -203,7 +203,7 @@ static inline bool isDevMode()
 }
 
 // Current active mode (loaded from NVS/RTC on boot)
-const OperatingMode *g_activeMode = &MODE_NORMAL;
+const OperatingMode *g_activeMode = &MODE_DEVELOPER;
 
 // NVS backup for msg counter (Flash memory - survives any reset including USB resets)
 Preferences prefs;
@@ -350,7 +350,7 @@ void IRAM_ATTR setRxFlag(void)
 static void loadOperatingMode()
 {
   prefs.begin("cattracker", true); // Read-only
-  String modeName = prefs.getString("op_mode", "normal");
+  String modeName = prefs.getString("op_mode", "developer");
   prefs.end();
 
   // Update RTC-backed mode name
