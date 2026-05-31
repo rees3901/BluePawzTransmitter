@@ -408,7 +408,7 @@ static void checkLostModeTimeout()
     // Silent revert. We do NOT send a special "alert" packet — the previous
     // version did, but that packet had no `status` field, so the receiver's
     // JSON normaliser tagged it "Error" and the cat dropped off the map.
-    // The next routine telemetry packet (with status "outanabout" or similar
+    // The next routine telemetry packet (with status "roaming" or similar
     // and now mode="active") tells the receiver everything it needs to know.
     saveOperatingMode(LOST_MODE_FALLBACK_MODE);
     g_lostModeAccumS = 0;
@@ -1677,7 +1677,7 @@ void TaskLoRa(void *)
 //       - After 5 consecutive home cycles, transmit "BLEHome" status
 //    3) If no Home → enable GPS, continue BLE scanning during GPS acquisition
 //       - If Home appears during GPS → abort TX and sleep
-//       - If no Home → transmit with GPS data and "outanabout" status
+//       - If no Home → transmit with GPS data and "roaming" status
 // ─────────────────────────────────────────────
 void TaskPower(void *)
 {
@@ -1960,7 +1960,7 @@ void TaskPower(void *)
     doc["msg_id"] = g_msgCounter++;
     doc["device_id"] = DEVICE_ID_INT;
     doc["id"] = (const char *)g_senderName;
-    doc["status"] = "outanabout";
+    doc["status"] = "roaming";
     doc["mode"] = g_currentMode;
     doc["lat"] = fix.lat;
     doc["lon"] = fix.lon;
