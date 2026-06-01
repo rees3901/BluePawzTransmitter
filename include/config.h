@@ -15,11 +15,32 @@
 // These must match between ALL devices to maintain communication
 // Changing these requires physical reprogramming of all nodes
 
-#define LORA_FREQ_MHZ 915.0 // US 915MHz (EU: 868.0)
-#define LORA_SF 8           // Spreading Factor (7-12)
-#define LORA_BW_KHZ 250.0   // Bandwidth (kHz)
-#define LORA_CR 5           // Coding Rate 4/5
-#define LORA_PREAMBLE 16    // Preamble length
+// V3.3.0 range-tuning. SF8/BW250 → SF9/BW125 trades raw data-rate for
+// link budget: SF8→SF9 ≈ +2.5 dB RX sensitivity, BW250→BW125 ≈ +3 dB
+// (noise floor halves). Combined ≈ +5.5 dB, roughly 1.5–2× range in
+// free space (more through clutter). Cost is ~4× airtime per packet
+// (a ~120-byte telemetry frame goes from ~50 ms to ~700 ms on air) —
+// fine for our slow telemetry cadence, but see the EU duty-cycle note.
+//
+// Frequency 868.0 MHz = EU/UK ISM band (was 915 = US). REGULATORY FYI:
+//   • 868.0–868.6 MHz: +14 dBm (25 mW) ERP max, ≤1% duty cycle.
+//   • 869.4–869.65 MHz: +27 dBm (500 mW) ERP, 10% duty cycle — the
+//     high-power sub-band. If you want max power *legally*, retune to
+//     ~869.525 here. The SX1262 caps at +22 dBm regardless.
+//   Our normal(17)/lost(22) dBm levels exceed the 868.0 +14 dBm limit,
+//   and lost mode's 30 s cadence at ~0.7 s airtime ≈ 2% duty (over the
+//   1% limit on this sub-band). Acceptable for a lost-pet emergency
+//   beacon, but switch to the 869.4–869.65 sub-band if you want to be
+//   fully compliant at high power/duty.
+//
+// These MUST match on ALL nodes (freq, SF, BW, sync word, CRC, header
+// mode, preamble). CR is carried in the explicit header so RX auto-
+// detects it, but we keep it aligned for clarity.
+#define LORA_FREQ_MHZ 868.0 // EU/UK 868MHz ISM (was 915 = US)
+#define LORA_SF 9           // Spreading Factor (7-12). 9 = range/airtime balance
+#define LORA_BW_KHZ 125.0   // Bandwidth (kHz). 125 narrows noise floor for +3dB
+#define LORA_CR 5           // Coding Rate 4/5 (auto-detected by RX via header)
+#define LORA_PREAMBLE 16    // Preamble length (base RX is always-on, 16 is ample)
 #define LORA_USE_CRC 1      // Enable CRC
 #define LORA_SYNC_WORD 0x12 // Private network sync word
 
@@ -70,9 +91,14 @@ struct OperatingMode
 // ─────────────────────────────────────────────
 
 // NORMAL - Daily tracking, balanced performance
+// V3.3.0: 19 → 17 dBm. With the SF9/BW125 PHY change adding ~+5.5 dB of
+// link budget, 17 dBm here still beats the OLD 19 dBm @ SF8/BW250 by
+// ~+3.5 dB net — so everyday range IMPROVES while leaving a 5 dB power
+// headroom that only emergency 'lost' mode unlocks (22 dBm). Holding
+// normal below max also runs the PA cooler and saves battery per TX.
 const OperatingMode MODE_NORMAL = {
     .name = "normal",
-    .lora_power_dbm = 19,    // Good range, not max power
+    .lora_power_dbm = 17,    // Range headroom reserved for lost mode (was 19)
     .sleep_interval_s = 300, // 5 minutes (will become 10 min in production)
     .led_flash_count = 5,
     .led_beacon_mode = false,
@@ -92,7 +118,7 @@ const OperatingMode MODE_POWERSAVE = {
 // ACTIVE - Frequent updates for monitoring
 const OperatingMode MODE_ACTIVE = {
     .name = "active",
-    .lora_power_dbm = 19,   // Same as normal
+    .lora_power_dbm = 17,   // Match normal; headroom reserved for lost (was 19)
     .sleep_interval_s = 60, // 1 minute
     .led_flash_count = 5,
     .led_beacon_mode = false,
@@ -111,9 +137,14 @@ const OperatingMode MODE_LOST = {
 };
 
 // DEVELOPER - Rapid cycle for testing and diagnostics
+// V3.3.0: 19 → 14 dBm. Deliberately the lowest of the awake modes so
+// bench/field testing happens with a real power margin still in hand —
+// if the link holds at 14 dBm it'll be rock-solid once deployed at 17,
+// and lost mode's 22 dBm is a full 8 dB above. Bump this back to 17 to
+// match 'normal' if you specifically want representative-range testing.
 const OperatingMode MODE_DEVELOPER = {
     .name = "developer",
-    .lora_power_dbm = 19,   // Normal power for realistic link testing
+    .lora_power_dbm = 14,   // Lowest awake power — proves the margin (was 19)
     .sleep_interval_s = 60, // 1 minute cycle for fast iteration
     .led_flash_count = 3,   // Quick triple flash (visually distinct)
     .led_beacon_mode = false,
