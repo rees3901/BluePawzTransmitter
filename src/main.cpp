@@ -692,7 +692,7 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
   char temp[200];
   snprintf(temp, sizeof(temp), "%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
            doc["msg_id"] | 0,
-           doc["id"] | (const char *)g_senderName,
+           doc["name"] | (const char *)g_senderName,
            g_currentMode,
            doc["status"] | "unknown",
            doc["lat"] | 0.0,
@@ -763,39 +763,27 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     return false;
   }
 
-  // V3 device targeting: ignore commands not addressed to this collar.
-  // Accepted forms:
-  //   "device":"<current name>"  -> only this collar acts
-  //   "device":"broadcast"       -> every collar acts
-  //   "device_id":<DEVICE_ID_INT> -> match by immutable numeric id (useful
-  //                                 when the current name is unknown, e.g.
-  //                                 right after a flash, or for set_name)
-  //   (missing "device" + "device_id") -> accepted for legacy clients, logged
-  bool targeted = false, matched = false;
-  if (doc["device_id"].is<int>())
+  // V3.6.0 device targeting: commands are addressed STRICTLY by the
+  // immutable numeric device_id (UID). Friendly names are never used for
+  // routing. Accepted forms:
+  //   "device_id":<DEVICE_ID_INT>  -> only this collar acts
+  //   "device_id":65535            -> broadcast: every collar acts
+  // A command with no device_id is rejected (no more legacy name match).
+  const uint16_t BROADCAST_ID = 65535;
+  if (!doc["device_id"].is<int>())
   {
-    targeted = true;
-    if (doc["device_id"].as<int>() == DEVICE_ID_INT) matched = true;
-  }
-  if (doc["device"].is<const char *>())
-  {
-    targeted = true;
-    const char *target = doc["device"];
-    if (strcmp(target, g_senderName) == 0 || strcmp(target, "broadcast") == 0)
-    {
-      matched = true;
-    }
-  }
-  if (targeted && !matched)
-  {
-    Serial.printf("[RX] Command not for me (I am '%s' id=%d); ignoring\n",
-                  g_senderName, DEVICE_ID_INT);
-    DEBUG_PRINTF("[RX] Not for me\n");
+    Serial.println("[RX] Command has no device_id — rejecting (V3.6.0 requires UID targeting)");
+    DEBUG_PRINTLN("[RX] No device_id");
     return false;
   }
-  if (!targeted)
   {
-    Serial.println("[RX] No device/device_id field on command — accepting (legacy client)");
+    int tgt = doc["device_id"].as<int>();
+    if (tgt != DEVICE_ID_INT && tgt != (int)BROADCAST_ID)
+    {
+      Serial.printf("[RX] Command for UID %d, I am %d; ignoring\n", tgt, DEVICE_ID_INT);
+      DEBUG_PRINTF("[RX] Not for me\n");
+      return false;
+    }
   }
 
   const char *cmd = doc["cmd"];
@@ -844,7 +832,8 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     ack["profile"] = profile;
     ack["power"] = newMode->lora_power_dbm;
     ack["sleep"] = newMode->sleep_interval_s;
-    ack["device"] = (const char *)g_senderName;
+    ack["device_id"] = DEVICE_ID_INT;            // UID (identity)
+    ack["name"] = (const char *)g_senderName;     // editable label
     if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
 
     TxReq req{};
@@ -866,7 +855,8 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     StaticJsonDocument<448> status;
     status["status"] = "ok";
     status["fw"] = FIRMWARE_VERSION;
-    status["device"] = (const char *)g_senderName;
+    status["device_id"] = DEVICE_ID_INT;          // UID (identity)
+    status["name"] = (const char *)g_senderName;   // editable label
     status["mode"] = g_currentMode;
     status["power"] = g_activeMode->lora_power_dbm;
     status["sleep"] = g_activeMode->sleep_interval_s;
@@ -909,8 +899,8 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
   {
     StaticJsonDocument<128> pong;
     pong["pong"] = true;
-    pong["device"] = (const char *)g_senderName;
-    pong["device_id"] = DEVICE_ID_INT;
+    pong["device_id"] = DEVICE_ID_INT;            // UID (identity)
+    pong["name"] = (const char *)g_senderName;     // editable label
     pong["rssi"] = rxRssi;
     pong["snr"] = rxSnr;
     pong["uptime_ms"] = millis();
@@ -952,7 +942,7 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
       ack["ack"] = "set_name";
       ack["ok"] = false;
       ack["device_id"] = DEVICE_ID_INT;
-      ack["device"] = (const char *)g_senderName; // current (unchanged) name
+      ack["name"] = (const char *)g_senderName; // current (unchanged) label
       if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
       TxReq req{};
       serializeJson(ack, req.json, sizeof(req.json));
@@ -967,9 +957,8 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     StaticJsonDocument<192> ack;
     ack["ack"] = "set_name";
     ack["ok"] = true;
-    ack["device_id"] = DEVICE_ID_INT;
-    ack["device"] = (const char *)g_senderName;
-    ack["id"] = (const char *)g_senderName; // also include "id" so receiver's JSON path picks it up
+    ack["device_id"] = DEVICE_ID_INT;        // UID (identity)
+    ack["name"] = (const char *)g_senderName; // the new editable label
     if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
     TxReq req{};
     serializeJson(ack, req.json, sizeof(req.json));
@@ -984,8 +973,8 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     bool enabled = doc["enabled"] | true; // default true if field missing
     StaticJsonDocument<256> ack;
     ack["ack"] = "set_geofence";
-    ack["device"] = (const char *)g_senderName;
-    ack["device_id"] = DEVICE_ID_INT;
+    ack["device_id"] = DEVICE_ID_INT;            // UID (identity)
+    ack["name"] = (const char *)g_senderName;     // editable label
     if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
 
     if (!enabled)
@@ -1963,8 +1952,10 @@ void TaskPower(void *)
     // Build full JSON with GPS data
     StaticJsonDocument<384> doc;
     doc["msg_id"] = g_msgCounter++;
+    // V3.6.0 field model: device_id = immutable UID (identity); name =
+    // editable friendly label. The legacy ambiguous "id" field is gone.
     doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = (const char *)g_senderName;
+    doc["name"] = (const char *)g_senderName;
     doc["status"] = homeHeartbeat ? "BLEHome" : "roaming";
     doc["mode"] = g_currentMode;
     doc["lat"] = fix.lat;
@@ -2011,8 +2002,8 @@ void TaskPower(void *)
     // GPS timeout - send invalid status (still TX so base station sees us)
     StaticJsonDocument<320> doc;
     doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT;
-    doc["id"] = (const char *)g_senderName;
+    doc["device_id"] = DEVICE_ID_INT; // immutable UID
+    doc["name"] = (const char *)g_senderName; // editable label
     doc["status"] = "invalidGPSLoc";
     doc["mode"] = g_currentMode;
     if (g_firstBoot)
