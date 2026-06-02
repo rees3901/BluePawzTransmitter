@@ -1083,6 +1083,7 @@ void setup()
   // Release GPIO hold from deep sleep
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)GPS_EN);
+  gpio_hold_dis((gpio_num_t)GPS_TX);
   gpio_hold_dis((gpio_num_t)LORA_NSS);
   gpio_hold_dis((gpio_num_t)LORA_RST);
 
@@ -1331,19 +1332,29 @@ void loop()
     lora.sleep();
     Serial.println("[SLEEP] SX1262 radio sleeping");
 
-    // Turn off L76K LED before sleep (it stays solid-on otherwise)
+    // Turn off L76K LED before sleep
+    // Send the command twice with generous delays — the L76K needs time
+    // to process the proprietary binary frame at 9600 baud.
     gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-    delay(50); // Give UART time to flush the command
-    Serial.println("[SLEEP] L76K LED off");
+    delay(200);
+    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+    delay(200);
+    Serial.println("[SLEEP] L76K LED off command sent");
     DEBUG_PRINTLN("[SLEEP] L76K LED off");
 
-    // Power off GPS completely
+    // Power off GPS module
     digitalWrite(GPS_EN, LOW);
     Serial.println("[SLEEP] GPS power disabled");
 
     // End GPS serial to release pins
     gpsSerial.end();
-    Serial.println("[SLEEP] GPS UART closed");
+
+    // Hold UART TX pin LOW during sleep — prevents floating pin from
+    // backfeeding current through L76K ESD diodes and lighting the LED
+    pinMode(GPS_TX, OUTPUT);
+    digitalWrite(GPS_TX, LOW);
+
+    Serial.println("[SLEEP] GPS UART closed, TX held LOW");
 
     // Save persistent state to NVS before sleep (survives USB resets)
     prefs.begin("cattracker", false);
@@ -1353,6 +1364,7 @@ void loop()
 
     // Hold GPIO states during deep sleep
     gpio_hold_en((gpio_num_t)GPS_EN);       // Keep GPS_EN LOW (GPS off)
+    gpio_hold_en((gpio_num_t)GPS_TX);       // Keep UART TX LOW (no backfeed to L76K)
     gpio_hold_en((gpio_num_t)LORA_NSS);     // Keep NSS HIGH (SX1262 deselected)
     gpio_hold_en((gpio_num_t)LORA_RST);     // Keep RST HIGH (SX1262 not in reset)
     gpio_deep_sleep_hold_en();
