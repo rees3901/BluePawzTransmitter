@@ -579,16 +579,21 @@ static const char *checkGeofence(double lat, double lon)
 // CSV Logging Functions
 // ─────────────────────────────────────────────
 
+static bool g_csvReady = false;
+
 // Initialize LittleFS and create CSV header if needed
 static bool initCSVLogging()
 {
 #if CSV_LOG_ENABLED
   if (!LittleFS.begin(true))
   {
-    Serial.println("[CSV] LittleFS mount failed!");
+    Serial.println("[CSV] LittleFS mount failed — run 'pio run -t erase' once to flash partition table");
     DEBUG_PRINTLN("[CSV] Mount failed");
+    g_csvReady = false;
     return false;
   }
+
+  g_csvReady = true;
 
   Serial.printf("[CSV] LittleFS mounted - Total: %d KB, Used: %d KB\n",
                 LittleFS.totalBytes() / 1024, LittleFS.usedBytes() / 1024);
@@ -655,6 +660,8 @@ static bool initCSVLogging()
 static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0)
 {
 #if CSV_LOG_ENABLED
+  if (!g_csvReady) return;
+
   // Parse the JSON to extract fields
   StaticJsonDocument<320> doc;
   DeserializationError error = deserializeJson(doc, json);
@@ -720,6 +727,12 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
 static void getCSVLogInfo(char *info, size_t maxLen)
 {
 #if CSV_LOG_ENABLED
+  if (!g_csvReady)
+  {
+    snprintf(info, maxLen, "FS not mounted");
+    return;
+  }
+
   if (!LittleFS.exists(CSV_LOG_FILE))
   {
     snprintf(info, maxLen, "No log file");
