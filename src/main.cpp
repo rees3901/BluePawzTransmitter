@@ -579,16 +579,21 @@ static const char *checkGeofence(double lat, double lon)
 // CSV Logging Functions
 // ─────────────────────────────────────────────
 
+static bool g_csvReady = false;
+
 // Initialize LittleFS and create CSV header if needed
 static bool initCSVLogging()
 {
 #if CSV_LOG_ENABLED
   if (!LittleFS.begin(true))
   {
-    Serial.println("[CSV] LittleFS mount failed!");
+    Serial.println("[CSV] LittleFS mount failed — run 'pio run -t erase' once to flash partition table");
     DEBUG_PRINTLN("[CSV] Mount failed");
+    g_csvReady = false;
     return false;
   }
+
+  g_csvReady = true;
 
   Serial.printf("[CSV] LittleFS mounted - Total: %d KB, Used: %d KB\n",
                 LittleFS.totalBytes() / 1024, LittleFS.usedBytes() / 1024);
@@ -655,6 +660,8 @@ static bool initCSVLogging()
 static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0)
 {
 #if CSV_LOG_ENABLED
+  if (!g_csvReady) return;
+
   // Parse the JSON to extract fields
   StaticJsonDocument<320> doc;
   DeserializationError error = deserializeJson(doc, json);
@@ -720,6 +727,12 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
 static void getCSVLogInfo(char *info, size_t maxLen)
 {
 #if CSV_LOG_ENABLED
+  if (!g_csvReady)
+  {
+    snprintf(info, maxLen, "FS not mounted");
+    return;
+  }
+
   if (!LittleFS.exists(CSV_LOG_FILE))
   {
     snprintf(info, maxLen, "No log file");
@@ -1059,6 +1072,9 @@ void setup()
   // Release GPIO hold from deep sleep
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)GPS_EN);
+  gpio_hold_dis((gpio_num_t)GPS_TX);
+  gpio_hold_dis((gpio_num_t)LORA_NSS);
+  gpio_hold_dis((gpio_num_t)LORA_RST);
 
   Serial.begin(115200);
   delay(100); // Give serial time to initialize
@@ -1301,19 +1317,33 @@ void loop()
     // Deinitialize BLE to save power
     BLEDevice::deinit(true);
 
-    // Turn off L76K LED before sleep (it stays solid-on otherwise)
+    // Put SX1262 into sleep mode (~0.2 µA vs ~4.5 mA in RX)
+    lora.sleep();
+    Serial.println("[SLEEP] SX1262 radio sleeping");
+
+    // Turn off L76K LED before sleep
+    // Send the command twice with generous delays — the L76K needs time
+    // to process the proprietary binary frame at 9600 baud.
     gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-    delay(50); // Give UART time to flush the command
-    Serial.println("[SLEEP] L76K LED off");
+    delay(200);
+    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+    delay(200);
+    Serial.println("[SLEEP] L76K LED off command sent");
     DEBUG_PRINTLN("[SLEEP] L76K LED off");
 
-    // Power off GPS completely
+    // Power off GPS module
     digitalWrite(GPS_EN, LOW);
     Serial.println("[SLEEP] GPS power disabled");
 
     // End GPS serial to release pins
     gpsSerial.end();
-    Serial.println("[SLEEP] GPS UART closed");
+
+    // Hold UART TX pin LOW during sleep — prevents floating pin from
+    // backfeeding current through L76K ESD diodes and lighting the LED
+    pinMode(GPS_TX, OUTPUT);
+    digitalWrite(GPS_TX, LOW);
+
+    Serial.println("[SLEEP] GPS UART closed, TX held LOW");
 
     // Save persistent state to NVS before sleep (survives USB resets)
     prefs.begin("cattracker", false);
@@ -1321,8 +1351,11 @@ void loop()
     prefs.putUChar("home_cycles", g_homeBeaconCycles);
     prefs.end();
 
-    // Hold GPIO states during deep sleep (keeps GPS_EN LOW)
-    gpio_hold_en((gpio_num_t)GPS_EN);
+    // Hold GPIO states during deep sleep
+    gpio_hold_en((gpio_num_t)GPS_EN);       // Keep GPS_EN LOW (GPS off)
+    gpio_hold_en((gpio_num_t)GPS_TX);       // Keep UART TX LOW (no backfeed to L76K)
+    gpio_hold_en((gpio_num_t)LORA_NSS);     // Keep NSS HIGH (SX1262 deselected)
+    gpio_hold_en((gpio_num_t)LORA_RST);     // Keep RST HIGH (SX1262 not in reset)
     gpio_deep_sleep_hold_en();
 
     // Get sleep interval from active mode
