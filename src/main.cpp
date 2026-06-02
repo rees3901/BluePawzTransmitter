@@ -1083,6 +1083,8 @@ void setup()
   // Release GPIO hold from deep sleep
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)GPS_EN);
+  gpio_hold_dis((gpio_num_t)LORA_NSS);
+  gpio_hold_dis((gpio_num_t)LORA_RST);
 
   Serial.begin(115200);
   delay(100); // Give serial time to initialize
@@ -1325,6 +1327,10 @@ void loop()
     // Deinitialize BLE to save power
     BLEDevice::deinit(true);
 
+    // Put SX1262 into sleep mode (~0.2 µA vs ~4.5 mA in RX)
+    lora.sleep();
+    Serial.println("[SLEEP] SX1262 radio sleeping");
+
     // Turn off L76K LED before sleep (it stays solid-on otherwise)
     gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
     delay(50); // Give UART time to flush the command
@@ -1345,8 +1351,10 @@ void loop()
     prefs.putUChar("home_cycles", g_homeBeaconCycles);
     prefs.end();
 
-    // Hold GPIO states during deep sleep (keeps GPS_EN LOW)
-    gpio_hold_en((gpio_num_t)GPS_EN);
+    // Hold GPIO states during deep sleep
+    gpio_hold_en((gpio_num_t)GPS_EN);       // Keep GPS_EN LOW (GPS off)
+    gpio_hold_en((gpio_num_t)LORA_NSS);     // Keep NSS HIGH (SX1262 deselected)
+    gpio_hold_en((gpio_num_t)LORA_RST);     // Keep RST HIGH (SX1262 not in reset)
     gpio_deep_sleep_hold_en();
 
     // Get sleep interval from active mode
