@@ -66,14 +66,15 @@ static void initDeviceId()
 
 // SENDER_NAME_MAX_LEN is defined in name_store.h (shared with the sandbox).
 #include "name_store.h"
+#include "cmd_inbound.h" // shared, host-tested inbound-command core (parse/target/ping/set_name)
 static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
 
 // V3.6.5: the name load/save/validate LOGIC now lives in the shared,
 // hardware-independent name_store.{h,cpp}, so the EXACT code that flashes to
 // the collar also compiles + runs in the native sandbox harness. Here we
 // just provide the ESP32 backing store (Preferences/NVS) behind the INvs
-// interface and keep loadSenderName()/saveSenderName() as thin adapters, so
-// all the existing g_senderName call sites are unchanged.
+// interface. g_nvs is shared by loadSenderName() and the inbound-command core
+// (cmd_inbound.cpp), which persists renames via bpSaveSenderName() directly.
 struct PrefsNvs : INvs
 {
   bool nvsGetString(const char *key, char *out, size_t outsz) override
@@ -108,12 +109,6 @@ static PrefsNvs g_nvs;
 static void loadSenderName()
 {
   bpLoadSenderName(g_senderName, sizeof(g_senderName), DEVICE_ID_INT, g_nvs);
-}
-
-// Validate + persist a new friendly name. Returns true on success.
-static bool saveSenderName(const char *newName)
-{
-  return bpSaveSenderName(newName, g_senderName, sizeof(g_senderName), g_nvs);
 }
 
 // Debug serial on spare pin (for battery operation monitoring)
@@ -775,45 +770,78 @@ static void getCSVLogInfo(char *info, size_t maxLen)
 // Parse and handle mode change command from base station
 static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr = 0.0)
 {
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, json);
-
-  if (error)
+  // ── Shared, host-tested inbound core (cmd_inbound.cpp) ───────────────────
+  // The native harness (BluePawzSim/native) compiles this SAME translation
+  // unit, so the parse → UID-targeting → ping → set_name paths are verified
+  // off-device against the exact code that flashes. mode / get_status /
+  // set_geofence are NOT owned by the core (they mutate operating-mode and
+  // geofence state); the core returns BP_OTHER and we dispatch them inline
+  // below after a local re-parse.
+  char coreAck[256];
+  BpInboundCtx ctx{DEVICE_ID_INT, g_senderName, sizeof(g_senderName),
+                   &g_nvs, rxRssi, rxSnr, (unsigned long)millis()};
+  BpInboundResult ir = bpHandleInbound(json, ctx, coreAck, sizeof(coreAck));
+  switch (ir.kind)
   {
-    Serial.printf("[RX] JSON parse error: %s\n", error.c_str());
+  case BP_PARSE_ERROR:
+    Serial.println("[RX] JSON parse error");
     DEBUG_PRINTLN("[RX] Parse error");
     return false;
-  }
-
-  // V3.6.0 device targeting: commands are addressed STRICTLY by the
-  // immutable numeric device_id (UID). Friendly names are never used for
-  // routing. Accepted forms:
-  //   "device_id":<DEVICE_ID_INT>  -> only this collar acts
-  //   "device_id":65535            -> broadcast: every collar acts
-  // A command with no device_id is rejected (no more legacy name match).
-  const uint16_t BROADCAST_ID = 65535;
-  if (!doc["device_id"].is<int>())
-  {
+  case BP_NO_DEVICE_ID:
     Serial.println("[RX] Command has no device_id — rejecting (V3.6.0 requires UID targeting)");
     DEBUG_PRINTLN("[RX] No device_id");
     return false;
-  }
-  {
-    int tgt = doc["device_id"].as<int>();
-    if (tgt != DEVICE_ID_INT && tgt != (int)BROADCAST_ID)
-    {
-      Serial.printf("[RX] Command for UID %d, I am %d; ignoring\n", tgt, DEVICE_ID_INT);
-      DEBUG_PRINTF("[RX] Not for me\n");
-      return false;
-    }
-  }
-
-  const char *cmd = doc["cmd"];
-  if (!cmd)
-  {
+  case BP_NOT_FOR_ME:
+    Serial.printf("[RX] Command for UID %d, I am %d; ignoring\n", ir.targetId, DEVICE_ID_INT);
+    DEBUG_PRINTF("[RX] Not for me\n");
+    return false;
+  case BP_NO_CMD:
     Serial.println("[RX] Missing 'cmd' field");
     return false;
+  case BP_PING:
+  {
+    TxReq req{};
+    strncpy(req.json, coreAck, sizeof(req.json) - 1);
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+    Serial.printf("[RX] Ping — pong queued (RSSI %d, SNR %.1f)\n", rxRssi, rxSnr);
+    DEBUG_PRINTLN("[RX] Pong");
+    return true;
   }
+  case BP_SET_NAME_OK:
+  {
+    TxReq req{};
+    strncpy(req.json, coreAck, sizeof(req.json) - 1);
+    xQueueSend(txReqQ, &req, portMAX_DELAY);
+    Serial.printf("[RX] Name changed to '%s' (device_id=%d)\n", g_senderName, DEVICE_ID_INT);
+    DEBUG_PRINTF("[RX] name -> %s\n", g_senderName);
+    return true;
+  }
+  case BP_SET_NAME_BAD:
+  {
+    // Invalid name → ACK ok:false was built; missing/loose name → no ACK.
+    if (coreAck[0] != '\0')
+    {
+      TxReq req{};
+      strncpy(req.json, coreAck, sizeof(req.json) - 1);
+      xQueueSend(txReqQ, &req, portMAX_DELAY);
+    }
+    Serial.println("[RX] set_name rejected (invalid or missing name)");
+    DEBUG_PRINTLN("[RX] set_name bad");
+    return false;
+  }
+  case BP_OTHER:
+    break; // fall through to mode / get_status / set_geofence
+  }
+
+  // ── mode / get_status / set_geofence only ────────────────────────────────
+  // The core already validated JSON + targeting; re-parse locally to dispatch
+  // these state-mutating commands from the firmware (cheap, infrequent).
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, json))
+    return false;
+  const char *cmd = doc["cmd"];
+  if (!cmd)
+    return false;
 
   // Handle mode change command
   if (strcmp(cmd, "mode") == 0)
@@ -916,78 +944,8 @@ static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr 
     return true;
   }
 
-  // Lightweight presence check — minimal packet, fast response
-  else if (strcmp(cmd, "ping") == 0)
-  {
-    StaticJsonDocument<128> pong;
-    pong["pong"] = true;
-    pong["device_id"] = DEVICE_ID_INT;            // UID (identity)
-    pong["name"] = (const char *)g_senderName;     // editable label
-    pong["rssi"] = rxRssi;
-    pong["snr"] = rxSnr;
-    pong["uptime_ms"] = millis();
-    if (doc["msg_id"].is<uint32_t>()) pong["msg_id"] = doc["msg_id"].as<uint32_t>();
-
-    TxReq req{};
-    serializeJson(pong, req.json, sizeof(req.json));
-    xQueueSend(txReqQ, &req, portMAX_DELAY);
-
-    Serial.printf("[RX] Ping — pong queued (RSSI %d, SNR %.1f)\n", rxRssi, rxSnr);
-    DEBUG_PRINTLN("[RX] Pong");
-    return true;
-  }
-
-  // V3: rename the collar. Wire format:
-  //   {"cmd":"set_name","device_id":4,"name":"Podge","msg_id":N}
-  // device_id is REQUIRED (we'd reject this above if it didn't match us, but
-  // we double-check here so a missing field can't accidentally rename every
-  // collar via the legacy "no device field = accept" backward-compat path).
-  else if (strcmp(cmd, "set_name") == 0)
-  {
-    if (!doc["device_id"].is<int>() || doc["device_id"].as<int>() != DEVICE_ID_INT)
-    {
-      Serial.println("[RX] set_name without matching device_id — refusing");
-      return false;
-    }
-    if (!doc["name"].is<const char *>())
-    {
-      Serial.println("[RX] set_name missing 'name' field");
-      return false;
-    }
-    const char *newName = doc["name"];
-    if (!saveSenderName(newName))
-    {
-      Serial.printf("[RX] set_name rejected: invalid name '%s' (1-15 chars, no commas/quotes/control)\n",
-                    newName);
-      // ACK with failure so the UI sees a response
-      StaticJsonDocument<160> ack;
-      ack["ack"] = "set_name";
-      ack["ok"] = false;
-      ack["device_id"] = DEVICE_ID_INT;
-      ack["name"] = (const char *)g_senderName; // current (unchanged) label
-      if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
-      TxReq req{};
-      serializeJson(ack, req.json, sizeof(req.json));
-      xQueueSend(txReqQ, &req, portMAX_DELAY);
-      return false;
-    }
-
-    Serial.printf("[RX] Name changed to '%s' (device_id=%d)\n", g_senderName, DEVICE_ID_INT);
-    DEBUG_PRINTF("[RX] name -> %s\n", g_senderName);
-
-    // ACK with new name so the receiver UI can confirm immediately
-    StaticJsonDocument<192> ack;
-    ack["ack"] = "set_name";
-    ack["ok"] = true;
-    ack["device_id"] = DEVICE_ID_INT;        // UID (identity)
-    ack["name"] = (const char *)g_senderName; // the new editable label
-    if (doc["msg_id"].is<uint32_t>()) ack["msg_id"] = doc["msg_id"].as<uint32_t>();
-    TxReq req{};
-    serializeJson(ack, req.json, sizeof(req.json));
-    xQueueSend(txReqQ, &req, portMAX_DELAY);
-
-    return true;
-  }
+  // NOTE: "ping" and "set_name" are handled above by the shared inbound core
+  // (bpHandleInbound in cmd_inbound.cpp) before this inline dispatch runs.
 
   // Handle geofence configuration from base station
   else if (strcmp(cmd, "set_geofence") == 0)
