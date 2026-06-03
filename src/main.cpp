@@ -81,26 +81,62 @@ struct PrefsNvs : INvs
   {
     Preferences p;
     bool ok = false;
-    if (p.begin("cattracker", true)) // read-only
+    if (!p.begin("cattracker", true)) // read-only
     {
-      String s = p.getString(key, "");
-      p.end();
-      if (s.length() > 0)
-      {
-        strncpy(out, s.c_str(), outsz - 1);
-        out[outsz - 1] = '\0';
-        ok = true;
-      }
+      Serial.printf("[NVS] get '%s': begin() FAILED\n", key);
+      return false;
     }
+    String s = p.getString(key, "");
+    p.end();
+    if (s.length() > 0)
+    {
+      strncpy(out, s.c_str(), outsz - 1);
+      out[outsz - 1] = '\0';
+      ok = true;
+    }
+    Serial.printf("[NVS] get '%s' → '%s' (%s)\n", key, s.c_str(),
+                  ok ? "found" : "empty/unset, using default");
     return ok;
   }
   bool nvsPutString(const char *key, const char *val) override
   {
+    // V3.6.7: previously this ignored putString()'s return and ALWAYS reported
+    // success, so a failed flash write looked like a successful rename: the
+    // collar applied the name to RAM + ACKed ok:true, then on the next wake
+    // (RAM wiped) reloaded the OLD name from the NVS that never actually
+    // stored it — i.e. "the ACK looks fine but check-ins never show the new
+    // name". Now we check the byte count AND read the value back on a fresh
+    // handle, returning true only if it genuinely persisted. A real failure
+    // therefore surfaces as set_name ok:false (visible over the air) plus a
+    // serial reason here — instead of silently losing the rename.
     Preferences p;
-    if (!p.begin("cattracker", false)) return false;
-    p.putString(key, val);
+    if (!p.begin("cattracker", false))
+    {
+      Serial.printf("[NVS] put '%s': begin(rw) FAILED (namespace busy/locked?)\n", key);
+      return false;
+    }
+    size_t n = p.putString(key, val);
     p.end(); // commit
-    return true;
+    if (n == 0)
+    {
+      Serial.printf("[NVS] put '%s'='%s': putString wrote 0 bytes — WRITE FAILED\n",
+                    key, val ? val : "");
+      return false;
+    }
+    // Read-back verification on a fresh handle: the real-flash boundary the
+    // native mock NVS can't exercise.
+    Preferences pr;
+    String got;
+    if (pr.begin("cattracker", true))
+    {
+      got = pr.getString(key, "");
+      pr.end();
+    }
+    bool verified = got == String(val ? val : "");
+    Serial.printf("[NVS] put '%s'='%s' (%u B) → readback '%s' %s\n",
+                  key, val ? val : "", (unsigned)n, got.c_str(),
+                  verified ? "VERIFIED" : "MISMATCH — NOT PERSISTED");
+    return verified;
   }
 };
 static PrefsNvs g_nvs;
