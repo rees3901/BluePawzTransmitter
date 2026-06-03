@@ -64,47 +64,56 @@ static void initDeviceId()
   DEVICE_ID_INT = 100 + (hash % 900); // 100–999
 }
 
-#define SENDER_NAME_MAX_LEN 15   // 15 chars + null terminator, matches NVS key length comfortably
+// SENDER_NAME_MAX_LEN is defined in name_store.h (shared with the sandbox).
+#include "name_store.h"
 static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
 
-// Load the friendly name from NVS into g_senderName. If empty/unset, derive a
-// sensible default of "Device-<DEVICE_ID_INT>". Safe to call repeatedly.
+// V3.6.5: the name load/save/validate LOGIC now lives in the shared,
+// hardware-independent name_store.{h,cpp}, so the EXACT code that flashes to
+// the collar also compiles + runs in the native sandbox harness. Here we
+// just provide the ESP32 backing store (Preferences/NVS) behind the INvs
+// interface and keep loadSenderName()/saveSenderName() as thin adapters, so
+// all the existing g_senderName call sites are unchanged.
+struct PrefsNvs : INvs
+{
+  bool nvsGetString(const char *key, char *out, size_t outsz) override
+  {
+    Preferences p;
+    bool ok = false;
+    if (p.begin("cattracker", true)) // read-only
+    {
+      String s = p.getString(key, "");
+      p.end();
+      if (s.length() > 0)
+      {
+        strncpy(out, s.c_str(), outsz - 1);
+        out[outsz - 1] = '\0';
+        ok = true;
+      }
+    }
+    return ok;
+  }
+  bool nvsPutString(const char *key, const char *val) override
+  {
+    Preferences p;
+    if (!p.begin("cattracker", false)) return false;
+    p.putString(key, val);
+    p.end(); // commit
+    return true;
+  }
+};
+static PrefsNvs g_nvs;
+
+// Load the friendly name from NVS into g_senderName (default Device-<id>).
 static void loadSenderName()
 {
-  Preferences p;
-  if (p.begin("cattracker", true)) // read-only
-  {
-    String stored = p.getString("name", "");
-    p.end();
-    if (stored.length() > 0 && stored.length() <= SENDER_NAME_MAX_LEN)
-    {
-      strncpy(g_senderName, stored.c_str(), SENDER_NAME_MAX_LEN);
-      g_senderName[SENDER_NAME_MAX_LEN] = '\0';
-      return;
-    }
-  }
-  snprintf(g_senderName, sizeof(g_senderName), "Device-%d", DEVICE_ID_INT);
+  bpLoadSenderName(g_senderName, sizeof(g_senderName), DEVICE_ID_INT, g_nvs);
 }
 
 // Validate + persist a new friendly name. Returns true on success.
-// Rejects: empty, too long, contains comma (CSV log safety) or control chars.
 static bool saveSenderName(const char *newName)
 {
-  if (!newName) return false;
-  size_t len = strnlen(newName, SENDER_NAME_MAX_LEN + 2);
-  if (len == 0 || len > SENDER_NAME_MAX_LEN) return false;
-  for (size_t i = 0; i < len; i++)
-  {
-    unsigned char c = (unsigned char)newName[i];
-    if (c < 0x20 || c == ',' || c == '"' || c == '\\') return false;
-  }
-  Preferences p;
-  if (!p.begin("cattracker", false)) return false;
-  p.putString("name", newName);
-  p.end();
-  strncpy(g_senderName, newName, SENDER_NAME_MAX_LEN);
-  g_senderName[SENDER_NAME_MAX_LEN] = '\0';
-  return true;
+  return bpSaveSenderName(newName, g_senderName, sizeof(g_senderName), g_nvs);
 }
 
 // Debug serial on spare pin (for battery operation monitoring)
