@@ -149,7 +149,11 @@ const OperatingMode MODE_DEVELOPER = {
     .led_flash_count = 3,   // Quick triple flash (visually distinct)
     .led_beacon_mode = false,
     .led_beacon_interval_ms = 0,
-    .home_heartbeat_cycles = 3};
+    // V3.7.0: the collar reports on the Nth consecutive at-home cycle and
+    // skips (sleeps) the N-1 before it. =2 means it sleeps through just ONE
+    // home cycle, then reports — vs =3 (skipped two) previously. Developer
+    // mode wants the most frequent LoRa for debugging, so keep this low.
+    .home_heartbeat_cycles = 2};
 
 // ─────────────────────────────────────────────
 // Developer Mode Configuration
