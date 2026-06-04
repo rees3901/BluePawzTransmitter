@@ -409,16 +409,15 @@ void IRAM_ATTR setRxFlag(void)
 }
 
 // Load operating mode from NVS or use default
-// TEMPORARY: force developer mode during development — remove when shipping
 static void loadOperatingMode()
 {
-  prefs.begin("cattracker", false);
-  prefs.putString("op_mode", "developer");
+  prefs.begin("cattracker", true); // Read-only
+  String modeName = prefs.getString("op_mode", "developer");
   prefs.end();
 
-  strncpy(g_currentMode, "developer", sizeof(g_currentMode) - 1);
+  strncpy(g_currentMode, modeName.c_str(), sizeof(g_currentMode) - 1);
   g_currentMode[sizeof(g_currentMode) - 1] = '\0';
-  g_activeMode = getModeByName("developer");
+  g_activeMode = getModeByName(g_currentMode);
 
   Serial.printf("[MODE] Loaded: %s (Power: %ddBm, Sleep: %ds)\n",
                 g_activeMode->name, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
