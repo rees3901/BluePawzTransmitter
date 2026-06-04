@@ -100,43 +100,52 @@ struct PrefsNvs : INvs
   }
   bool nvsPutString(const char *key, const char *val) override
   {
-    // V3.6.7: previously this ignored putString()'s return and ALWAYS reported
-    // success, so a failed flash write looked like a successful rename: the
-    // collar applied the name to RAM + ACKed ok:true, then on the next wake
-    // (RAM wiped) reloaded the OLD name from the NVS that never actually
-    // stored it — i.e. "the ACK looks fine but check-ins never show the new
-    // name". Now we check the byte count AND read the value back on a fresh
-    // handle, returning true only if it genuinely persisted. A real failure
-    // therefore surfaces as set_name ok:false (visible over the air) plus a
-    // serial reason here — instead of silently losing the rename.
-    Preferences p;
-    if (!p.begin("cattracker", false))
+    // Bulletproof string persist (step 6 of the command flow). Two things made
+    // renames silently fail in the field:
+    //   1. putString()'s return was ignored, so a 0-byte write looked like
+    //      success — the collar ACKed ok:true but reloaded the OLD name next
+    //      wake. (Fixed: we check the byte count.)
+    //   2. The asymmetry "msg_id (putUInt) persists but name (putString) does
+    //      not" is the signature of a STALE / WRONG-TYPE "name" entry: once a
+    //      key exists with a non-string type, nvs_set_str refuses it forever
+    //      and putString keeps returning 0. (Fixed: on a failed verify we
+    //      erase the key and rewrite it fresh as a string.)
+    // We verify by reading the value back on a fresh handle every time, and
+    // only report success when it genuinely round-trips. Any real failure
+    // surfaces as set_name ok:false over the air + a serial reason.
+    const char *v = val ? val : "";
+    for (int attempt = 0; attempt < 2; attempt++)
     {
-      Serial.printf("[NVS] put '%s': begin(rw) FAILED (namespace busy/locked?)\n", key);
-      return false;
+      Preferences p;
+      if (!p.begin("cattracker", false))
+      {
+        Serial.printf("[NVS] put '%s': begin(rw) FAILED (namespace busy?)\n", key);
+        return false;
+      }
+      if (attempt == 1)
+        p.remove(key); // clear any stale / wrong-type entry, then rewrite fresh
+      size_t n = p.putString(key, v);
+      p.end(); // commit
+
+      // Verify on a fresh read-only handle.
+      Preferences pr;
+      String got;
+      if (pr.begin("cattracker", true))
+      {
+        got = pr.getString(key, "");
+        pr.end();
+      }
+      if (n > 0 && got == String(v))
+      {
+        Serial.printf("[NVS] put '%s'='%s' VERIFIED%s\n", key, v,
+                      attempt ? " (after erase+rewrite)" : "");
+        return true;
+      }
+      Serial.printf("[NVS] put '%s'='%s' attempt %d FAILED (wrote %u B, readback '%s')%s\n",
+                    key, v, attempt + 1, (unsigned)n, got.c_str(),
+                    attempt == 0 ? " — erasing key and retrying" : " — GIVING UP");
     }
-    size_t n = p.putString(key, val);
-    p.end(); // commit
-    if (n == 0)
-    {
-      Serial.printf("[NVS] put '%s'='%s': putString wrote 0 bytes — WRITE FAILED\n",
-                    key, val ? val : "");
-      return false;
-    }
-    // Read-back verification on a fresh handle: the real-flash boundary the
-    // native mock NVS can't exercise.
-    Preferences pr;
-    String got;
-    if (pr.begin("cattracker", true))
-    {
-      got = pr.getString(key, "");
-      pr.end();
-    }
-    bool verified = got == String(val ? val : "");
-    Serial.printf("[NVS] put '%s'='%s' (%u B) → readback '%s' %s\n",
-                  key, val ? val : "", (unsigned)n, got.c_str(),
-                  verified ? "VERIFIED" : "MISMATCH — NOT PERSISTED");
-    return verified;
+    return false;
   }
 };
 static PrefsNvs g_nvs;
@@ -803,16 +812,34 @@ static void getCSVLogInfo(char *info, size_t maxLen)
 #endif
 }
 
-// Parse and handle mode change command from base station
+// ─────────────────────────────────────────────────────────────────────────
+// Inbound command handler — the collar's half of the remote-command flow.
+//
+// The whole feature is deliberately just these steps:
+//   1. Base station sends a command JSON over LoRa.
+//   2. Collar receives the packet            → TaskLoRa rxFlag → readData().
+//   3. Collar parses the JSON                → deserializeJson (in bpHandleInbound).
+//   4. Collar identifies it as a command     → has "cmd" + a device_id that is
+//                                              this collar's UID (or broadcast).
+//   5. Collar applies the requested setting  → e.g. set_name updates g_senderName.
+//   6. Collar persists it reliably           → bpSaveSenderName → NVS write that
+//                                              is read back + verified (see
+//                                              PrefsNvs::nvsPutString). g_senderName
+//                                              is only updated once the write sticks,
+//                                              so an ok:true ACK GUARANTEES persistence.
+//   7. Collar sends an ACK                   → {"ack":...,"ok":true,"device_id":<UID>,
+//                                              "name":<new>,"msg_id":<echoed>}.
+//   8. Collar uses the new setting in ALL    → telemetry always emits g_senderName,
+//      future telemetry                        which is reloaded from NVS every boot.
+//
+// Steps 2-7 for set_name / ping live in the shared, host-tested core
+// cmd_inbound.cpp (the native harness compiles the SAME file, so they're
+// verified off-device against the exact code that flashes). mode / get_status
+// / set_geofence mutate extra state and are dispatched inline below after the
+// core returns BP_OTHER.
+// ─────────────────────────────────────────────────────────────────────────
 static bool handleModeCommand(const char *json, int16_t rxRssi = 0, float rxSnr = 0.0)
 {
-  // ── Shared, host-tested inbound core (cmd_inbound.cpp) ───────────────────
-  // The native harness (BluePawzSim/native) compiles this SAME translation
-  // unit, so the parse → UID-targeting → ping → set_name paths are verified
-  // off-device against the exact code that flashes. mode / get_status /
-  // set_geofence are NOT owned by the core (they mutate operating-mode and
-  // geofence state); the core returns BP_OTHER and we dispatch them inline
-  // below after a local re-parse.
   char coreAck[256];
   BpInboundCtx ctx{DEVICE_ID_INT, g_senderName, sizeof(g_senderName),
                    &g_nvs, rxRssi, rxSnr, (unsigned long)millis()};
@@ -1584,6 +1611,12 @@ void TaskLoRa(void *)
           continue;
         }
 
+        // Clamp before NUL-terminating: a full 256-byte packet would make
+        // rxBuf[pktLen] a 1-byte stack overrun. Commands are ~60 B so this is
+        // a guard, not a normal path — but a corrupted/oversized frame must
+        // not scribble past the buffer before we even parse it.
+        if (pktLen >= sizeof(rxBuf))
+          pktLen = sizeof(rxBuf) - 1;
         rxBuf[pktLen] = '\0';
 
         int16_t cmdRssi = lora.getRSSI();
