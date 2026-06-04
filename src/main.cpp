@@ -223,6 +223,7 @@ struct GpsFix
 struct TxReq
 {
   char json[320];
+  bool isTelemetry; // true = main telemetry packet, false = command ACK/response
 };
 
 static QueueHandle_t gpsFixQ;     // latest fix (overwrite)
@@ -1711,7 +1712,10 @@ void TaskLoRa(void *)
       int ts = lora.transmit(req.json);
       if (ts == RADIOLIB_ERR_NONE)
       {
-        xEventGroupSetBits(evBits, EV_TXDONE);
+        if (req.isTelemetry)
+        {
+          xEventGroupSetBits(evBits, EV_TXDONE);
+        }
 
         // LED flicker to indicate successful transmission
         led_flicker();
@@ -2055,6 +2059,7 @@ void TaskPower(void *)
     }
 
     TxReq req{};
+    req.isTelemetry = true;
     serializeJson(doc, req.json, sizeof(req.json));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
@@ -2087,6 +2092,7 @@ void TaskPower(void *)
     }
 
     TxReq req{};
+    req.isTelemetry = true;
     serializeJson(doc, req.json, sizeof(req.json));
     xQueueSend(txReqQ, &req, portMAX_DELAY);
 
