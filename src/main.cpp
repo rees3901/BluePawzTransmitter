@@ -69,83 +69,100 @@ static void initDeviceId()
 #include "cmd_inbound.h" // shared, host-tested inbound-command core (parse/target/ping/set_name)
 static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
 
-// V3.6.5: the name load/save/validate LOGIC now lives in the shared,
-// hardware-independent name_store.{h,cpp}, so the EXACT code that flashes to
-// the collar also compiles + runs in the native sandbox harness. Here we
-// just provide the ESP32 backing store (Preferences/NVS) behind the INvs
-// interface. g_nvs is shared by loadSenderName() and the inbound-command core
-// (cmd_inbound.cpp), which persists renames via bpSaveSenderName() directly.
+// V3.6.9: MASTER CONFIG persistence (the simple, reliable model).
+//
+// Every persisted collar setting (currently just the friendly name) is a field
+// of ONE JSON blob — the master config — written to NVS as a single string
+// under a FRESH namespace/key. Why this shape, after renames kept failing to
+// stick in the field:
+//
+//   * msg_id (an integer key) survived deep sleep fine, but the name (a string
+//     under key "name" in the old "cattracker" namespace) never did. That
+//     one-key-works / other-key-fails split is the classic signature of a
+//     stale, WRONG-TYPE "name" entry: once an NVS key exists with a non-string
+//     type, nvs_set_str refuses it forever and putString silently returns 0.
+//   * A BRAND-NEW namespace + key that has never been written sidesteps that
+//     poisoned entry completely, and a single JSON blob means there is only
+//     ONE key, of ONE type, to ever manage.
+//   * Every write is read back and verified, so a genuine failure is reported
+//     (and shows up as set_name ok:false over the air) instead of vanishing.
+//
+// The hardware-independent core (name_store / cmd_inbound) still talks to the
+// generic INvs get/put-string interface; on the device each "key" maps to a
+// field of the master-config blob. The native sandbox backs the same interface
+// with an in-RAM map, so the tested command logic is unchanged.
+#define CFG_NS "bpcfg"     // fresh NVS namespace — never written by old firmware
+#define CFG_KEY "config"   // single master-config JSON blob lives here
 struct PrefsNvs : INvs
 {
-  bool nvsGetString(const char *key, char *out, size_t outsz) override
+  // Read the whole master-config blob into `doc`. False if absent/unparseable.
+  static bool readBlob(JsonDocument &doc)
   {
     Preferences p;
-    bool ok = false;
-    if (!p.begin("cattracker", true)) // read-only
+    String s;
+    if (p.begin(CFG_NS, true)) // read-only
     {
-      Serial.printf("[NVS] get '%s': begin() FAILED\n", key);
+      s = p.getString(CFG_KEY, "");
+      p.end();
+    }
+    if (s.length() == 0)
+      return false;
+    return deserializeJson(doc, s) == DeserializationError::Ok;
+  }
+
+  // Serialize `doc` and persist it as the single blob, then read it back to
+  // confirm it genuinely stuck. Returns true only on a verified round-trip.
+  static bool writeBlobVerified(JsonDocument &doc)
+  {
+    String json;
+    serializeJson(doc, json);
+    Preferences p;
+    if (!p.begin(CFG_NS, false))
+    {
+      Serial.println("[CFG] begin(rw) FAILED");
       return false;
     }
-    String s = p.getString(key, "");
+    size_t n = p.putString(CFG_KEY, json);
     p.end();
-    if (s.length() > 0)
+    Preferences pr;
+    String got;
+    if (pr.begin(CFG_NS, true))
     {
-      strncpy(out, s.c_str(), outsz - 1);
-      out[outsz - 1] = '\0';
-      ok = true;
+      got = pr.getString(CFG_KEY, "");
+      pr.end();
     }
-    Serial.printf("[NVS] get '%s' → '%s' (%s)\n", key, s.c_str(),
-                  ok ? "found" : "empty/unset, using default");
+    bool ok = (n > 0) && (got == json);
+    Serial.printf("[CFG] save %s: %s\n", ok ? "VERIFIED" : "FAILED", json.c_str());
     return ok;
   }
+
+  bool nvsGetString(const char *key, char *out, size_t outsz) override
+  {
+    JsonDocument doc;
+    if (!readBlob(doc))
+    {
+      Serial.printf("[CFG] no master config yet (key '%s') - using default\n", key);
+      return false;
+    }
+    const char *v = doc[key] | "";
+    if (v[0] == '\0')
+      return false;
+    strncpy(out, v, outsz - 1);
+    out[outsz - 1] = '\0';
+    Serial.printf("[CFG] get '%s' = '%s'\n", key, out);
+    return true;
+  }
+
   bool nvsPutString(const char *key, const char *val) override
   {
-    // Bulletproof string persist (step 6 of the command flow). Two things made
-    // renames silently fail in the field:
-    //   1. putString()'s return was ignored, so a 0-byte write looked like
-    //      success — the collar ACKed ok:true but reloaded the OLD name next
-    //      wake. (Fixed: we check the byte count.)
-    //   2. The asymmetry "msg_id (putUInt) persists but name (putString) does
-    //      not" is the signature of a STALE / WRONG-TYPE "name" entry: once a
-    //      key exists with a non-string type, nvs_set_str refuses it forever
-    //      and putString keeps returning 0. (Fixed: on a failed verify we
-    //      erase the key and rewrite it fresh as a string.)
-    // We verify by reading the value back on a fresh handle every time, and
-    // only report success when it genuinely round-trips. Any real failure
-    // surfaces as set_name ok:false over the air + a serial reason.
-    const char *v = val ? val : "";
-    for (int attempt = 0; attempt < 2; attempt++)
-    {
-      Preferences p;
-      if (!p.begin("cattracker", false))
-      {
-        Serial.printf("[NVS] put '%s': begin(rw) FAILED (namespace busy?)\n", key);
-        return false;
-      }
-      if (attempt == 1)
-        p.remove(key); // clear any stale / wrong-type entry, then rewrite fresh
-      size_t n = p.putString(key, v);
-      p.end(); // commit
-
-      // Verify on a fresh read-only handle.
-      Preferences pr;
-      String got;
-      if (pr.begin("cattracker", true))
-      {
-        got = pr.getString(key, "");
-        pr.end();
-      }
-      if (n > 0 && got == String(v))
-      {
-        Serial.printf("[NVS] put '%s'='%s' VERIFIED%s\n", key, v,
-                      attempt ? " (after erase+rewrite)" : "");
-        return true;
-      }
-      Serial.printf("[NVS] put '%s'='%s' attempt %d FAILED (wrote %u B, readback '%s')%s\n",
-                    key, v, attempt + 1, (unsigned)n, got.c_str(),
-                    attempt == 0 ? " — erasing key and retrying" : " — GIVING UP");
-    }
-    return false;
+    // Read-modify-write the single master-config blob: load the current config
+    // (an empty doc if none exists yet), set this one field, then persist and
+    // verify the whole blob. String(val) forces a copy into the doc so we never
+    // serialize a dangling pointer into the inbound command buffer.
+    JsonDocument doc;
+    readBlob(doc);
+    doc[key] = String(val ? val : "");
+    return writeBlobVerified(doc);
   }
 };
 static PrefsNvs g_nvs;
