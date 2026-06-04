@@ -23,19 +23,46 @@ Why not also use SCons SRC_FILTER?
    LibBuilder's compiler config (`'CC' is not recognized` errors). The
    rename approach is blunter but bulletproof.
 
-Why no git-hash logic here?
-   The transmitter's FIRMWARE_VERSION is a static -D build flag the
-   user edits manually in platformio.ini. Changing it already triggers
-   a full rebuild (platformio.ini changes always do), so we don't need
-   the per-file CPPDEFINES gymnastics the receiver uses. Just the
-   RadioLib prune is enough.
+Git-hash → FIRMWARE_VERSION (V3.6.7):
+   FIRMWARE_VERSION used to be a hand-edited static `-D` flag in
+   platformio.ini (frozen at "98b079f"), so the collar's telemetry `fw`
+   field never changed and you could not tell which build was actually
+   flashed. Now we resolve the live git short-hash here, stash it on env,
+   and the POST script (inject_version_post.py) appends
+   `-DFIRMWARE_VERSION="<hash>"` to PROJENV only — so only main.cpp.o
+   recompiles when the hash flips on commit, NOT the whole framework +
+   library cache (that global-env mistake is what caused the 15-20 min
+   rebuilds; see the receiver's inject_git_hash notes). projenv is exposed
+   only to post scripts, which is why the macro is applied there, not here.
 """
 
+import subprocess
 from pathlib import Path
 
 Import("env")  # noqa: F821  (provided by PlatformIO's SCons env)
 
 PROJECT_DIR = Path(env["PROJECT_DIR"])  # noqa: F821
+
+
+def _git(*args: str) -> str:
+    return subprocess.check_output(
+        ["git", *args], cwd=str(PROJECT_DIR), stderr=subprocess.DEVNULL
+    ).decode().strip()
+
+
+def get_git_hash() -> str:
+    try:
+        short = _git("rev-parse", "--short=7", "HEAD")
+        dirty = bool(_git("status", "--porcelain"))  # empty iff clean tree
+        return f"{short}-dirty" if dirty else short
+    except Exception:
+        return "unknown"
+
+
+# Resolve + stash for the post script (so it doesn't re-run git).
+git_hash = get_git_hash()
+env["TX_FIRMWARE_VERSION"] = git_hash  # noqa: F821
+print(f"[prune_radiolib] FIRMWARE_VERSION = {git_hash}")
 
 # Keep ONLY: modules/SX126x (our SX1262 family) + base infrastructure
 # (Hal, Module, ArduinoHal -- those are at the lib's root, untouched).
