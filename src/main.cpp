@@ -86,12 +86,10 @@ static char g_senderName[SENDER_NAME_MAX_LEN + 1] = {0};
 //     poisoned entry completely, and a single JSON blob means there is only
 //     ONE key, of ONE type, to ever manage.
 //   * Every write is read back and verified, so a genuine failure is reported
-//     (and shows up as set_name ok:false over the air) instead of vanishing.
+//     instead of vanishing.
 //
-// The hardware-independent core (name_store / cmd_inbound) still talks to the
-// generic INvs get/put-string interface; on the device each "key" maps to a
-// field of the master-config blob. The native sandbox backs the same interface
-// with an in-RAM map, so the tested command logic is unchanged.
+// name_store talks to the generic INvs get/put-string interface; on the device
+// each "key" maps to a field of the master-config blob.
 #define CFG_NS "bpcfg"     // fresh NVS namespace — never written by old firmware
 #define CFG_KEY "config"   // single master-config JSON blob lives here
 struct PrefsNvs : INvs
@@ -251,7 +249,6 @@ static EventGroupHandle_t evBits; // state flags
 #define EV_FIX (1 << 0)      // have recent valid GPS fix
 #define EV_HOME (1 << 1)     // BLE beacon seen this cycle
 #define EV_TXDONE (1 << 2)   // LoRa TX finished
-#define EV_LORA_CMD (1 << 3) // LoRa command received (HIGHEST PRIORITY)
 
 // Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
@@ -288,9 +285,6 @@ const OperatingMode *g_activeMode = &MODE_DEVELOPER;
 
 // NVS backup for msg counter (Flash memory - survives any reset including USB resets)
 Preferences prefs;
-
-// LoRa RX interrupt flag
-volatile bool rxFlag = false;
 
 static void saveOperatingMode(const char *modeName);
 
@@ -419,12 +413,6 @@ static void led_beacon_pulse()
     vTaskDelay(pdMS_TO_TICKS(100));
     digitalWrite(LED_PIN, LOW);
   }
-}
-
-// LoRa RX interrupt handler (ISR - keep minimal!)
-void IRAM_ATTR setRxFlag(void)
-{
-  rxFlag = true;
 }
 
 // Load operating mode from NVS or use default
@@ -1436,23 +1424,13 @@ void TaskPower(void *)
 
   uint32_t bleStartTime = millis();
   bool homeDetectedInitial = false;
-  bool loraCommandReceived = false;
   uint32_t lastHomePrintTime = 0;
 
   while (millis() - bleStartTime < (BLE_INITIAL_SCAN_S * 1000))
   {
     EventBits_t bits = xEventGroupGetBits(evBits);
 
-    // PRIORITY 1: Check for LoRa command (overrides everything)
-    if (bits & EV_LORA_CMD)
-    {
-      loraCommandReceived = true;
-      Serial.printf("[POWER] LoRa command received after %d ms - PRIORITY MODE\n", millis() - bleStartTime);
-      DEBUG_PRINTLN("[POWER] LoRa CMD priority");
-      break; // Exit scan immediately
-    }
-
-    // PRIORITY 2: Check for BLE home
+    // Check for BLE home beacon
     if (bits & EV_HOME)
     {
       if (!homeDetectedInitial)
@@ -1478,21 +1456,7 @@ void TaskPower(void *)
   // PHASE 2: Priority Decision Logic
   // ─────────────────────────────────────────────
 
-  // CASE 1: LoRa command received - apply settings and continue cycle normally
-  if (loraCommandReceived)
-  {
-    Serial.println("[POWER] LoRa command takes precedence - continuing cycle with new settings");
-    DEBUG_PRINTLN("[POWER] LoRa CMD applied");
-
-    // Clear the command flag
-    xEventGroupClearBits(evBits, EV_LORA_CMD);
-
-    // Settings already applied by handleModeCommand()
-    // Continue to GPS acquisition phase (don't sleep even if home detected)
-    homeDetectedInitial = false; // Override BLE home detection
-  }
-
-  // CASE 2: Home detected (and NO LoRa command)
+  // Home detected
   // On first boot, skip home shortcut — always acquire GPS and TX so the
   // base station discovers this collar and its initial location.
   if (g_firstBoot && homeDetectedInitial)
@@ -1504,7 +1468,7 @@ void TaskPower(void *)
 
   bool homeHeartbeat = false; // Flag: this cycle is a home heartbeat with GPS
 
-  if (homeDetectedInitial && !loraCommandReceived)
+  if (homeDetectedInitial)
   {
     uint8_t heartbeatThreshold = g_activeMode->home_heartbeat_cycles;
     g_homeBeaconCycles++;
@@ -1563,15 +1527,6 @@ void TaskPower(void *)
   while (millis() - gpsStartTime < timeout)
   {
     EventBits_t bits = xEventGroupGetBits(evBits);
-
-    // Check for LoRa commands during GPS acquisition
-    if (bits & EV_LORA_CMD)
-    {
-      xEventGroupClearBits(evBits, EV_LORA_CMD);
-      Serial.printf("[POWER] LoRa command received during GPS acquisition (%d ms)\n",
-                    millis() - gpsStartTime);
-      DEBUG_PRINTLN("[POWER] LoRa CMD during GPS");
-    }
 
     // Check if home beacon appeared during GPS acquisition
     // (skip on first boot or heartbeat cycle — we must TX regardless)
