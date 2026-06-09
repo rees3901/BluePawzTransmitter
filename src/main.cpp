@@ -45,12 +45,16 @@
 // Device Identity (per-node configuration)
 // ─────────────────────────────────────────────
 // Device ID is derived from the ESP32's factory-burned MAC address on boot,
-// producing a stable 3-digit number (100–999) unique to each physical chip.
+// producing a stable 3-digit number (100–998) unique to each physical chip.
 // No manual programming needed — flash the same firmware on any collar and
 // it gets its own ID automatically.
 // The human-friendly NAME ("Podge", "Macy", etc.) is a runtime value
-// (g_senderName) stored in NVS and changed at any time via the `set_name`
-// command from the receiver. Default if NVS is empty: "Device-<id>".
+// (g_senderName) stored in NVS and changed at any time via an OTAP command
+// from the receiver. Default if NVS is empty: "Device-<id>".
+//
+// OTAP reserved device IDs (plain integers on the wire, shared with the base):
+#define BASE_ID 1        // the base station / receiver
+#define BROADCAST_ID 999 // a command addressed here is acted on by every collar
 static uint16_t DEVICE_ID_INT = 0;
 
 static uint8_t g_mac[6];
@@ -61,7 +65,8 @@ static void initDeviceId()
   uint32_t hash = g_mac[0];
   for (int i = 1; i < 6; i++)
     hash = hash * 31 + g_mac[i];
-  DEVICE_ID_INT = 100 + (hash % 900); // 100–999
+  // 100–998: 999 is reserved for broadcast, so the hash is mod 899 (never 999).
+  DEVICE_ID_INT = 100 + (hash % 899);
 }
 
 // SENDER_NAME_MAX_LEN is defined in name_store.h. The friendly name is still
@@ -1253,10 +1258,141 @@ void TaskBLE(void *)
 }
 
 // ─────────────────────────────────────────────
+// OTAP inbound command path (re-instated in Phase 1)
+// ─────────────────────────────────────────────
+// SX1262 RX is interrupt-driven: DIO1 fires when a packet lands and this ISR
+// just flips a flag. TaskLoRa (the SOLE radio owner) polls the flag, reads the
+// packet, and re-arms RX. The ISR must stay in IRAM and do nothing else.
+static volatile bool g_loraRxFlag = false;
+void IRAM_ATTR onLoRaDio1()
+{
+  g_loraRxFlag = true;
+}
+
+// Reserved envelope fields that are NOT configurable parameters. Everything
+// else in a command doc is treated as a key/value config change by the generic
+// apply loop below.
+static bool isEnvelopeKey(const char *k)
+{
+  return !strcmp(k, "type") || !strcmp(k, "source_id") ||
+         !strcmp(k, "destination_id") || !strcmp(k, "message_id") ||
+         !strcmp(k, "msg_id") || !strcmp(k, "timestamp") || !strcmp(k, "time");
+}
+
+// Parse one inbound LoRa frame (already NUL-terminated). If it is a COMMAND
+// addressed to this collar (or the broadcast ID), apply every known parameter
+// generically and queue an ACK/NACK back to the base, echoing the command's
+// message_id so the base can match it. Runs inside TaskLoRa, so it may queue a
+// TxReq but must NEVER touch the radio directly.
+static void handleInboundLoRa(const char *json)
+{
+  Serial.println(String("[RX] received ") + json);
+  DEBUG_PRINTLN(String("[RX] ") + json);
+
+  StaticJsonDocument<320> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err)
+  {
+    // Can't address a response without a parseable message — drop it.
+    Serial.printf("[RX] drop: invalid_json (%s)\n", err.c_str());
+    return;
+  }
+
+  const char *type = doc["type"] | "";
+  if (strcmp(type, "command") != 0)
+  {
+    // Overheard telemetry / ACK / presence from elsewhere — ignore quietly.
+    DEBUG_PRINTF("[RX] ignore type '%s'\n", type);
+    return;
+  }
+
+  uint16_t dest = doc["destination_id"] | 0;
+  if (dest != DEVICE_ID_INT && dest != BROADCAST_ID)
+  {
+    Serial.printf("[CMD] not-for-me (dest=%u, me=%u)\n", dest, DEVICE_ID_INT);
+    return;
+  }
+
+  uint16_t src = doc["source_id"] | BASE_ID;  // who to answer (the base)
+  uint32_t msgId = doc["message_id"] | 0;     // command id we must echo back
+  Serial.printf("[CMD] for-me dest=%u src=%u message_id=%lu\n",
+                dest, src, (unsigned long)msgId);
+
+  // ── Generic apply loop ───────────────────────────────────────────────
+  // Walk every key/value; skip envelope fields; apply each known config
+  // parameter. The FIRST failure short-circuits to a NACK. An unknown key is
+  // unsupported_command; a command carrying NO config key at all is likewise
+  // unsupported (nothing to do). Phase-1 known key set = { name }.
+  const char *nackReason = nullptr;
+  int appliedCount = 0;
+
+  for (JsonPair kv : doc.as<JsonObject>())
+  {
+    const char *key = kv.key().c_str();
+    if (isEnvelopeKey(key))
+      continue;
+
+    if (strcmp(key, "name") == 0)
+    {
+      const char *newName = kv.value().is<const char *>() ? kv.value().as<const char *>() : nullptr;
+      if (!newName || !bpValidSenderName(newName))
+      {
+        Serial.printf("[CFG] reject name '%s' -> invalid_value\n",
+                      newName ? newName : "<non-string>");
+        nackReason = "invalid_value";
+        break;
+      }
+      // Validation already passed, so a false return here is a PERSISTENCE
+      // failure (writeBlobVerified prints [CFG] save FAILED) → invalid_parameter.
+      if (!bpSaveSenderName(newName, g_senderName, sizeof(g_senderName), g_nvs))
+      {
+        Serial.println("[CFG] name write FAILED -> invalid_parameter");
+        nackReason = "invalid_parameter";
+        break;
+      }
+      Serial.printf("[CFG] name applied + persisted: '%s'\n", g_senderName);
+      appliedCount++;
+    }
+    else
+    {
+      Serial.printf("[CMD] unsupported parameter '%s'\n", key);
+      nackReason = "unsupported_command";
+      break;
+    }
+  }
+
+  if (!nackReason && appliedCount == 0)
+    nackReason = "unsupported_command"; // command had no recognised parameter
+
+  // ── Build the response (ACK on success, NACK on failure) ─────────────
+  StaticJsonDocument<256> resp;
+  resp["type"] = nackReason ? "nack" : "ack";
+  resp["source_id"] = DEVICE_ID_INT;
+  resp["destination_id"] = src;
+  resp["message_id"] = msgId;        // echo the command's id for matching
+  resp["device_id"] = DEVICE_ID_INT;
+  if (nackReason)
+    resp["reason"] = nackReason;
+  else
+    resp["name"] = (const char *)g_senderName; // echo the name we applied
+
+  TxReq out{};
+  out.isTelemetry = false; // response packet — must NOT trigger deep sleep
+  serializeJson(resp, out.json, sizeof(out.json));
+  if (xQueueSend(txReqQ, &out, pdMS_TO_TICKS(100)) != pdTRUE)
+  {
+    Serial.println("[ACK] queue full — response dropped");
+    return;
+  }
+  Serial.printf("[%s] queued: %s\n", nackReason ? "NACK" : "ACK", out.json);
+  DEBUG_PRINTLN(String(nackReason ? "[NACK] " : "[ACK] ") + out.json);
+}
+
+// ─────────────────────────────────────────────
 // Task: LoRa owner
-//  • Receives mode commands from base station
-//  • Transmits packets with mode-based power
-//  • Handles RX and TX
+//  • Receives commands from the base station (DIO1 ISR → handleInboundLoRa)
+//  • Transmits telemetry + presence + ACK/NACK with mode-based power
+//  • Sole owner of the radio — all RX/TX calls live here
 // ─────────────────────────────────────────────
 void TaskLoRa(void *)
 {
@@ -1283,8 +1419,14 @@ void TaskLoRa(void *)
                 LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
   DEBUG_PRINTF("[LORA] SF%d BW%.0f P%d\n", LORA_SF, LORA_BW_KHZ, g_activeMode->lora_power_dbm);
 
-  // V3.8.0: transmit-only collar — no RX, no command interrupt, no command
-  // handling. The radio is used solely to transmit telemetry below.
+  // OTAP: listen for inbound commands for the WHOLE wake. SX1262 RX is
+  // interrupt-driven via DIO1; the loop polls g_loraRxFlag and re-arms RX after
+  // every received packet and every TX so the collar never goes deaf mid-wake.
+  lora.setDio1Action(onLoRaDio1);
+  lora.startReceive();
+  Serial.println("[LoRa] RX armed (listening for commands)");
+  DEBUG_PRINTLN("[LoRa] RX armed");
+
   for (;;)
   {
     // ─────────────────────────────────────────────
@@ -1298,6 +1440,29 @@ void TaskLoRa(void *)
         led_beacon_pulse();
         lastBeacon = millis();
       }
+    }
+
+    // ─────────────────────────────────────────────
+    // PRIORITY 2.5: Inbound command (DIO1 ISR set the flag)
+    // ─────────────────────────────────────────────
+    if (g_loraRxFlag)
+    {
+      g_loraRxFlag = false;
+      char rxBuf[256];
+      size_t len = lora.getPacketLength();
+      if (len > sizeof(rxBuf) - 1)
+        len = sizeof(rxBuf) - 1;
+      int rs = lora.readData((uint8_t *)rxBuf, len);
+      rxBuf[len] = '\0'; // NUL-terminate at the true length (buf is 256)
+      if (rs == RADIOLIB_ERR_NONE)
+      {
+        handleInboundLoRa(rxBuf);
+      }
+      else
+      {
+        Serial.printf("[RX] readData error: %d\n", rs);
+      }
+      lora.startReceive(); // re-arm to keep listening for the rest of the wake
     }
 
     // ─────────────────────────────────────────────
@@ -1354,11 +1519,6 @@ void TaskLoRa(void *)
       int ts = lora.transmit(req.json);
       if (ts == RADIOLIB_ERR_NONE)
       {
-        if (req.isTelemetry)
-        {
-          xEventGroupSetBits(evBits, EV_TXDONE);
-        }
-
         // LED flicker to indicate successful transmission
         led_flicker();
 
@@ -1393,6 +1553,17 @@ void TaskLoRa(void *)
       lora.startReceive();
       Serial.println("[LoRa] Returned to RX mode");
       DEBUG_PRINTLN("[LoRa] RX resume");
+
+      // Signal "telemetry sent → may sleep" ONLY after the radio work for this
+      // packet is completely finished (re-arm included). loop() tears the LoRa
+      // task down the instant EV_TXDONE is set, so setting it earlier (before
+      // the RSSI/CSV/startReceive calls above) risked vTaskDelete killing
+      // TaskLoRa mid-SPI on the shared bus. Non-telemetry packets (presence,
+      // ACK/NACK) never set it, so the collar keeps listening the whole wake.
+      if (ts == RADIOLIB_ERR_NONE && req.isTelemetry)
+      {
+        xEventGroupSetBits(evBits, EV_TXDONE);
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -1415,6 +1586,30 @@ void TaskPower(void *)
 
   Serial.println("\n[POWER] === New wake cycle ===");
   DEBUG_PRINTLN("\n[POWER] Wake cycle");
+
+  // ─────────────────────────────────────────────
+  // OTAP presence packet — announce "I'm awake" at the very start of the wake
+  // ─────────────────────────────────────────────
+  // A tiny, GPS-free packet sent BEFORE BLE/GPS work so the base learns this
+  // collar is reachable and can start delivering any QUEUED command into the
+  // whole wake window (BLE 10s + GPS 20–60s + stabilise 15s). isTelemetry=false
+  // → it does NOT set EV_TXDONE, so it never short-circuits the wake to sleep.
+  {
+    StaticJsonDocument<160> pres;
+    pres["type"] = "presence";
+    pres["source_id"] = DEVICE_ID_INT;
+    pres["destination_id"] = BASE_ID;
+    pres["message_id"] = g_msgCounter++;
+    pres["device_id"] = DEVICE_ID_INT; // == source_id (aids base attribution)
+    pres["uptime_ms"] = millis();
+
+    TxReq req{};
+    req.isTelemetry = false; // response/announce packet — must NOT trigger sleep
+    serializeJson(pres, req.json, sizeof(req.json));
+    xQueueSend(txReqQ, &req, pdMS_TO_TICKS(100));
+    Serial.println(String("[POWER] Presence queued: ") + req.json);
+    DEBUG_PRINTLN("[POWER] Presence queued");
+  }
 
   // ─────────────────────────────────────────────
   // PHASE 1: Initial 10-second BLE + LoRa RX scan
@@ -1632,10 +1827,15 @@ void TaskPower(void *)
 
     // Build full JSON with GPS data
     StaticJsonDocument<384> doc;
+    // OTAP envelope. For telemetry, source_id == device_id (same collar UID)
+    // and msg_id IS the message_id; kept compact for the ~255-byte LoRa limit.
+    doc["type"] = "telemetry";
+    doc["source_id"] = DEVICE_ID_INT;
+    doc["destination_id"] = BASE_ID;
     doc["msg_id"] = g_msgCounter++;
     // V3.6.0 field model: device_id = immutable UID (identity); name =
     // editable friendly label. The legacy ambiguous "id" field is gone.
-    doc["device_id"] = DEVICE_ID_INT;
+    doc["device_id"] = DEVICE_ID_INT; // == source_id
     doc["name"] = (const char *)g_senderName;
     doc["status"] = homeHeartbeat ? "BLEHome" : "roaming";
     doc["mode"] = g_currentMode;
@@ -1683,8 +1883,13 @@ void TaskPower(void *)
   {
     // GPS timeout - send invalid status (still TX so base station sees us)
     StaticJsonDocument<320> doc;
+    // OTAP envelope (compact for the ~255-byte LoRa limit). For telemetry,
+    // source_id == device_id and msg_id IS the message_id.
+    doc["type"] = "telemetry";
+    doc["source_id"] = DEVICE_ID_INT;
+    doc["destination_id"] = BASE_ID;
     doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT; // immutable UID
+    doc["device_id"] = DEVICE_ID_INT; // == source_id (immutable UID)
     doc["name"] = (const char *)g_senderName; // editable label
     doc["status"] = "invalidGPSLoc";
     doc["mode"] = g_currentMode;
