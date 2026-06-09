@@ -1454,14 +1454,15 @@ void TaskLoRa(void *)
         len = sizeof(rxBuf) - 1;
       int rs = lora.readData((uint8_t *)rxBuf, len);
       rxBuf[len] = '\0'; // NUL-terminate at the true length (buf is 256)
-      if (rs == RADIOLIB_ERR_NONE)
+      if (rs == RADIOLIB_ERR_NONE && len > 0)
       {
         handleInboundLoRa(rxBuf);
       }
-      else
+      else if (rs != RADIOLIB_ERR_NONE)
       {
         Serial.printf("[RX] readData error: %d\n", rs);
       }
+      // (len==0 → spurious/empty packet, e.g. a stray IRQ after a TX; ignore.)
       lora.startReceive(); // re-arm to keep listening for the rest of the wake
     }
 
@@ -1554,14 +1555,22 @@ void TaskLoRa(void *)
       Serial.println("[LoRa] Returned to RX mode");
       DEBUG_PRINTLN("[LoRa] RX resume");
 
-      // Signal "telemetry sent → may sleep" ONLY after the radio work for this
+      // Signal "telemetry done → may sleep" ONLY after the radio work for this
       // packet is completely finished (re-arm included). loop() tears the LoRa
       // task down the instant EV_TXDONE is set, so setting it earlier (before
       // the RSSI/CSV/startReceive calls above) risked vTaskDelete killing
       // TaskLoRa mid-SPI on the shared bus. Non-telemetry packets (presence,
       // ACK/NACK) never set it, so the collar keeps listening the whole wake.
-      if (ts == RADIOLIB_ERR_NONE && req.isTelemetry)
+      //
+      // CRUCIAL: set it even when the transmit FAILED. Otherwise a rejected
+      // telemetry packet (e.g. RADIOLIB_ERR_PACKET_TOO_LONG, -4) would leave the
+      // collar hung at "Waiting for TX completion" forever, awake and draining
+      // the battery. On failure we just lose this cycle's packet and send a
+      // fresh one next wake.
+      if (req.isTelemetry)
       {
+        if (ts != RADIOLIB_ERR_NONE)
+          Serial.printf("[LoRa] telemetry TX failed (%d) — sleeping anyway, retry next wake\n", ts);
         xEventGroupSetBits(evBits, EV_TXDONE);
       }
     }
@@ -1827,15 +1836,17 @@ void TaskPower(void *)
 
     // Build full JSON with GPS data
     StaticJsonDocument<384> doc;
-    // OTAP envelope. For telemetry, source_id == device_id (same collar UID)
-    // and msg_id IS the message_id; kept compact for the ~255-byte LoRa limit.
-    doc["type"] = "telemetry";
-    doc["source_id"] = DEVICE_ID_INT;
-    doc["destination_id"] = BASE_ID;
+    // OTAP NOTE: telemetry deliberately carries NO type/source_id/destination_id
+    // envelope. Dev-mode telemetry is already ~240 B and the SX1262 hard limit
+    // is 255 B; the ~54-byte envelope pushed it to ~294 B → transmit() rejected
+    // it (RADIOLIB_ERR_PACKET_TOO_LONG). The base does not need it: telemetry is
+    // routed by device_id (it falls through the type-router) and logMessage
+    // attributes it via device_id. The envelope lives only on the small
+    // presence/command/ack/nack packets.
     doc["msg_id"] = g_msgCounter++;
     // V3.6.0 field model: device_id = immutable UID (identity); name =
     // editable friendly label. The legacy ambiguous "id" field is gone.
-    doc["device_id"] = DEVICE_ID_INT; // == source_id
+    doc["device_id"] = DEVICE_ID_INT;
     doc["name"] = (const char *)g_senderName;
     doc["status"] = homeHeartbeat ? "BLEHome" : "roaming";
     doc["mode"] = g_currentMode;
@@ -1883,13 +1894,10 @@ void TaskPower(void *)
   {
     // GPS timeout - send invalid status (still TX so base station sees us)
     StaticJsonDocument<320> doc;
-    // OTAP envelope (compact for the ~255-byte LoRa limit). For telemetry,
-    // source_id == device_id and msg_id IS the message_id.
-    doc["type"] = "telemetry";
-    doc["source_id"] = DEVICE_ID_INT;
-    doc["destination_id"] = BASE_ID;
+    // OTAP NOTE: no envelope on telemetry — see the GPS-fix builder above. The
+    // base routes by device_id; the envelope rides only the small packets.
     doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT; // == source_id (immutable UID)
+    doc["device_id"] = DEVICE_ID_INT; // immutable UID
     doc["name"] = (const char *)g_senderName; // editable label
     doc["status"] = "invalidGPSLoc";
     doc["mode"] = g_currentMode;
