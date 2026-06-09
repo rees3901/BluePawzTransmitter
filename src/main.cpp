@@ -1836,17 +1836,20 @@ void TaskPower(void *)
 
     // Build full JSON with GPS data
     StaticJsonDocument<384> doc;
-    // OTAP NOTE: telemetry deliberately carries NO type/source_id/destination_id
-    // envelope. Dev-mode telemetry is already ~240 B and the SX1262 hard limit
-    // is 255 B; the ~54-byte envelope pushed it to ~294 B → transmit() rejected
-    // it (RADIOLIB_ERR_PACKET_TOO_LONG). The base does not need it: telemetry is
-    // routed by device_id (it falls through the type-router) and logMessage
-    // attributes it via device_id. The envelope lives only on the small
-    // presence/command/ack/nack packets.
+    // OTAP unified envelope — every packet is self-describing. For telemetry
+    // source_id == device_id (this collar's UID) and destination_id == the base.
+    // BUDGET NOTE: the SX1262 hard limit is 255 B. With the envelope + core
+    // fields this leaves little room in developer mode, so the heaviest
+    // debug-only fields (heap, uptime_ms) are NOT sent over the air — they stay
+    // on the boot serial. fw IS sent on steady-state packets but skipped on the
+    // (larger) first-boot discovery packet so the frame always fits.
+    doc["type"] = "telemetry";
+    doc["source_id"] = DEVICE_ID_INT;
+    doc["destination_id"] = BASE_ID;
     doc["msg_id"] = g_msgCounter++;
     // V3.6.0 field model: device_id = immutable UID (identity); name =
     // editable friendly label. The legacy ambiguous "id" field is gone.
-    doc["device_id"] = DEVICE_ID_INT;
+    doc["device_id"] = DEVICE_ID_INT; // == source_id
     doc["name"] = (const char *)g_senderName;
     doc["status"] = homeHeartbeat ? "BLEHome" : "roaming";
     doc["mode"] = g_currentMode;
@@ -1868,14 +1871,14 @@ void TaskPower(void *)
       doc["geofence"] = gfStatus;
     }
 
-    // Developer mode: extra diagnostics in telemetry
+    // Developer mode: GPS-quality diagnostics in telemetry (kept compact to fit
+    // the 255-byte LoRa frame alongside the envelope).
     if (isDevMode())
     {
       doc["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
       doc["hdop"] = gps.hdop.isValid() ? gps.hdop.value() / 100.0 : 99.99;
-      doc["heap"] = ESP.getFreeHeap();
-      doc["uptime_ms"] = millis();
-      doc["fw"] = FIRMWARE_VERSION;
+      if (!g_firstBoot) // fw fits on steady-state packets, not the bigger first-boot one
+        doc["fw"] = FIRMWARE_VERSION;
     }
 
     TxReq req{};
@@ -1894,10 +1897,13 @@ void TaskPower(void *)
   {
     // GPS timeout - send invalid status (still TX so base station sees us)
     StaticJsonDocument<320> doc;
-    // OTAP NOTE: no envelope on telemetry — see the GPS-fix builder above. The
-    // base routes by device_id; the envelope rides only the small packets.
+    // OTAP unified envelope (same as the GPS-fix builder). No-GPS telemetry is
+    // smaller (no lat/lon/time/hdop) so it fits comfortably.
+    doc["type"] = "telemetry";
+    doc["source_id"] = DEVICE_ID_INT;
+    doc["destination_id"] = BASE_ID;
     doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT; // immutable UID
+    doc["device_id"] = DEVICE_ID_INT; // == source_id (immutable UID)
     doc["name"] = (const char *)g_senderName; // editable label
     doc["status"] = "invalidGPSLoc";
     doc["mode"] = g_currentMode;
@@ -1908,9 +1914,8 @@ void TaskPower(void *)
     if (isDevMode())
     {
       doc["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-      doc["heap"] = ESP.getFreeHeap();
-      doc["uptime_ms"] = millis();
-      doc["fw"] = FIRMWARE_VERSION;
+      if (!g_firstBoot)
+        doc["fw"] = FIRMWARE_VERSION;
     }
 
     TxReq req{};
