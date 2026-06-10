@@ -1018,11 +1018,27 @@ void setup()
   Serial.println("[BOOT] RTOS tasks started");
 }
 
-// Post-TX RX window: how long to keep TaskLoRa alive after telemetry has gone
-// out, so the receiver can opportunistically push queued commands now that it
-// knows the collar is awake. Class-A LoRaWAN-style pattern.
-#define POST_TX_LISTEN_MS 20000U // Base window
-#define POST_TX_EXTEND_MS 3000U  // Extension per command received (so bursts land)
+// Post-TX RX window: after telemetry goes out, keep the LoRa radio listening
+// briefly so the base can deliver an OTAP command + receive the collar's ACK
+// before the collar deep-sleeps. The collar shuts down GPS/BLE immediately but
+// holds the radio open for this grace period. Each command received extends the
+// window so a burst (and the ACK round-trip) all lands.
+#define POST_TX_LISTEN_MS 5000U // 5 s grace listen window before sleep
+#define POST_TX_EXTEND_MS 3000U // extend per command received (ACK round-trip)
+
+// millis() of the last inbound OTAP command for THIS device (set in
+// handleInboundLoRa, read by loop()'s listen window to extend it). Plain global
+// (within-wake only) — volatile because it crosses TaskLoRa → loop().
+static volatile uint32_t g_lastCmdRxMs = 0;
+
+// Graceful radio shutdown handshake (loop() ↔ TaskLoRa). When the listen window
+// closes, loop() raises g_loraStopReq instead of force-deleting TaskLoRa; the
+// task self-deletes at its next IDLE point (any in-flight ACK transmit finished,
+// txReqQ drained, radio re-armed) — never mid-SPI — and confirms via
+// g_loraStopped. This deterministically closes the ACK-TX teardown race that a
+// fixed time budget (LBT backoff can blow past it) could not.
+static volatile bool g_loraStopReq = false;  // loop() → TaskLoRa: stop when idle
+static volatile bool g_loraStopped = false;  // TaskLoRa → loop(): radio asleep, ending
 
 void loop()
 {
@@ -1031,63 +1047,73 @@ void loop()
 
   if (bits & EV_TXDONE)
   {
-    // V3.8.0: remote commands removed — the collar is TRANSMIT-ONLY now. Once
-    // telemetry has gone out there is nothing to listen for, so go straight to
-    // sleep cleanup (no post-TX RX window, no command handling).
-    Serial.println("[MAIN] TX done — cycle complete, cleaning up for sleep");
+    // Cycle complete (telemetry sent, or a home-skip). Open a short post-TX
+    // LISTEN WINDOW before sleeping: shut down the power-hungry peripherals
+    // (GPS, BLE) NOW, but KEEP the LoRa radio alive + listening so the base can
+    // deliver a late OTAP command and receive its ACK before we deep-sleep. The
+    // radio re-armed RX after the last TX, so TaskLoRa is already listening;
+    // handleInboundLoRa applies + ACKs in that task while loop() waits out the
+    // window here.
+    uint32_t listenStart = millis();
+    Serial.println("[MAIN] Cycle complete — GPS/BLE down, LoRa listening before sleep");
 
-    // Delete all tasks
-    if (hGPS)
+    // ── graceful peripheral shutdown (everything EXCEPT the radio) ──
+    if (hGPS)   { vTaskDelete(hGPS);   hGPS = nullptr; }
+    if (hBLE)   { vTaskDelete(hBLE);   hBLE = nullptr; }
+    if (hPower) { vTaskDelete(hPower); hPower = nullptr; } // already self-suspended
+    BLEDevice::deinit(true);
+
+    // Turn off L76K LED, power down GPS, close the UART (TX held LOW so the
+    // floating pin can't backfeed the L76K). TaskLoRa keeps listening throughout.
+    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+    delay(200);
+    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+    delay(200);
+    digitalWrite(GPS_EN, LOW);
+    gpsSerial.end();
+    pinMode(GPS_TX, OUTPUT);
+    digitalWrite(GPS_TX, LOW);
+    Serial.println("[SLEEP] GPS/BLE down, UART TX held LOW");
+
+    // ── post-TX listen window ──
+    // Stay open POST_TX_LISTEN_MS (5 s). Each inbound command stamps
+    // g_lastCmdRxMs and extends the window by POST_TX_EXTEND_MS so the ACK
+    // round-trip (and any follow-up command in the same burst) completes before
+    // we kill the radio — avoids tearing down TaskLoRa mid-ACK.
+    for (;;)
     {
-      vTaskDelete(hGPS);
-      hGPS = nullptr;
+      uint32_t now = millis();
+      uint32_t windowEnd = listenStart + POST_TX_LISTEN_MS;
+      if (g_lastCmdRxMs > listenStart && (g_lastCmdRxMs + POST_TX_EXTEND_MS) > windowEnd)
+        windowEnd = g_lastCmdRxMs + POST_TX_EXTEND_MS;
+      if (now >= windowEnd)
+        break;
+      delay(50);
     }
-    if (hBLE)
+    Serial.printf("[MAIN] Listen window closed after %lu ms — sleeping\n",
+                  (unsigned long)(millis() - listenStart));
+
+    // ── stop the radio SAFELY ──
+    // Ask TaskLoRa to self-delete at its next IDLE point — it finishes any
+    // in-flight ACK transmit + drains txReqQ first, then sleeps the radio — so we
+    // never vTaskDelete it mid-SPI on the shared bus (the ACK can clear LBT
+    // backoff + airtime well after the listen window's time budget). Wait with a
+    // hard cap so a wedged radio can't block deep sleep forever.
+    g_loraStopReq = true;
+    uint32_t stopWait = millis();
+    while (!g_loraStopped && (millis() - stopWait) < 4000U)
+      delay(20);
+    if (g_loraStopped)
     {
-      vTaskDelete(hBLE);
-      hBLE = nullptr;
+      hLoRa = nullptr; // TaskLoRa self-deleted and already slept the radio
     }
-    if (hLoRa)
+    else if (hLoRa) // cap hit — degenerate fallback (radio wedged): force it down
     {
       vTaskDelete(hLoRa);
       hLoRa = nullptr;
+      lora.sleep();
     }
-    if (hPower)
-    {
-      vTaskDelete(hPower);
-      hPower = nullptr;
-    }
-
-    // Deinitialize BLE to save power
-    BLEDevice::deinit(true);
-
-    // Put SX1262 into sleep mode (~0.2 µA vs ~4.5 mA in RX)
-    lora.sleep();
     Serial.println("[SLEEP] SX1262 radio sleeping");
-
-    // Turn off L76K LED before sleep
-    // Send the command twice with generous delays — the L76K needs time
-    // to process the proprietary binary frame at 9600 baud.
-    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-    delay(200);
-    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-    delay(200);
-    Serial.println("[SLEEP] L76K LED off command sent");
-    DEBUG_PRINTLN("[SLEEP] L76K LED off");
-
-    // Power off GPS module
-    digitalWrite(GPS_EN, LOW);
-    Serial.println("[SLEEP] GPS power disabled");
-
-    // End GPS serial to release pins
-    gpsSerial.end();
-
-    // Hold UART TX pin LOW during sleep — prevents floating pin from
-    // backfeeding current through L76K ESD diodes and lighting the LED
-    pinMode(GPS_TX, OUTPUT);
-    digitalWrite(GPS_TX, LOW);
-
-    Serial.println("[SLEEP] GPS UART closed, TX held LOW");
 
     // Save persistent state to NVS before sleep (survives USB resets)
     prefs.begin("cattracker", false);
@@ -1279,6 +1305,16 @@ static bool isEnvelopeKey(const char *k)
          !strcmp(k, "msg_id") || !strcmp(k, "timestamp") || !strcmp(k, "time");
 }
 
+// Valid OTAP-settable power profiles (the user-facing preset list). NOTE:
+// getModeByName() can't validate — it silently falls back to MODE_NORMAL for an
+// unknown name — so we check the value explicitly here. "developer" is a local
+// bench-test mode (button-toggled) and is deliberately NOT remotely settable.
+static bool bpValidProfile(const char *p)
+{
+  return p && (!strcmp(p, "powersave") || !strcmp(p, "normal") ||
+               !strcmp(p, "active") || !strcmp(p, "lost"));
+}
+
 // Parse one inbound LoRa frame (already NUL-terminated). If it is a COMMAND
 // addressed to this collar (or the broadcast ID), apply every known parameter
 // generically and queue an ACK/NACK back to the base, echoing the command's
@@ -1317,6 +1353,9 @@ static void handleInboundLoRa(const char *json)
   uint32_t msgId = doc["message_id"] | 0;     // command id we must echo back
   Serial.printf("[CMD] for-me dest=%u src=%u message_id=%lu\n",
                 dest, src, (unsigned long)msgId);
+  // Stamp the time so loop()'s post-TX listen window extends to cover the ACK
+  // round-trip + any follow-up command in the same burst.
+  g_lastCmdRxMs = millis();
 
   // ── Generic apply loop ───────────────────────────────────────────────
   // Walk every key/value; skip envelope fields; apply each known config
@@ -1353,6 +1392,27 @@ static void handleInboundLoRa(const char *json)
       Serial.printf("[CFG] name applied + persisted: '%s'\n", g_senderName);
       appliedCount++;
     }
+    else if (strcmp(key, "profile") == 0 || strcmp(key, "mode") == 0)
+    {
+      // Change the operating/power profile (powersave/normal/active/lost).
+      const char *prof = kv.value().is<const char *>() ? kv.value().as<const char *>() : nullptr;
+      if (!bpValidProfile(prof))
+      {
+        Serial.printf("[CFG] reject profile '%s' -> invalid_value\n", prof ? prof : "<non-string>");
+        nackReason = "invalid_value";
+        break;
+      }
+      // Persist to NVS + update g_currentMode/g_activeMode (survives deep sleep).
+      // The new sleep interval applies on THIS wake's sleep; LED-beacon/heartbeat
+      // behaviour applies next wake. Update the radio's TX power immediately so
+      // the ACK + any further TX this wake go out at the new mode's power (we are
+      // inside TaskLoRa, the radio owner, so this is safe).
+      saveOperatingMode(prof);
+      lora.setOutputPower(g_activeMode->lora_power_dbm);
+      Serial.printf("[CFG] profile applied + persisted: '%s' (%d dBm, sleep %ds)\n",
+                    g_currentMode, g_activeMode->lora_power_dbm, g_activeMode->sleep_interval_s);
+      appliedCount++;
+    }
     else
     {
       Serial.printf("[CMD] unsupported parameter '%s'\n", key);
@@ -1374,7 +1434,12 @@ static void handleInboundLoRa(const char *json)
   if (nackReason)
     resp["reason"] = nackReason;
   else
-    resp["name"] = (const char *)g_senderName; // echo the name we applied
+  {
+    // Echo the current name + mode so the base sees exactly what was applied
+    // (and can confirm a rename or a profile change from one ACK).
+    resp["name"] = (const char *)g_senderName;
+    resp["mode"] = g_currentMode;
+  }
 
   TxReq out{};
   out.isTelemetry = false; // response packet — must NOT trigger deep sleep
@@ -1574,6 +1639,20 @@ void TaskLoRa(void *)
         xEventGroupSetBits(evBits, EV_TXDONE);
       }
     }
+
+    // Graceful shutdown handshake. loop() raises g_loraStopReq once the post-TX
+    // listen window closes. Honour it ONLY at this IDLE point — after RX + any
+    // TX for this iteration, radio re-armed, and the TX queue EMPTY (so any
+    // pending ACK has already gone out) — and never mid-SPI. Sleep the radio and
+    // self-delete so loop() can deep-sleep safely.
+    if (g_loraStopReq && uxQueueMessagesWaiting(txReqQ) == 0)
+    {
+      lora.sleep();
+      Serial.println("[LoRa] stop requested — radio asleep, task ending");
+      g_loraStopped = true;
+      vTaskDelete(nullptr); // never returns
+    }
+
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
