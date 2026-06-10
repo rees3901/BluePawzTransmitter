@@ -757,11 +757,13 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
 
   // Add remaining fields
   char temp[200];
+  // v3.9.x: telemetry now uses SHORT wire keys (seq=msg_id, st=status); this
+  // local CSV parses the same doc so it reads the short keys too.
   snprintf(temp, sizeof(temp), "%u,%s,%s,%s,%.6f,%.6f,%.1f,%s,%.2f,%d,%.1f",
-           doc["msg_id"] | 0,
+           doc["seq"] | 0,
            doc["name"] | (const char *)g_senderName,
            g_currentMode,
-           doc["status"] | "unknown",
+           doc["st"] | "unknown",
            doc["lat"] | 0.0,
            doc["lon"] | 0.0,
            doc["dist_m"] | 0.0,
@@ -776,9 +778,9 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
   logFile.println(csvLine);
   logFile.close();
 
-  Serial.printf("[CSV] Logged: msg_id=%u, status=%s\n",
-                doc["msg_id"] | 0, doc["status"] | "?");
-  DEBUG_PRINTF("[CSV] Log: %u\n", doc["msg_id"] | 0);
+  Serial.printf("[CSV] Logged: seq=%u, st=%s\n",
+                doc["seq"] | 0, doc["st"] | "?");
+  DEBUG_PRINTF("[CSV] Log: %u\n", doc["seq"] | 0);
 
 #endif
 }
@@ -1300,19 +1302,22 @@ void IRAM_ATTR onLoRaDio1()
 // apply loop below.
 static bool isEnvelopeKey(const char *k)
 {
-  return !strcmp(k, "type") || !strcmp(k, "source_id") ||
-         !strcmp(k, "destination_id") || !strcmp(k, "message_id") ||
-         !strcmp(k, "msg_id") || !strcmp(k, "timestamp") || !strcmp(k, "time");
+  // SHORT wire keys: src/dst/mid/seq/did (+ ping, the special command flag).
+  return !strcmp(k, "type") || !strcmp(k, "src") || !strcmp(k, "dst") ||
+         !strcmp(k, "mid") || !strcmp(k, "seq") || !strcmp(k, "did") ||
+         !strcmp(k, "ping") || !strcmp(k, "timestamp") || !strcmp(k, "time");
 }
 
-// Valid OTAP-settable power profiles (the user-facing preset list). NOTE:
-// getModeByName() can't validate — it silently falls back to MODE_NORMAL for an
-// unknown name — so we check the value explicitly here. "developer" is a local
-// bench-test mode (button-toggled) and is deliberately NOT remotely settable.
+// Valid OTAP-settable power profiles. NOTE: getModeByName() can't validate — it
+// silently falls back to MODE_NORMAL for an unknown name — so we check the value
+// explicitly here. "developer" IS remotely settable (useful for debugging: it
+// adds dev diagnostics to telemetry, lowest awake power, 30 s cycle); it can
+// also still be toggled locally by the button.
 static bool bpValidProfile(const char *p)
 {
   return p && (!strcmp(p, "powersave") || !strcmp(p, "normal") ||
-               !strcmp(p, "active") || !strcmp(p, "lost"));
+               !strcmp(p, "active") || !strcmp(p, "lost") ||
+               !strcmp(p, "developer"));
 }
 
 // Parse one inbound LoRa frame (already NUL-terminated). If it is a COMMAND
@@ -1342,20 +1347,61 @@ static void handleInboundLoRa(const char *json)
     return;
   }
 
-  uint16_t dest = doc["destination_id"] | 0;
+  uint16_t dest = doc["dst"] | 0;             // destination_id (short wire key)
   if (dest != DEVICE_ID_INT && dest != BROADCAST_ID)
   {
     Serial.printf("[CMD] not-for-me (dest=%u, me=%u)\n", dest, DEVICE_ID_INT);
     return;
   }
 
-  uint16_t src = doc["source_id"] | BASE_ID;  // who to answer (the base)
-  uint32_t msgId = doc["message_id"] | 0;     // command id we must echo back
-  Serial.printf("[CMD] for-me dest=%u src=%u message_id=%lu\n",
+  uint16_t src = doc["src"] | BASE_ID;        // source_id — who to answer (the base)
+  uint32_t msgId = doc["mid"] | 0;            // message_id — id we must echo back
+  Serial.printf("[CMD] for-me dst=%u src=%u mid=%lu\n",
                 dest, src, (unsigned long)msgId);
-  // Stamp the time so loop()'s post-TX listen window extends to cover the ACK
-  // round-trip + any follow-up command in the same burst.
+  // Stamp the time so loop()'s post-TX listen window extends to cover the
+  // reply round-trip + any follow-up command in the same burst.
   g_lastCmdRxMs = millis();
+
+  // ── PING → immediate solicited telemetry reply ───────────────────────
+  // No separate ping/pong subsystem: a ping just makes us emit a normal
+  // telemetry packet from the collar's CURRENT values (fresh GPS if locked this
+  // wake, else marked no-fix), tagged pong:true + echoing the ping's mid so the
+  // base can match it. Queued isTelemetry=false so it never triggers sleep. No
+  // ACK and no apply loop for a ping.
+  if (doc["ping"].is<bool>() || doc["ping"].is<int>())
+  {
+    StaticJsonDocument<320> pong;
+    pong["type"] = "telemetry";
+    pong["src"] = DEVICE_ID_INT;
+    pong["dst"] = src;
+    pong["seq"] = g_msgCounter++;
+    pong["did"] = DEVICE_ID_INT;
+    pong["name"] = (const char *)g_senderName;
+    pong["md"] = g_currentMode;
+    pong["pong"] = true; // solicited-response marker
+    pong["mid"] = msgId; // echo the ping's id
+    if (gps.location.isValid())
+    {
+      pong["st"] = "roaming";
+      pong["lat"] = gps.location.lat();
+      pong["lon"] = gps.location.lng();
+    }
+    else
+    {
+      pong["st"] = "invalidGPSLoc"; // awake but no fix yet this wake
+    }
+    if (isDevMode())
+      pong["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+
+    TxReq out{};
+    out.isTelemetry = false;
+    serializeJson(pong, out.json, sizeof(out.json));
+    if (xQueueSend(txReqQ, &out, pdMS_TO_TICKS(100)) == pdTRUE)
+      Serial.printf("[PONG] solicited telemetry queued: %s\n", out.json);
+    else
+      Serial.println("[PONG] queue full — reply dropped");
+    return;
+  }
 
   // ── Generic apply loop ───────────────────────────────────────────────
   // Walk every key/value; skip envelope fields; apply each known config
@@ -1392,9 +1438,9 @@ static void handleInboundLoRa(const char *json)
       Serial.printf("[CFG] name applied + persisted: '%s'\n", g_senderName);
       appliedCount++;
     }
-    else if (strcmp(key, "profile") == 0 || strcmp(key, "mode") == 0)
+    else if (strcmp(key, "md") == 0)
     {
-      // Change the operating/power profile (powersave/normal/active/lost).
+      // Change the operating/power profile (md = mode, short wire key).
       const char *prof = kv.value().is<const char *>() ? kv.value().as<const char *>() : nullptr;
       if (!bpValidProfile(prof))
       {
@@ -1424,13 +1470,13 @@ static void handleInboundLoRa(const char *json)
   if (!nackReason && appliedCount == 0)
     nackReason = "unsupported_command"; // command had no recognised parameter
 
-  // ── Build the response (ACK on success, NACK on failure) ─────────────
+  // ── Build the response (ACK on success, NACK on failure) — SHORT keys ─
   StaticJsonDocument<256> resp;
   resp["type"] = nackReason ? "nack" : "ack";
-  resp["source_id"] = DEVICE_ID_INT;
-  resp["destination_id"] = src;
-  resp["message_id"] = msgId;        // echo the command's id for matching
-  resp["device_id"] = DEVICE_ID_INT;
+  resp["src"] = DEVICE_ID_INT;       // source_id
+  resp["dst"] = src;                 // destination_id (the base)
+  resp["mid"] = msgId;               // echo the command's message_id for matching
+  resp["did"] = DEVICE_ID_INT;       // device_id
   if (nackReason)
     resp["reason"] = nackReason;
   else
@@ -1438,7 +1484,7 @@ static void handleInboundLoRa(const char *json)
     // Echo the current name + mode so the base sees exactly what was applied
     // (and can confirm a rename or a profile change from one ACK).
     resp["name"] = (const char *)g_senderName;
-    resp["mode"] = g_currentMode;
+    resp["md"] = g_currentMode;
   }
 
   TxReq out{};
@@ -1685,10 +1731,10 @@ void TaskPower(void *)
   {
     StaticJsonDocument<160> pres;
     pres["type"] = "presence";
-    pres["source_id"] = DEVICE_ID_INT;
-    pres["destination_id"] = BASE_ID;
-    pres["message_id"] = g_msgCounter++;
-    pres["device_id"] = DEVICE_ID_INT; // == source_id (aids base attribution)
+    pres["src"] = DEVICE_ID_INT;       // source_id (this collar)
+    pres["dst"] = BASE_ID;             // destination_id (the base)
+    pres["mid"] = g_msgCounter++;      // message_id
+    pres["did"] = DEVICE_ID_INT;       // device_id (== src)
     pres["uptime_ms"] = millis();
 
     TxReq req{};
@@ -1915,23 +1961,21 @@ void TaskPower(void *)
 
     // Build full JSON with GPS data
     StaticJsonDocument<384> doc;
-    // OTAP unified envelope — every packet is self-describing. For telemetry
-    // source_id == device_id (this collar's UID) and destination_id == the base.
-    // BUDGET NOTE: the SX1262 hard limit is 255 B. With the envelope + core
-    // fields this leaves little room in developer mode, so the heaviest
-    // debug-only fields (heap, uptime_ms) are NOT sent over the air — they stay
-    // on the boot serial. fw IS sent on steady-state packets but skipped on the
-    // (larger) first-boot discovery packet so the frame always fits.
+    // OTAP unified envelope — every packet is self-describing. SHORT wire keys
+    // to save airtime/power (the base expands them back to long keys for the UI
+    // + logs): src=source_id, dst=destination_id, seq=msg_id (telemetry counter),
+    // did=device_id, st=status, md=mode. type/name/lat/lon/time kept verbatim.
+    // For telemetry src == did (this collar's UID) and dst == the base.
+    // BUDGET: the SX1262 cap is 255 B; in dev mode heap/uptime_ms are dropped and
+    // fw rides steady-state packets only so the frame always fits.
     doc["type"] = "telemetry";
-    doc["source_id"] = DEVICE_ID_INT;
-    doc["destination_id"] = BASE_ID;
-    doc["msg_id"] = g_msgCounter++;
-    // V3.6.0 field model: device_id = immutable UID (identity); name =
-    // editable friendly label. The legacy ambiguous "id" field is gone.
-    doc["device_id"] = DEVICE_ID_INT; // == source_id
-    doc["name"] = (const char *)g_senderName;
-    doc["status"] = homeHeartbeat ? "BLEHome" : "roaming";
-    doc["mode"] = g_currentMode;
+    doc["src"] = DEVICE_ID_INT;
+    doc["dst"] = BASE_ID;
+    doc["seq"] = g_msgCounter++;
+    doc["did"] = DEVICE_ID_INT; // == src; immutable UID (identity)
+    doc["name"] = (const char *)g_senderName; // editable friendly label
+    doc["st"] = homeHeartbeat ? "BLEHome" : "roaming";
+    doc["md"] = g_currentMode;
     doc["lat"] = fix.lat;
     doc["lon"] = fix.lon;
     if (fix.dateTime[0] != '\0')
@@ -1976,16 +2020,15 @@ void TaskPower(void *)
   {
     // GPS timeout - send invalid status (still TX so base station sees us)
     StaticJsonDocument<320> doc;
-    // OTAP unified envelope (same as the GPS-fix builder). No-GPS telemetry is
-    // smaller (no lat/lon/time/hdop) so it fits comfortably.
+    // OTAP unified envelope, SHORT wire keys (see the GPS-fix builder).
     doc["type"] = "telemetry";
-    doc["source_id"] = DEVICE_ID_INT;
-    doc["destination_id"] = BASE_ID;
-    doc["msg_id"] = g_msgCounter++;
-    doc["device_id"] = DEVICE_ID_INT; // == source_id (immutable UID)
+    doc["src"] = DEVICE_ID_INT;
+    doc["dst"] = BASE_ID;
+    doc["seq"] = g_msgCounter++;
+    doc["did"] = DEVICE_ID_INT; // == src (immutable UID)
     doc["name"] = (const char *)g_senderName; // editable label
-    doc["status"] = "invalidGPSLoc";
-    doc["mode"] = g_currentMode;
+    doc["st"] = "invalidGPSLoc";
+    doc["md"] = g_currentMode;
     if (g_firstBoot)
     {
       doc["first_boot"] = true;
