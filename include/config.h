@@ -40,7 +40,7 @@
 #define LORA_SF 9           // Spreading Factor (7-12). 9 = range/airtime balance
 #define LORA_BW_KHZ 125.0   // Bandwidth (kHz). 125 narrows noise floor for +3dB
 #define LORA_CR 5           // Coding Rate 4/5 (auto-detected by RX via header)
-#define LORA_PREAMBLE 16    // Preamble length (base RX is always-on, 16 is ample)
+#define LORA_PREAMBLE 8     // Standard preamble; base RX is always listening
 #define LORA_USE_CRC 1      // Enable CRC
 #define LORA_SYNC_WORD 0x12 // Private network sync word
 
