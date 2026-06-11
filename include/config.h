@@ -185,7 +185,9 @@ const OperatingMode MODE_DEVELOPER = {
 // {"cmd":"mode","profile":"powersave"}
 // {"cmd":"mode","profile":"developer"}
 // {"cmd":"get_status"}           // Request current mode/battery/GPS status
-// {"cmd":"ping"}                 // Presence check — collar replies with pong + link stats
+// {"type":"CMD","src":1,"dst":N,"mid":42,"ping":true}
+// Ping produces immediate telemetry tagged pong:true. It uses the current GPS
+// fix when available, otherwise the last valid fix retained in RTC memory.
 // {"cmd":"set_geofence","device_id":N,"lat":XX.X,"lon":YY.Y,"radius_m":500}
 // {"cmd":"set_geofence","device_id":N,"enabled":false}  // Disable geofence
 
@@ -193,7 +195,9 @@ const OperatingMode MODE_DEVELOPER = {
 // {"ack":"mode","profile":"lost","power":22,"sleep":30}
 // {"status":"ok","mode":"normal","battery":3.7,"gps":"locked","uptime":3600}
 // {"ack":"set_geofence","ok":true,"lat":XX.X,"lon":YY.Y,"radius_m":500}
-// {"pong":true,"device":"Podge","rssi":-45,"snr":8.5,"uptime_ms":3200}
+// {"type":"tel","src":N,"dst":1,"mid":42,"seq":99,
+//  "name":"Podge","st":"last","md":"normal","pong":true,
+//  "lat":51.0,"lon":-2.0,"time":1781188262}
 
 // ─────────────────────────────────────────────
 // Helper Function: Get Mode by Name

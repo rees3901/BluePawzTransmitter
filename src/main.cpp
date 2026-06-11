@@ -3,7 +3,7 @@
   │  CAT TRACKER TX (ESP32S3 + FreeRTOS)                       │
   │  SX1262 LoRa + TinyGPSPlus + BLE "Home" beacon             │
   │  Behaviour: wake → GPS/ BLE → build JSON → LoRa TX → sleep │
-  │  JSON fields: msg_id, device_id, id, status, lat/lon/time… │
+  │  Compact JSON: src/dst/seq/name/status/GPS Unix time       │
   └─────────────────────────────────────────────────────────────┘
 
   High‑level RTOS design
@@ -238,7 +238,7 @@ struct GpsFix
   double lat = 0;
   double lon = 0;
   bool valid = false;
-  char dateTime[24] = ""; // Format: "YYYY-MM-DD HH:MM:SS"
+  uint32_t unixTime = 0; // GPS UTC as Unix seconds; 0 when unavailable
 };
 
 struct TxReq
@@ -255,11 +255,34 @@ static EventGroupHandle_t evBits; // state flags
 #define EV_HOME (1 << 1)     // BLE beacon seen this cycle
 #define EV_TXDONE (1 << 2)   // LoRa TX finished
 
+// Convert a validated GPS UTC date/time to Unix seconds without relying on the
+// ESP32 system clock or timezone configuration.
+static uint32_t gpsToUnixTime(uint16_t year, uint8_t month, uint8_t day,
+                              uint8_t hour, uint8_t minute, uint8_t second)
+{
+  static const uint16_t daysBeforeMonth[] =
+      {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+  uint32_t y = year;
+  uint32_t days = (y - 1970) * 365;
+  days += (y - 1969) / 4;
+  days -= (y - 1901) / 100;
+  days += (y - 1601) / 400;
+  days += daysBeforeMonth[month - 1];
+  if (month > 2 && (y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0)))
+    days++;
+  days += day - 1;
+  return days * 86400UL + hour * 3600UL + minute * 60UL + second;
+}
+
 // Persisted counters and state across deep sleep (RTC memory - fast but cleared on reset)
 RTC_DATA_ATTR uint32_t g_msgCounter = 0;
 RTC_DATA_ATTR bool g_gpsWarmedUp = false;        // Tracks if GPS has achieved initial lock
 RTC_DATA_ATTR uint8_t g_homeBeaconCycles = 0;    // Count consecutive cycles at home (BLE detected)
 RTC_DATA_ATTR char g_currentMode[16] = "developer"; // Current operating mode name
+RTC_DATA_ATTR bool g_lastGpsValid = false;        // Last valid fix retained across deep sleep
+RTC_DATA_ATTR double g_lastGpsLat = 0.0;
+RTC_DATA_ATTR double g_lastGpsLon = 0.0;
+RTC_DATA_ATTR uint32_t g_lastGpsUnixTime = 0;
 // V3 fix: previously stored a millis()-based timestamp ("g_lostModeStartTime"),
 // but millis() resets every deep-sleep wake, so the 2-hour timeout never fired
 // correctly. Track total seconds in lost mode by ACCUMULATING across wakes
@@ -283,6 +306,16 @@ static bool g_firstBoot = false;
 static inline bool isDevMode()
 {
   return strcmp(g_currentMode, "developer") == 0;
+}
+
+static inline const char *modeToWire(const char *mode)
+{
+  return strcmp(mode, "developer") == 0 ? "dev" : mode;
+}
+
+static inline const char *modeFromWire(const char *mode)
+{
+  return mode && strcmp(mode, "dev") == 0 ? "developer" : mode;
 }
 
 // Current active mode (loaded from NVS/RTC on boot)
@@ -744,16 +777,10 @@ static void logTransmissionToCSV(const char *json, int rssi = 0, float snr = 0.0
   // Build CSV line: timestamp,msg_id,device,mode,status,lat,lon,dist_m,bearing,battery_v,rssi,snr
   char csvLine[256];
 
-  // Get current time from GPS if available, otherwise use uptime
-  const char *timestamp = doc["time"] | "";
-  if (strlen(timestamp) == 0)
-  {
-    snprintf(csvLine, sizeof(csvLine), "%lu,", millis() / 1000); // Uptime in seconds
-  }
-  else
-  {
-    snprintf(csvLine, sizeof(csvLine), "%s,", timestamp);
-  }
+  // The wire carries GPS time as Unix seconds. Fall back to uptime if absent.
+  uint32_t timestamp = doc["time"] | (uint32_t)0;
+  snprintf(csvLine, sizeof(csvLine), "%lu,",
+           (unsigned long)(timestamp ? timestamp : millis() / 1000));
 
   // Add remaining fields
   char temp[200];
@@ -1208,18 +1235,25 @@ void TaskGPS(void *)
       fix.lat = gps.location.lat();
       fix.lon = gps.location.lng();
       fix.valid = gps.location.isValid();
+      if (fix.valid)
+      {
+        g_lastGpsValid = true;
+        g_lastGpsLat = fix.lat;
+        g_lastGpsLon = fix.lon;
+      }
 
-      // Format date/time as human-readable string
+      // Convert valid GPS UTC directly to compact Unix seconds for the wire.
       if (gps.date.isValid() && gps.time.isValid())
       {
-        snprintf(fix.dateTime, sizeof(fix.dateTime),
-                 "%04d-%02d-%02d %02d:%02d:%02d",
-                 gps.date.year(), gps.date.month(), gps.date.day(),
-                 gps.time.hour(), gps.time.minute(), gps.time.second());
+        fix.unixTime = gpsToUnixTime(
+            gps.date.year(), gps.date.month(), gps.date.day(),
+            gps.time.hour(), gps.time.minute(), gps.time.second());
+        if (fix.valid)
+          g_lastGpsUnixTime = fix.unixTime;
       }
       else
       {
-        fix.dateTime[0] = '\0'; // Empty if invalid
+        fix.unixTime = 0;
       }
 
       if (fix.valid && !lastReportedValid)
@@ -1302,9 +1336,13 @@ void IRAM_ATTR onLoRaDio1()
 // apply loop below.
 static bool isEnvelopeKey(const char *k)
 {
-  // SHORT wire keys: src/dst/mid/seq/did (+ ping, the special command flag).
+  // Short keys are current; long/legacy aliases remain accepted during rollout.
   return !strcmp(k, "type") || !strcmp(k, "src") || !strcmp(k, "dst") ||
          !strcmp(k, "mid") || !strcmp(k, "seq") || !strcmp(k, "did") ||
+         !strcmp(k, "source_id") || !strcmp(k, "destination_id") ||
+         !strcmp(k, "message_id") || !strcmp(k, "msg_id") ||
+         !strcmp(k, "device_id") || !strcmp(k, "cmd") ||
+         !strcmp(k, "profile") || !strcmp(k, "device") ||
          !strcmp(k, "ping") || !strcmp(k, "timestamp") || !strcmp(k, "time");
 }
 
@@ -1340,22 +1378,30 @@ static void handleInboundLoRa(const char *json)
   }
 
   const char *type = doc["type"] | "";
-  if (strcmp(type, "command") != 0)
+  const char *legacyCmd = doc["cmd"] | "";
+  if (strcmp(type, "CMD") != 0 && strcmp(type, "command") != 0 &&
+      legacyCmd[0] == '\0')
   {
     // Overheard telemetry / ACK / presence from elsewhere — ignore quietly.
     DEBUG_PRINTF("[RX] ignore type '%s'\n", type);
     return;
   }
 
-  uint16_t dest = doc["dst"] | 0;             // destination_id (short wire key)
+  uint16_t dest = doc["dst"] | (uint16_t)(doc["destination_id"] | (uint16_t)(doc["device_id"] | 0));
+  const char *legacyDevice = doc["device"] | "";
+  if (dest == 0 && legacyDevice[0] != '\0' &&
+      (strcmp(legacyDevice, g_senderName) == 0 || strcmp(legacyDevice, "broadcast") == 0))
+  {
+    dest = (strcmp(legacyDevice, "broadcast") == 0) ? BROADCAST_ID : DEVICE_ID_INT;
+  }
   if (dest != DEVICE_ID_INT && dest != BROADCAST_ID)
   {
     Serial.printf("[CMD] not-for-me (dest=%u, me=%u)\n", dest, DEVICE_ID_INT);
     return;
   }
 
-  uint16_t src = doc["src"] | BASE_ID;        // source_id — who to answer (the base)
-  uint32_t msgId = doc["mid"] | 0;            // message_id — id we must echo back
+  uint16_t src = doc["src"] | (uint16_t)(doc["source_id"] | BASE_ID);
+  uint32_t msgId = doc["mid"] | (uint32_t)(doc["message_id"] | (uint32_t)(doc["msg_id"] | 0));
   Serial.printf("[CMD] for-me dst=%u src=%u mid=%lu\n",
                 dest, src, (unsigned long)msgId);
   // Stamp the time so loop()'s post-TX listen window extends to cover the
@@ -1365,32 +1411,49 @@ static void handleInboundLoRa(const char *json)
   // ── PING → immediate solicited telemetry reply ───────────────────────
   // No separate ping/pong subsystem: a ping just makes us emit a normal
   // telemetry packet from the collar's CURRENT values (fresh GPS if locked this
-  // wake, else marked no-fix), tagged pong:true + echoing the ping's mid so the
-  // base can match it. Queued isTelemetry=false so it never triggers sleep. No
-  // ACK and no apply loop for a ping.
-  if (doc["ping"].is<bool>() || doc["ping"].is<int>())
+  // wake, otherwise the retained fix explicitly marked "last"), tagged
+  // pong:true + echoing the ping's mid so the base can match it. Queued
+  // isTelemetry=false so it never triggers sleep. No ACK and no apply loop.
+  if (doc["ping"].is<bool>() || doc["ping"].is<int>() || strcmp(legacyCmd, "ping") == 0)
   {
     StaticJsonDocument<320> pong;
-    pong["type"] = "telemetry";
+    bool retainedFix = false;
+    pong["type"] = "tel";
     pong["src"] = DEVICE_ID_INT;
     pong["dst"] = src;
     pong["seq"] = g_msgCounter++;
-    pong["did"] = DEVICE_ID_INT;
     pong["name"] = (const char *)g_senderName;
-    pong["md"] = g_currentMode;
+    pong["md"] = modeToWire(g_currentMode);
     pong["pong"] = true; // solicited-response marker
     pong["mid"] = msgId; // echo the ping's id
     if (gps.location.isValid())
     {
-      pong["st"] = "roaming";
+      pong["st"] = "roam";
       pong["lat"] = gps.location.lat();
       pong["lon"] = gps.location.lng();
+      if (gps.date.isValid() && gps.time.isValid())
+      {
+        pong["time"] = gpsToUnixTime(
+            gps.date.year(), gps.date.month(), gps.date.day(),
+            gps.time.hour(), gps.time.minute(), gps.time.second());
+      }
+    }
+    else if (g_lastGpsValid)
+    {
+      pong["st"] = "last";
+      pong["lat"] = g_lastGpsLat;
+      pong["lon"] = g_lastGpsLon;
+      retainedFix = true;
+      if (g_lastGpsUnixTime != 0)
+        pong["time"] = g_lastGpsUnixTime;
     }
     else
     {
       pong["st"] = "invalidGPSLoc"; // awake but no fix yet this wake
     }
-    if (isDevMode())
+    // Satellite count only describes the current GPS receiver state. It would
+    // be misleading beside a retained fix from an earlier wake.
+    if (isDevMode() && !retainedFix)
       pong["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
 
     TxReq out{};
@@ -1401,6 +1464,18 @@ static void handleInboundLoRa(const char *json)
     else
       Serial.println("[PONG] queue full — reply dropped");
     return;
+  }
+
+  // Normalize the previous command shape into the compact generic parameter.
+  if (strcmp(legacyCmd, "mode") == 0 && doc["profile"].is<const char *>())
+    doc["md"] = doc["profile"].as<const char *>();
+
+  if (doc["md"].is<const char *>())
+  {
+    const char *wireMode = doc["md"].as<const char *>();
+    const char *mode = modeFromWire(wireMode);
+    if (mode != wireMode)
+      doc["md"] = mode;
   }
 
   // ── Generic apply loop ───────────────────────────────────────────────
@@ -1476,7 +1551,6 @@ static void handleInboundLoRa(const char *json)
   resp["src"] = DEVICE_ID_INT;       // source_id
   resp["dst"] = src;                 // destination_id (the base)
   resp["mid"] = msgId;               // echo the command's message_id for matching
-  resp["did"] = DEVICE_ID_INT;       // device_id
   if (nackReason)
     resp["reason"] = nackReason;
   else
@@ -1484,7 +1558,7 @@ static void handleInboundLoRa(const char *json)
     // Echo the current name + mode so the base sees exactly what was applied
     // (and can confirm a rename or a profile change from one ACK).
     resp["name"] = (const char *)g_senderName;
-    resp["md"] = g_currentMode;
+    resp["md"] = modeToWire(g_currentMode);
   }
 
   TxReq out{};
@@ -1708,10 +1782,10 @@ void TaskLoRa(void *)
 //  • New power-saving strategy:
 //    1) Wake → BLE scan 10s for 'Home' beacon
 //    2) If Home detected → sleep immediately (skip GPS/TX)
-//       - After N home cycles (per mode), acquire GPS and TX "BLEHome" heartbeat
+//       - After N home cycles (per mode), acquire GPS and TX st:"home" heartbeat
 //    3) If no Home → enable GPS, continue BLE scanning during GPS acquisition
 //       - If Home appears during GPS → abort TX and sleep
-//       - If no Home → transmit with GPS data and "roaming" status
+//       - If no Home → transmit with GPS data and st:"roam"
 // ─────────────────────────────────────────────
 void TaskPower(void *)
 {
@@ -1730,11 +1804,10 @@ void TaskPower(void *)
   // → it does NOT set EV_TXDONE, so it never short-circuits the wake to sleep.
   {
     StaticJsonDocument<160> pres;
-    pres["type"] = "presence";
+    pres["type"] = "ping";
     pres["src"] = DEVICE_ID_INT;       // source_id (this collar)
     pres["dst"] = BASE_ID;             // destination_id (the base)
     pres["mid"] = g_msgCounter++;      // message_id
-    pres["did"] = DEVICE_ID_INT;       // device_id (== src)
     pres["uptime_ms"] = millis();
 
     TxReq req{};
@@ -1963,24 +2036,21 @@ void TaskPower(void *)
     StaticJsonDocument<384> doc;
     // OTAP unified envelope — every packet is self-describing. SHORT wire keys
     // to save airtime/power (the base expands them back to long keys for the UI
-    // + logs): src=source_id, dst=destination_id, seq=msg_id (telemetry counter),
-    // did=device_id, st=status, md=mode. type/name/lat/lon/time kept verbatim.
-    // For telemetry src == did (this collar's UID) and dst == the base.
-    // BUDGET: the SX1262 cap is 255 B; in dev mode heap/uptime_ms are dropped and
-    // fw rides steady-state packets only so the frame always fits.
-    doc["type"] = "telemetry";
+    // + logs): src=source/device identity, dst=destination, seq=telemetry ID,
+    // st=status and md=mode. GPS time is Unix seconds. The receiver expands
+    // these into its descriptive internal/UI fields.
+    doc["type"] = "tel";
     doc["src"] = DEVICE_ID_INT;
     doc["dst"] = BASE_ID;
     doc["seq"] = g_msgCounter++;
-    doc["did"] = DEVICE_ID_INT; // == src; immutable UID (identity)
     doc["name"] = (const char *)g_senderName; // editable friendly label
-    doc["st"] = homeHeartbeat ? "BLEHome" : "roaming";
-    doc["md"] = g_currentMode;
+    doc["st"] = homeHeartbeat ? "home" : "roam";
+    doc["md"] = modeToWire(g_currentMode);
     doc["lat"] = fix.lat;
     doc["lon"] = fix.lon;
-    if (fix.dateTime[0] != '\0')
+    if (fix.unixTime != 0)
     {
-      doc["time"] = fix.dateTime;
+      doc["time"] = fix.unixTime;
     }
     if (g_firstBoot)
     {
@@ -1999,9 +2069,6 @@ void TaskPower(void *)
     if (isDevMode())
     {
       doc["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-      doc["hdop"] = gps.hdop.isValid() ? gps.hdop.value() / 100.0 : 99.99;
-      if (!g_firstBoot) // fw fits on steady-state packets, not the bigger first-boot one
-        doc["fw"] = FIRMWARE_VERSION;
     }
 
     TxReq req{};
@@ -2021,14 +2088,13 @@ void TaskPower(void *)
     // GPS timeout - send invalid status (still TX so base station sees us)
     StaticJsonDocument<320> doc;
     // OTAP unified envelope, SHORT wire keys (see the GPS-fix builder).
-    doc["type"] = "telemetry";
+    doc["type"] = "tel";
     doc["src"] = DEVICE_ID_INT;
     doc["dst"] = BASE_ID;
     doc["seq"] = g_msgCounter++;
-    doc["did"] = DEVICE_ID_INT; // == src (immutable UID)
     doc["name"] = (const char *)g_senderName; // editable label
     doc["st"] = "invalidGPSLoc";
-    doc["md"] = g_currentMode;
+    doc["md"] = modeToWire(g_currentMode);
     if (g_firstBoot)
     {
       doc["first_boot"] = true;
@@ -2036,8 +2102,6 @@ void TaskPower(void *)
     if (isDevMode())
     {
       doc["sats"] = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-      if (!g_firstBoot)
-        doc["fw"] = FIRMWARE_VERSION;
     }
 
     TxReq req{};
