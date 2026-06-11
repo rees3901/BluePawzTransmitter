@@ -15,7 +15,7 @@
 
   Sleep policy
   ────────────
-  • Uses deep sleep via timer wake (default 30 s). Adjust SLEEP_SECONDS below.
+  • Uses deep sleep with profile timer or GPIO21 user-button wake.
   • All state that must persist across deep sleep uses RTC_DATA_ATTR.
 
   NOTE: Keep RadioLib access in a single task (TaskLoRa). Do not use RadioLib
@@ -32,6 +32,7 @@
 #include <LittleFS.h>
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <driver/rtc_io.h>
 #include "config.h" // Operating modes and shared configuration
 
 #ifndef FIRMWARE_VERSION
@@ -301,6 +302,7 @@ RTC_DATA_ATTR char g_preGeofenceMode[16] = "";   // Mode before geofence auto-es
 // First boot flag — forces full GPS acquisition + TX regardless of BLE home,
 // so the base station discovers this collar and its initial location.
 static bool g_firstBoot = false;
+static bool g_buttonWake = false;
 
 // Developer mode helper — returns true when the active mode is "developer"
 static inline bool isDevMode()
@@ -333,6 +335,31 @@ static void saveOperatingMode(const char *modeName);
 // Detects: press → release → press → release within DEV_MODE_DOUBLE_PRESS_MS.
 static enum { BTN_IDLE, BTN_WAIT_RELEASE1, BTN_WAIT_PRESS2, BTN_WAIT_RELEASE2 } g_btnState = BTN_IDLE;
 static uint32_t g_btnTimestamp = 0;
+
+static void toggleDeveloperMode()
+{
+  if (isDevMode())
+  {
+    saveOperatingMode("normal");
+    g_activeMode = getModeByName("normal");
+    Serial.println("[BTN] *** Developer Mode OFF — switched to Normal ***");
+  }
+  else
+  {
+    saveOperatingMode("developer");
+    g_activeMode = getModeByName("developer");
+    Serial.println("[BTN] *** Developer Mode ON ***");
+  }
+
+  int flashes = isDevMode() ? 5 : 2;
+  for (int i = 0; i < flashes; i++)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    delay(150);
+    digitalWrite(LED_PIN, LOW);
+    delay(150);
+  }
+}
 
 static void pollButtonToggle()
 {
@@ -376,32 +403,45 @@ static void pollButtonToggle()
     if (!pressed)
     {
       // Double-press detected! Toggle developer mode.
-      if (isDevMode())
-      {
-        saveOperatingMode("normal");
-        g_activeMode = getModeByName("normal");
-        Serial.println("[BTN] *** Developer Mode OFF — switched to Normal ***");
-      }
-      else
-      {
-        saveOperatingMode("developer");
-        g_activeMode = getModeByName("developer");
-        Serial.println("[BTN] *** Developer Mode ON ***");
-      }
-
-      int flashes = isDevMode() ? 5 : 2;
-      for (int i = 0; i < flashes; i++)
-      {
-        digitalWrite(LED_PIN, HIGH);
-        delay(150);
-        digitalWrite(LED_PIN, LOW);
-        delay(150);
-      }
-
+      toggleDeveloperMode();
       g_btnState = BTN_IDLE;
     }
     break;
   }
+}
+
+// A sleeping collar wakes on the first press before the normal polling state
+// machine is running. Give that click its usual double-click window during
+// boot. Without a second click, continue into the standard presence cycle.
+static void handleButtonWakeGesture()
+{
+  if (!g_buttonWake)
+    return;
+
+  Serial.println("[BTN] User button woke collar — waiting briefly for second click");
+
+  uint32_t releaseDeadline = millis() + 2000U;
+  while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW &&
+         (int32_t)(releaseDeadline - millis()) > 0)
+    delay(10);
+
+  uint32_t secondPressDeadline = millis() + DEV_MODE_DOUBLE_PRESS_MS;
+  while ((int32_t)(secondPressDeadline - millis()) > 0)
+  {
+    if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
+    {
+      uint32_t secondReleaseDeadline = millis() + 2000U;
+      while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW &&
+             (int32_t)(secondReleaseDeadline - millis()) > 0)
+        delay(10);
+      toggleDeveloperMode();
+      Serial.println("[BTN] Button wake handled as developer-mode double-click");
+      return;
+    }
+    delay(10);
+  }
+
+  Serial.println("[BTN] Single press — starting forced presence/wake cycle");
 }
 
 // ─────────────────────────────────────────────
@@ -882,6 +922,7 @@ void setup()
   gpio_hold_dis((gpio_num_t)GPS_TX);
   gpio_hold_dis((gpio_num_t)LORA_NSS);
   gpio_hold_dis((gpio_num_t)LORA_RST);
+  rtc_gpio_deinit((gpio_num_t)DEV_MODE_BUTTON_PIN);
 
   Serial.begin(115200);
   delay(100); // Give serial time to initialize
@@ -916,6 +957,7 @@ void setup()
   Serial.printf("[BOOT] Reset reason: %d  Wakeup cause: %d\n",
                 esp_reset_reason(), wakeup_reason);
   DEBUG_PRINTF("[BOOT] Reset: %d  Wake: %d\n", esp_reset_reason(), wakeup_reason);
+  g_buttonWake = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
 
   // Load persistent counter from NVS (survives all resets)
   prefs.begin("cattracker", false);
@@ -924,8 +966,11 @@ void setup()
   switch (wakeup_reason)
   {
   case ESP_SLEEP_WAKEUP_TIMER:
-    Serial.printf("[BOOT] Wake from DEEP SLEEP (RTC msg_id: %d)\n", g_msgCounter);
-    DEBUG_PRINTF("[BOOT] Wake from DEEP SLEEP (msg_id: %d)\n", g_msgCounter);
+  case ESP_SLEEP_WAKEUP_EXT0:
+    Serial.printf("[BOOT] Wake from DEEP SLEEP via %s (RTC msg_id: %d)\n",
+                  g_buttonWake ? "USER BUTTON" : "TIMER", g_msgCounter);
+    DEBUG_PRINTF("[BOOT] Wake from %s (msg_id: %d)\n",
+                 g_buttonWake ? "BUTTON" : "TIMER", g_msgCounter);
     g_firstBoot = false;
     // Use RTC counter if valid (faster), otherwise fall back to NVS
     if (g_msgCounter < nvsCounter)
@@ -964,8 +1009,10 @@ void setup()
   // Check lost mode timeout (auto-revert if exceeded)
   checkLostModeTimeout();
 
-  // Button state machine reset (polled continuously during wake cycle)
+  // Resolve a button wake as either a single forced cycle or the first click
+  // of the existing developer-mode double-click gesture.
   g_btnState = BTN_IDLE;
+  handleButtonWakeGesture();
 
   // Initialize CSV logging (LittleFS)
   initCSVLogging();
@@ -1174,12 +1221,16 @@ void loop()
 #endif
     delay(100); // Ensure serial buffer is flushed
 
-// Disable USB serial as wakeup source
+// Disable old wake sources, then arm both the profile timer and the active-low
+// user button. The RTC pull-up keeps GPIO21 high while the ESP32-S3 sleeps.
 #ifdef CONFIG_IDF_TARGET_ESP32S3
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 #endif
 
+    rtc_gpio_pullup_en((gpio_num_t)DEV_MODE_BUTTON_PIN);
+    rtc_gpio_pulldown_dis((gpio_num_t)DEV_MODE_BUTTON_PIN);
     esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)DEV_MODE_BUTTON_PIN, 0);
     esp_deep_sleep_start();
     // Never returns - ESP32 will restart and run setup() again
   }
