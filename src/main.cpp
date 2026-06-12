@@ -899,6 +899,7 @@ static TaskHandle_t hGPS = nullptr;
 static TaskHandle_t hBLE = nullptr;
 static TaskHandle_t hLoRa = nullptr;
 static TaskHandle_t hPower = nullptr;
+static bool g_gpsStartedThisWake = false;
 
 // ─────────────────────────────────────────────
 // Task forward declarations (defined later)
@@ -907,6 +908,48 @@ void TaskGPS(void *);
 void TaskBLE(void *);
 void TaskLoRa(void *);
 void TaskPower(void *);
+
+// Start the GPS only after the initial BLE home decision says it is needed.
+// Keeping the rail, UART and parser task off during Phase 1 is the main
+// at-home power saving: ordinary home cycles never energise the L76K.
+static bool startGpsForAcquisition()
+{
+  if (g_gpsStartedThisWake)
+    return true;
+
+  Serial.println("[GPS] Powering on after BLE scan");
+  DEBUG_PRINTLN("[GPS] Power on after BLE");
+
+  pinMode(GPS_EN, OUTPUT);
+  digitalWrite(GPS_EN, HIGH);
+  delay(500); // Let the module power rail stabilise before opening UART.
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  delay(100);
+  while (gpsSerial.available())
+    gpsSerial.read();
+
+  // Restore L76K LED to 1PPS blink mode (it turns solid-on during sleep).
+  gpsSerial.write(L76K_LED_RECOVER, sizeof(L76K_LED_RECOVER));
+
+  BaseType_t created = xTaskCreatePinnedToCore(
+      TaskGPS, "gps", 4096, nullptr, 2, &hGPS, APP_CPU_NUM);
+  if (created != pdPASS)
+  {
+    Serial.println("[GPS] ERROR: failed to create GPS reader task");
+    gpsSerial.end();
+    pinMode(GPS_TX, OUTPUT);
+    digitalWrite(GPS_TX, LOW);
+    digitalWrite(GPS_EN, LOW);
+    hGPS = nullptr;
+    return false;
+  }
+
+  g_gpsStartedThisWake = true;
+  Serial.println("[GPS] UART ready, parser task started");
+  DEBUG_PRINTLN("[GPS] UART/task ready");
+  return true;
+}
 
 // ─────────────────────────────────────────────
 // Setup & Main loop
@@ -1053,28 +1096,15 @@ void setup()
   txReqQ = xQueueCreate(4, sizeof(TxReq));   // TX requests
   evBits = xEventGroupCreate();              // state flags (EV_FIX, EV_HOME, EV_TXDONE)
 
-  // GPS Enable and UART
+  // Keep GPS physically off until the initial BLE home scan fails or a
+  // scheduled home heartbeat requires a location update.
   pinMode(GPS_EN, OUTPUT);
-  digitalWrite(GPS_EN, HIGH); // Power on GPS
-  Serial.println("[INIT] GPS power enabled");
-  DEBUG_PRINTLN("[INIT] GPS power enabled");
-  delay(500); // Let GPS module fully power up and stabilize
-
-  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-
-  // Flush any stale data in UART buffer from previous session
-  delay(100);
-  while (gpsSerial.available())
-  {
-    gpsSerial.read();
-  }
-  Serial.println("[INIT] GPS UART started and buffer flushed");
-  DEBUG_PRINTLN("[INIT] GPS UART ready");
-
-  // Restore L76K LED to 1PPS blink mode (it turns solid-on during sleep)
-  gpsSerial.write(L76K_LED_RECOVER, sizeof(L76K_LED_RECOVER));
-  Serial.println("[INIT] L76K LED restored to 1PPS mode");
-  DEBUG_PRINTLN("[INIT] L76K LED on");
+  digitalWrite(GPS_EN, LOW);
+  pinMode(GPS_TX, OUTPUT);
+  digitalWrite(GPS_TX, LOW);
+  g_gpsStartedThisWake = false;
+  Serial.println("[INIT] GPS held off pending BLE decision");
+  DEBUG_PRINTLN("[INIT] GPS off pending BLE");
 
   // LoRa radio init (will be re-done in TaskLoRa, but SPI setup here)
   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -1086,7 +1116,6 @@ void setup()
   Serial.println("[BLE] stack init done");
 
   // Create tasks
-  xTaskCreatePinnedToCore(TaskGPS, "gps", 4096, nullptr, 2, &hGPS, APP_CPU_NUM); // GPS on APP CPU
   xTaskCreatePinnedToCore(TaskBLE, "ble", 4096, nullptr, 1, &hBLE, APP_CPU_NUM); // BLE on APP CPU
   xTaskCreatePinnedToCore(TaskLoRa, "lora", 4096, nullptr, 2, &hLoRa, PRO_CPU_NUM);
   xTaskCreatePinnedToCore(TaskPower, "power", 4096, nullptr, 3, &hPower, PRO_CPU_NUM);
@@ -1139,14 +1168,18 @@ void loop()
     if (hPower) { vTaskDelete(hPower); hPower = nullptr; } // already self-suspended
     BLEDevice::deinit(true);
 
-    // Turn off L76K LED, power down GPS, close the UART (TX held LOW so the
-    // floating pin can't backfeed the L76K). TaskLoRa keeps listening throughout.
-    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-    delay(200);
-    gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-    delay(200);
+    // If GPS was needed this wake, turn off its LED and close its UART. On a
+    // normal at-home skip the GPS was never started, so avoid touching UART.
+    if (g_gpsStartedThisWake)
+    {
+      gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+      delay(200);
+      gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+      delay(200);
+      gpsSerial.end();
+      g_gpsStartedThisWake = false;
+    }
     digitalWrite(GPS_EN, LOW);
-    gpsSerial.end();
     pinMode(GPS_TX, OUTPUT);
     digitalWrite(GPS_TX, LOW);
     Serial.println("[SLEEP] GPS/BLE down, UART TX held LOW");
@@ -1962,7 +1995,14 @@ void TaskPower(void *)
     g_homeBeaconCycles = 0;
   }
 
-  // GPS is already powered on from setup(), just wait for fix
+  // Only now energise GPS and launch its parser task. Home-skip cycles returned
+  // above without ever powering the module.
+  if (!startGpsForAcquisition())
+  {
+    Serial.println("[POWER] GPS startup failed - telemetry will report invalidGPSLoc");
+    DEBUG_PRINTLN("[POWER] GPS startup failed");
+  }
+
   GpsFix fix{};
 
   // Adaptive GPS acquisition: Cold start vs Warm start
