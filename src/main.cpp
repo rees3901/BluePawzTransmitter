@@ -208,7 +208,7 @@ static void loadSenderName()
 
 #define GPS_RX D7
 #define GPS_TX D6
-#define GPS_EN 1 // D2 → GPS Enable (HIGH = ON)
+#define GPS_WAKEUP D0 // L76K WAKE_UP (HIGH = awake, LOW = standby; does not switch 3V3)
 #define LED_PIN 48
 
 // ─────────────────────────────────────────────
@@ -921,12 +921,12 @@ static bool startGpsForAcquisition()
   if (g_gpsStartedThisWake)
     return true;
 
-  Serial.println("[GPS] Powering on after BLE scan");
-  DEBUG_PRINTLN("[GPS] Power on after BLE");
+  Serial.println("[GPS] Waking after BLE scan");
+  DEBUG_PRINTLN("[GPS] Wake after BLE");
 
-  pinMode(GPS_EN, OUTPUT);
-  digitalWrite(GPS_EN, HIGH);
-  delay(500); // Let the module power rail stabilise before opening UART.
+  pinMode(GPS_WAKEUP, OUTPUT);
+  digitalWrite(GPS_WAKEUP, HIGH);
+  delay(500); // Let the module wake and its UART stabilise.
 
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
   delay(100);
@@ -945,7 +945,7 @@ static bool startGpsForAcquisition()
     gpsSerial.end();
     pinMode(GPS_TX, OUTPUT);
     digitalWrite(GPS_TX, LOW);
-    digitalWrite(GPS_EN, LOW);
+    digitalWrite(GPS_WAKEUP, LOW);
     hGPS = nullptr;
     return false;
   }
@@ -966,10 +966,12 @@ void setup()
 
   // Release GPIO hold from deep sleep
   gpio_deep_sleep_hold_dis();
-  gpio_hold_dis((gpio_num_t)GPS_EN);
+  gpio_hold_dis((gpio_num_t)GPS_WAKEUP);
   gpio_hold_dis((gpio_num_t)GPS_TX);
   gpio_hold_dis((gpio_num_t)LORA_NSS);
   gpio_hold_dis((gpio_num_t)LORA_RST);
+  gpio_hold_dis((gpio_num_t)LORA_SCK);
+  gpio_hold_dis((gpio_num_t)LORA_MOSI);
   rtc_gpio_deinit((gpio_num_t)DEV_MODE_BUTTON_PIN);
 
   Serial.begin(115200);
@@ -1101,10 +1103,12 @@ void setup()
   txReqQ = xQueueCreate(4, sizeof(TxReq));   // TX requests
   evBits = xEventGroupCreate();              // state flags (EV_FIX, EV_HOME, EV_TXDONE)
 
-  // Keep GPS physically off until the initial BLE home scan fails or a
-  // scheduled home heartbeat requires a location update.
-  pinMode(GPS_EN, OUTPUT);
-  digitalWrite(GPS_EN, LOW);
+  // Keep the L76K in standby until the initial BLE home scan fails or a
+  // scheduled home heartbeat requires a location update. The module's 3V3
+  // supply remains present because the XIAO GNSS board exposes WAKE_UP, not a
+  // switched power-enable signal.
+  pinMode(GPS_WAKEUP, OUTPUT);
+  digitalWrite(GPS_WAKEUP, LOW);
   pinMode(GPS_TX, OUTPUT);
   digitalWrite(GPS_TX, LOW);
   g_gpsStartedThisWake = false;
@@ -1149,6 +1153,22 @@ static volatile uint32_t g_lastCmdRxMs = 0;
 // fixed time budget (LBT backoff can blow past it) could not.
 static volatile bool g_loraStopReq = false;  // loop() → TaskLoRa: stop when idle
 static volatile bool g_loraStopped = false;  // TaskLoRa → loop(): radio asleep, ending
+static volatile int16_t g_loraSleepResult = RADIOLIB_ERR_NONE;
+
+// Every deep-sleep wake performs a complete lora.begin() and configuration, so
+// retaining the SX1262 modem configuration serves no purpose. Cold sleep turns
+// off its RTC and discards configuration for the radio's lowest sleep state.
+static int16_t putLoRaToColdSleep()
+{
+  int16_t state = lora.sleep(false);
+  if (state != RADIOLIB_ERR_NONE)
+  {
+    Serial.printf("[SLEEP] SX1262 cold-sleep command failed (%d), retrying\n", state);
+    delay(2);
+    state = lora.sleep(false);
+  }
+  return state;
+}
 
 void loop()
 {
@@ -1182,7 +1202,7 @@ void loop()
       gpsSerial.end();
       g_gpsStartedThisWake = false;
     }
-    digitalWrite(GPS_EN, LOW);
+    digitalWrite(GPS_WAKEUP, LOW);
     pinMode(GPS_TX, OUTPUT);
     digitalWrite(GPS_TX, LOW);
     Serial.println("[SLEEP] GPS/BLE down, UART TX held LOW");
@@ -1223,9 +1243,21 @@ void loop()
     {
       vTaskDelete(hLoRa);
       hLoRa = nullptr;
-      lora.sleep();
+      g_loraSleepResult = putLoRaToColdSleep();
     }
-    Serial.println("[SLEEP] SX1262 radio sleeping");
+    if (g_loraSleepResult == RADIOLIB_ERR_NONE)
+      Serial.println("[SLEEP] SX1262 confirmed in cold sleep");
+    else
+      Serial.printf("[SLEEP] WARNING: SX1262 sleep command failed (%d)\n",
+                    g_loraSleepResult);
+
+    // The ESP32 SPI peripheral powers down in deep sleep. Release it explicitly,
+    // then hold the SX1262 input lines at defined idle levels.
+    LoRaSPI.end();
+    pinMode(LORA_SCK, OUTPUT);
+    digitalWrite(LORA_SCK, LOW);
+    pinMode(LORA_MOSI, OUTPUT);
+    digitalWrite(LORA_MOSI, LOW);
 
     // Save persistent state to NVS before sleep (survives USB resets)
     prefs.begin("cattracker", false);
@@ -1234,10 +1266,12 @@ void loop()
     prefs.end();
 
     // Hold GPIO states during deep sleep
-    gpio_hold_en((gpio_num_t)GPS_EN);       // Keep GPS_EN LOW (GPS off)
+    gpio_hold_en((gpio_num_t)GPS_WAKEUP);   // Keep L76K WAKE_UP LOW (standby; 3V3 remains powered)
     gpio_hold_en((gpio_num_t)GPS_TX);       // Keep UART TX LOW (no backfeed to L76K)
     gpio_hold_en((gpio_num_t)LORA_NSS);     // Keep NSS HIGH (SX1262 deselected)
     gpio_hold_en((gpio_num_t)LORA_RST);     // Keep RST HIGH (SX1262 not in reset)
+    gpio_hold_en((gpio_num_t)LORA_SCK);     // Keep radio clock LOW (no floating input)
+    gpio_hold_en((gpio_num_t)LORA_MOSI);    // Keep radio data input LOW
     gpio_deep_sleep_hold_en();
 
     // Get sleep interval from active mode
@@ -1258,7 +1292,8 @@ void loop()
     delay(100); // Ensure serial buffer is flushed
 
 // Disable old wake sources, then arm both the profile timer and the active-low
-// user button. The RTC pull-up keeps GPIO21 high while the ESP32-S3 sleeps.
+// user button. EXT0 keeps the RTC peripheral domain powered so its internal
+// pull-up remains available; moving to EXT1 would require an external pull-up.
 #ifdef CONFIG_IDF_TARGET_ESP32S3
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 #endif
@@ -1266,7 +1301,10 @@ void loop()
     rtc_gpio_pullup_en((gpio_num_t)DEV_MODE_BUTTON_PIN);
     rtc_gpio_pulldown_dis((gpio_num_t)DEV_MODE_BUTTON_PIN);
     esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)DEV_MODE_BUTTON_PIN, 0);
+    esp_err_t buttonWakeResult =
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)DEV_MODE_BUTTON_PIN, 0);
+    if (buttonWakeResult != ESP_OK)
+      Serial.printf("[SLEEP] WARNING: button wake setup failed (%d)\n", buttonWakeResult);
     esp_deep_sleep_start();
     // Never returns - ESP32 will restart and run setup() again
   }
@@ -1854,8 +1892,12 @@ void TaskLoRa(void *)
     // self-delete so loop() can deep-sleep safely.
     if (g_loraStopReq && uxQueueMessagesWaiting(txReqQ) == 0)
     {
-      lora.sleep();
-      Serial.println("[LoRa] stop requested — radio asleep, task ending");
+      g_loraSleepResult = putLoRaToColdSleep();
+      if (g_loraSleepResult == RADIOLIB_ERR_NONE)
+        Serial.println("[LoRa] stop requested — radio in cold sleep, task ending");
+      else
+        Serial.printf("[LoRa] stop requested — sleep failed (%d), task ending\n",
+                      g_loraSleepResult);
       g_loraStopped = true;
       vTaskDelete(nullptr); // never returns
     }
