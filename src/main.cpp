@@ -455,13 +455,17 @@ static const uint8_t L76K_LED_OFF[] = {
     0xF0,
     0xC8, 0x17, 0x08};
 
-static const uint8_t L76K_LED_RECOVER[] = {
-    0xBA, 0xCE, 0x10, 0x00, 0x06, 0x03, 0x40,
-    0x42, 0x0F, 0x00, 0xA0, 0x86, 0x01, 0x00,
-    0x03,
-    0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
-    0xF3,
-    0xC8, 0x17, 0x08};
+static void disableL76kLed()
+{
+  // The L76K can briefly ignore configuration while its UART is settling.
+  // Send the vendor LED-off command twice so the 1PPS indicator remains dark
+  // throughout acquisition and after the module is powered down.
+  gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+  gpsSerial.flush();
+  delay(100);
+  gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+  gpsSerial.flush();
+}
 
 // ─────────────────────────────────────────────
 // Utilities
@@ -929,8 +933,9 @@ static bool startGpsForAcquisition()
   while (gpsSerial.available())
     gpsSerial.read();
 
-  // Restore L76K LED to 1PPS blink mode (it turns solid-on during sleep).
-  gpsSerial.write(L76K_LED_RECOVER, sizeof(L76K_LED_RECOVER));
+  // Keep the onboard GNSS/1PPS LED permanently disabled. This is the vendor
+  // OffState command; do not send the RecoverState command anywhere.
+  disableL76kLed();
 
   BaseType_t created = xTaskCreatePinnedToCore(
       TaskGPS, "gps", 4096, nullptr, 2, &hGPS, APP_CPU_NUM);
@@ -1172,9 +1177,7 @@ void loop()
     // normal at-home skip the GPS was never started, so avoid touching UART.
     if (g_gpsStartedThisWake)
     {
-      gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
-      delay(200);
-      gpsSerial.write(L76K_LED_OFF, sizeof(L76K_LED_OFF));
+      disableL76kLed();
       delay(200);
       gpsSerial.end();
       g_gpsStartedThisWake = false;
