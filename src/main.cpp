@@ -467,6 +467,25 @@ static void disableL76kLed()
   gpsSerial.flush();
 }
 
+static uint8_t nmeaChecksum(const char *body)
+{
+  uint8_t checksum = 0;
+  while (*body != '\0')
+    checksum ^= static_cast<uint8_t>(*body++);
+  return checksum;
+}
+
+static void requestL76kStandby(uint16_t seconds)
+{
+  char body[24];
+  char command[32];
+  snprintf(body, sizeof(body), "PCAS12,%u", seconds);
+  snprintf(command, sizeof(command), "$%s*%02X\r\n", body, nmeaChecksum(body));
+  gpsSerial.print(command);
+  gpsSerial.flush();
+  Serial.printf("[GPS] Requested L76K standby for %u seconds\n", seconds);
+}
+
 // ─────────────────────────────────────────────
 // Utilities
 // ─────────────────────────────────────────────
@@ -914,8 +933,8 @@ void TaskLoRa(void *);
 void TaskPower(void *);
 
 // Start the GPS only after the initial BLE home decision says it is needed.
-// Keeping the rail, UART and parser task off during Phase 1 is the main
-// at-home power saving: ordinary home cycles never energise the L76K.
+// Keeping the UART and parser task off during Phase 1 is the main at-home
+// power saving: ordinary home cycles never wake the L76K from standby.
 static bool startGpsForAcquisition()
 {
   if (g_gpsStartedThisWake)
@@ -1177,6 +1196,10 @@ void loop()
 
   if (bits & EV_TXDONE)
   {
+    // Needed while the GNSS UART is still open so its timed standby can match
+    // the ESP32 profile sleep.
+    uint16_t sleepSeconds = g_activeMode->sleep_interval_s;
+
     // Cycle complete (telemetry sent, or a home-skip). Open a short post-TX
     // LISTEN WINDOW before sleeping: shut down the power-hungry peripherals
     // (GPS, BLE) NOW, but KEEP the LoRa radio alive + listening so the base can
@@ -1193,19 +1216,28 @@ void loop()
     if (hPower) { vTaskDelete(hPower); hPower = nullptr; } // already self-suspended
     BLEDevice::deinit(true);
 
-    // If GPS was needed this wake, turn off its LED and close its UART. On a
-    // normal at-home skip the GPS was never started, so avoid touching UART.
+    // Use both documented standby controls: the timed CASIC command and the
+    // active-low WAKEUP pin. The margin covers the post-TX listen window and
+    // shutdown work before the ESP32 actually enters deep sleep.
     if (g_gpsStartedThisWake)
     {
+      uint32_t standbySeconds = static_cast<uint32_t>(sleepSeconds) + 10U;
+      if (standbySeconds > UINT16_MAX)
+        standbySeconds = UINT16_MAX;
+
       disableL76kLed();
-      delay(200);
+      requestL76kStandby(static_cast<uint16_t>(standbySeconds));
+      delay(150);
+      digitalWrite(GPS_WAKEUP, LOW);
+      delay(50);
       gpsSerial.end();
       g_gpsStartedThisWake = false;
     }
     digitalWrite(GPS_WAKEUP, LOW);
     pinMode(GPS_TX, OUTPUT);
     digitalWrite(GPS_TX, LOW);
-    Serial.println("[SLEEP] GPS/BLE down, UART TX held LOW");
+    Serial.printf("[SLEEP] GPS/BLE down; GNSS WAKEUP GPIO%d=%d, UART TX LOW\n",
+                  GPS_WAKEUP, digitalRead(GPS_WAKEUP));
 
     // ── post-TX listen window ──
     // Stay open POST_TX_LISTEN_MS (5 s). Each inbound command stamps
@@ -1273,9 +1305,6 @@ void loop()
     gpio_hold_en((gpio_num_t)LORA_SCK);     // Keep radio clock LOW (no floating input)
     gpio_hold_en((gpio_num_t)LORA_MOSI);    // Keep radio data input LOW
     gpio_deep_sleep_hold_en();
-
-    // Get sleep interval from active mode
-    uint16_t sleepSeconds = g_activeMode->sleep_interval_s;
 
     // V3: accumulate lost-mode time across deep-sleep cycles so the 2-hour
     // auto-revert actually fires. No-op when not in lost mode.
