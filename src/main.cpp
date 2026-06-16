@@ -209,6 +209,8 @@ static void loadSenderName()
 #define GPS_RX D7
 #define GPS_TX D6
 #define GPS_WAKEUP D0 // L76K WAKE_UP (HIGH = awake, LOW = standby; does not switch 3V3)
+#define GPS_RESET D9  // L76K RESET_N. On XIAO ESP32S3 this is GPIO8, shared with LORA_MISO.
+#define GPS_RESET_SLEEP_EXPERIMENT true
 #define LED_PIN 48
 
 // ─────────────────────────────────────────────
@@ -484,6 +486,25 @@ static void requestL76kStandby(uint16_t seconds)
   gpsSerial.print(command);
   gpsSerial.flush();
   Serial.printf("[GPS] Requested L76K standby for %u seconds\n", seconds);
+}
+
+static void releaseGpsReset()
+{
+#if GPS_RESET_SLEEP_EXPERIMENT
+  // RESET_N is active-low. Keep this as a released input/pull-up while awake
+  // because the same XIAO header pad is also the SX1262 MISO line.
+  pinMode(GPS_RESET, INPUT_PULLUP);
+#endif
+}
+
+static void holdGpsResetForSleep()
+{
+#if GPS_RESET_SLEEP_EXPERIMENT
+  // Experimental low-power test: hold L76K RESET_N low only after LoRa has
+  // stopped and SPI is closed, avoiding contention with the radio MISO line.
+  pinMode(GPS_RESET, OUTPUT);
+  digitalWrite(GPS_RESET, LOW);
+#endif
 }
 
 // ─────────────────────────────────────────────
@@ -943,6 +964,9 @@ static bool startGpsForAcquisition()
   Serial.println("[GPS] Waking after BLE scan");
   DEBUG_PRINTLN("[GPS] Wake after BLE");
 
+  releaseGpsReset();
+  delay(500); // Let RESET_N release before asking the L76K to wake.
+
   pinMode(GPS_WAKEUP, OUTPUT);
   digitalWrite(GPS_WAKEUP, HIGH);
   delay(500); // Let the module wake and its UART stabilise.
@@ -965,6 +989,7 @@ static bool startGpsForAcquisition()
     pinMode(GPS_TX, OUTPUT);
     digitalWrite(GPS_TX, LOW);
     digitalWrite(GPS_WAKEUP, LOW);
+    holdGpsResetForSleep();
     hGPS = nullptr;
     return false;
   }
@@ -987,6 +1012,7 @@ void setup()
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)GPS_WAKEUP);
   gpio_hold_dis((gpio_num_t)GPS_TX);
+  gpio_hold_dis((gpio_num_t)GPS_RESET);
   gpio_hold_dis((gpio_num_t)LORA_NSS);
   gpio_hold_dis((gpio_num_t)LORA_RST);
   gpio_hold_dis((gpio_num_t)LORA_SCK);
@@ -995,6 +1021,7 @@ void setup()
 
   Serial.begin(115200);
   delay(100); // Give serial time to initialize
+  releaseGpsReset();
 
   // Initialize debug serial for battery operation
 #if DEBUG_SERIAL_ENABLED
@@ -1126,6 +1153,7 @@ void setup()
   // scheduled home heartbeat requires a location update. The module's 3V3
   // supply remains present because the XIAO GNSS board exposes WAKE_UP, not a
   // switched power-enable signal.
+  releaseGpsReset();
   pinMode(GPS_WAKEUP, OUTPUT);
   digitalWrite(GPS_WAKEUP, LOW);
   pinMode(GPS_TX, OUTPUT);
@@ -1290,6 +1318,7 @@ void loop()
     digitalWrite(LORA_SCK, LOW);
     pinMode(LORA_MOSI, OUTPUT);
     digitalWrite(LORA_MOSI, LOW);
+    holdGpsResetForSleep();
 
     // Save persistent state to NVS before sleep (survives USB resets)
     prefs.begin("cattracker", false);
@@ -1300,6 +1329,7 @@ void loop()
     // Hold GPIO states during deep sleep
     gpio_hold_en((gpio_num_t)GPS_WAKEUP);   // Keep L76K WAKE_UP LOW (standby; 3V3 remains powered)
     gpio_hold_en((gpio_num_t)GPS_TX);       // Keep UART TX LOW (no backfeed to L76K)
+    gpio_hold_en((gpio_num_t)GPS_RESET);    // EXPERIMENT: hold L76K RESET_N LOW during sleep
     gpio_hold_en((gpio_num_t)LORA_NSS);     // Keep NSS HIGH (SX1262 deselected)
     gpio_hold_en((gpio_num_t)LORA_RST);     // Keep RST HIGH (SX1262 not in reset)
     gpio_hold_en((gpio_num_t)LORA_SCK);     // Keep radio clock LOW (no floating input)
