@@ -304,6 +304,7 @@ RTC_DATA_ATTR char g_preGeofenceMode[16] = "";   // Mode before geofence auto-es
 static bool g_firstBoot = false;
 static bool g_buttonWake = false;
 static bool g_buttonSuppressUntilRelease = false;
+static volatile bool g_forceFullCycleRequested = false;
 
 // Developer mode helper — returns true when the active mode is "developer"
 static inline bool isDevMode()
@@ -334,7 +335,7 @@ static void saveOperatingMode(const char *modeName);
 // ─────────────────────────────────────────────
 // State machine polled by TaskButton throughout the whole awake cycle.
 // Short press → release → press → release toggles dev/normal.
-// A deliberate hold queues an immediate presence ping.
+// A deliberate hold requests a full wake cycle and queues an immediate presence ping.
 static enum { BTN_IDLE, BTN_WAIT_RELEASE1, BTN_WAIT_RELEASE_LONG, BTN_WAIT_PRESS2, BTN_WAIT_RELEASE2 } g_btnState = BTN_IDLE;
 static uint32_t g_btnTimestamp = 0;
 static uint32_t g_lastButtonPresenceMs = 0;
@@ -368,6 +369,17 @@ static bool queuePresencePing(const char *reason, bool buttonInitiated)
 
   Serial.println("[BTN] Presence queue full — dropped");
   return false;
+}
+
+static void requestForcedFullCycle(const char *reason, bool queueImmediatePresence)
+{
+  g_forceFullCycleRequested = true;
+  Serial.printf("[BTN] Forced full cycle requested%s%s%s\n",
+                reason && reason[0] ? " (" : "",
+                reason && reason[0] ? reason : "",
+                reason && reason[0] ? ")" : "");
+  if (queueImmediatePresence)
+    queuePresencePing(reason, true);
 }
 
 static void flashDeveloperModeLed()
@@ -436,7 +448,8 @@ static void pollButtonToggle()
     {
       if (now - g_lastButtonPresenceMs > 1500U)
       {
-        if (queuePresencePing("button hold", true))
+        requestForcedFullCycle("button hold", true);
+        if (g_forceFullCycleRequested)
           g_lastButtonPresenceMs = now;
       }
       g_btnState = BTN_WAIT_RELEASE_LONG;
@@ -500,6 +513,7 @@ static void handleButtonWakeGesture()
   if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
   {
     g_buttonSuppressUntilRelease = true;
+    requestForcedFullCycle("sleep button hold", false);
     Serial.printf("[BTN] Sleep wake held for %lu ms — forced presence cycle starts now\n",
                   (unsigned long)heldMs);
     return;
@@ -523,11 +537,13 @@ static void handleButtonWakeGesture()
 
   if (heldMs >= DEV_MODE_LONG_PRESS_MS)
   {
+    requestForcedFullCycle("sleep button press", false);
     Serial.printf("[BTN] Single hold (%lu ms) — starting forced presence/wake cycle\n",
                   (unsigned long)heldMs);
   }
   else
   {
+    requestForcedFullCycle("sleep button press", false);
     Serial.printf("[BTN] Short wake press (%lu ms) — starting forced presence/wake cycle\n",
                   (unsigned long)heldMs);
   }
@@ -2054,6 +2070,8 @@ void TaskPower(void *)
 
   Serial.println("\n[POWER] === New wake cycle ===");
   DEBUG_PRINTLN("\n[POWER] Wake cycle");
+  if (g_forceFullCycleRequested)
+    Serial.println("[POWER] Forced full cycle active — button request will bypass home skip");
 
   // ─────────────────────────────────────────────
   // OTAP presence packet — announce "I'm awake" at the very start of the wake
@@ -2062,21 +2080,7 @@ void TaskPower(void *)
   // collar is reachable and can start delivering any QUEUED command into the
   // whole wake window (BLE 10s + GPS 20–60s + stabilise 15s). isTelemetry=false
   // → it does NOT set EV_TXDONE, so it never short-circuits the wake to sleep.
-  {
-    StaticJsonDocument<160> pres;
-    pres["type"] = "ping";
-    pres["src"] = DEVICE_ID_INT;       // source_id (this collar)
-    pres["dst"] = BASE_ID;             // destination_id (the base)
-    pres["mid"] = g_msgCounter++;      // message_id
-    pres["uptime_ms"] = millis();
-
-    TxReq req{};
-    req.isTelemetry = false; // response/announce packet — must NOT trigger sleep
-    serializeJson(pres, req.json, sizeof(req.json));
-    xQueueSend(txReqQ, &req, pdMS_TO_TICKS(100));
-    Serial.println(String("[POWER] Presence queued: ") + req.json);
-    DEBUG_PRINTLN("[POWER] Presence queued");
-  }
+  queuePresencePing("cycle start", g_forceFullCycleRequested || g_buttonWake);
 
   // ─────────────────────────────────────────────
   // PHASE 1: Initial 10-second BLE + LoRa RX scan
@@ -2117,6 +2121,20 @@ void TaskPower(void *)
   // PHASE 2: Priority Decision Logic
   // ─────────────────────────────────────────────
 
+  bool homeHeartbeat = false; // Flag: this cycle is a home heartbeat with GPS
+
+  // A physical button request means "run the full wake/report cycle now".
+  // If the home beacon is present, still acquire GPS and report as a home
+  // heartbeat instead of taking the low-power home skip.
+  if (g_forceFullCycleRequested && homeDetectedInitial)
+  {
+    Serial.println("[POWER] Button-forced cycle — home beacon present, sending GPS heartbeat anyway");
+    DEBUG_PRINTLN("[POWER] Button force overrides home skip");
+    homeDetectedInitial = false;
+    homeHeartbeat = true;
+    g_homeBeaconCycles = 0;
+  }
+
   // Home detected
   // On first boot, skip home shortcut — always acquire GPS and TX so the
   // base station discovers this collar and its initial location.
@@ -2126,8 +2144,6 @@ void TaskPower(void *)
     DEBUG_PRINTLN("[POWER] First boot override");
     homeDetectedInitial = false;
   }
-
-  bool homeHeartbeat = false; // Flag: this cycle is a home heartbeat with GPS
 
   if (homeDetectedInitial)
   {
@@ -2198,7 +2214,7 @@ void TaskPower(void *)
 
     // Check if home beacon appeared during GPS acquisition
     // (skip on first boot or heartbeat cycle — we must TX regardless)
-    if (!g_firstBoot && !homeHeartbeat && (bits & EV_HOME))
+    if (!g_firstBoot && !homeHeartbeat && !g_forceFullCycleRequested && (bits & EV_HOME))
     {
       homeDetectedDuringGPS = true;
       Serial.printf("[POWER] Home beacon appeared during GPS (after %d ms) - aborting TX\n",
@@ -2280,7 +2296,7 @@ void TaskPower(void *)
       while (millis() - stabilizeStart < GPS_STABILISE_MS)
       {
         EventBits_t bits = xEventGroupGetBits(evBits);
-        if (!g_firstBoot && !homeHeartbeat && (bits & EV_HOME))
+        if (!g_firstBoot && !homeHeartbeat && !g_forceFullCycleRequested && (bits & EV_HOME))
         {
           Serial.println("[POWER] Home beacon detected during stabilization - aborting TX");
           DEBUG_PRINTLN("[POWER] Home in stabilize - abort");
@@ -2319,6 +2335,10 @@ void TaskPower(void *)
     {
       doc["first_boot"] = true;
     }
+    if (g_forceFullCycleRequested)
+    {
+      doc["btn"] = true;
+    }
 
     // Geofence check — adds "geofence" field and may auto-escalate mode
     const char *gfStatus = checkGeofence(fix.lat, fix.lon);
@@ -2345,6 +2365,8 @@ void TaskPower(void *)
                                    strlen(req.json), ESP.getFreeHeap());
     DEBUG_PRINTLN("[POWER] TX queued");
     g_firstBoot = false;
+    g_buttonWake = false;
+    g_forceFullCycleRequested = false;
   }
   else
   {
@@ -2361,6 +2383,10 @@ void TaskPower(void *)
     if (g_firstBoot)
     {
       doc["first_boot"] = true;
+    }
+    if (g_forceFullCycleRequested)
+    {
+      doc["btn"] = true;
     }
     if (isDevMode())
     {
@@ -2379,6 +2405,8 @@ void TaskPower(void *)
                                    gps.satellites.isValid() ? (int)gps.satellites.value() : 0);
     DEBUG_PRINTLN("[POWER] TX invalid");
     g_firstBoot = false;
+    g_buttonWake = false;
+    g_forceFullCycleRequested = false;
   }
 
   // Wait for TX completion (EV_TXDONE set by TaskLoRa)
