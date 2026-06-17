@@ -160,6 +160,7 @@ const OperatingMode MODE_DEVELOPER = {
 // ─────────────────────────────────────────────
 #define DEV_MODE_BUTTON_PIN 21       // Active-low: single wakes, double toggles dev mode
 #define DEV_MODE_DOUBLE_PRESS_MS 500 // Max gap between presses for double-press
+#define DEV_MODE_LONG_PRESS_MS 300   // Minimum deliberate hold for single-press wake
 
 // ─────────────────────────────────────────────
 // Lost Mode Safety

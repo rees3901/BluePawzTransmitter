@@ -336,6 +336,24 @@ static void saveOperatingMode(const char *modeName);
 static enum { BTN_IDLE, BTN_WAIT_RELEASE1, BTN_WAIT_PRESS2, BTN_WAIT_RELEASE2 } g_btnState = BTN_IDLE;
 static uint32_t g_btnTimestamp = 0;
 
+static void flashDeveloperModeLed()
+{
+  for (int i = 0; i < 10; i++)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    delay(55);
+    digitalWrite(LED_PIN, LOW);
+    delay(55);
+  }
+}
+
+static void flashNormalModeLed()
+{
+  digitalWrite(LED_PIN, HIGH);
+  delay(750);
+  digitalWrite(LED_PIN, LOW);
+}
+
 static void toggleDeveloperMode()
 {
   if (isDevMode())
@@ -351,14 +369,10 @@ static void toggleDeveloperMode()
     Serial.println("[BTN] *** Developer Mode ON ***");
   }
 
-  int flashes = isDevMode() ? 5 : 2;
-  for (int i = 0; i < flashes; i++)
-  {
-    digitalWrite(LED_PIN, HIGH);
-    delay(150);
-    digitalWrite(LED_PIN, LOW);
-    delay(150);
-  }
+  if (isDevMode())
+    flashDeveloperModeLed();
+  else
+    flashNormalModeLed();
 }
 
 static void pollButtonToggle()
@@ -420,10 +434,12 @@ static void handleButtonWakeGesture()
 
   Serial.println("[BTN] User button woke collar — waiting briefly for second click");
 
+  uint32_t pressStart = millis();
   uint32_t releaseDeadline = millis() + 2000U;
   while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW &&
          (int32_t)(releaseDeadline - millis()) > 0)
     delay(10);
+  uint32_t heldMs = millis() - pressStart;
 
   uint32_t secondPressDeadline = millis() + DEV_MODE_DOUBLE_PRESS_MS;
   while ((int32_t)(secondPressDeadline - millis()) > 0)
@@ -441,7 +457,16 @@ static void handleButtonWakeGesture()
     delay(10);
   }
 
-  Serial.println("[BTN] Single press — starting forced presence/wake cycle");
+  if (heldMs >= DEV_MODE_LONG_PRESS_MS)
+  {
+    Serial.printf("[BTN] Single hold (%lu ms) — starting forced presence/wake cycle\n",
+                  (unsigned long)heldMs);
+  }
+  else
+  {
+    Serial.printf("[BTN] Short wake press (%lu ms) — starting forced presence/wake cycle\n",
+                  (unsigned long)heldMs);
+  }
 }
 
 // ─────────────────────────────────────────────
