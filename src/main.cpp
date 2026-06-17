@@ -303,6 +303,7 @@ RTC_DATA_ATTR char g_preGeofenceMode[16] = "";   // Mode before geofence auto-es
 // so the base station discovers this collar and its initial location.
 static bool g_firstBoot = false;
 static bool g_buttonWake = false;
+static bool g_buttonSuppressUntilRelease = false;
 
 // Developer mode helper — returns true when the active mode is "developer"
 static inline bool isDevMode()
@@ -331,10 +332,43 @@ static void saveOperatingMode(const char *modeName);
 // ─────────────────────────────────────────────
 // Non-blocking double-press button detection
 // ─────────────────────────────────────────────
-// State machine polled from active wait loops throughout the wake cycle.
-// Detects: press → release → press → release within DEV_MODE_DOUBLE_PRESS_MS.
-static enum { BTN_IDLE, BTN_WAIT_RELEASE1, BTN_WAIT_PRESS2, BTN_WAIT_RELEASE2 } g_btnState = BTN_IDLE;
+// State machine polled by TaskButton throughout the whole awake cycle.
+// Short press → release → press → release toggles dev/normal.
+// A deliberate hold queues an immediate presence ping.
+static enum { BTN_IDLE, BTN_WAIT_RELEASE1, BTN_WAIT_RELEASE_LONG, BTN_WAIT_PRESS2, BTN_WAIT_RELEASE2 } g_btnState = BTN_IDLE;
 static uint32_t g_btnTimestamp = 0;
+static uint32_t g_lastButtonPresenceMs = 0;
+
+static bool queuePresencePing(const char *reason, bool buttonInitiated)
+{
+  if (txReqQ == nullptr)
+    return false;
+
+  StaticJsonDocument<160> pres;
+  pres["type"] = "ping";
+  pres["src"] = DEVICE_ID_INT;
+  pres["dst"] = BASE_ID;
+  pres["mid"] = g_msgCounter++;
+  pres["uptime_ms"] = millis();
+  if (buttonInitiated)
+    pres["btn"] = true;
+
+  TxReq req{};
+  req.isTelemetry = false;
+  serializeJson(pres, req.json, sizeof(req.json));
+  if (xQueueSend(txReqQ, &req, pdMS_TO_TICKS(100)) == pdTRUE)
+  {
+    if (reason && reason[0])
+      Serial.printf("[BTN] Presence queued (%s): %s\n", reason, req.json);
+    else
+      Serial.printf("[BTN] Presence queued: %s\n", req.json);
+    DEBUG_PRINTLN("[BTN] Presence queued");
+    return true;
+  }
+
+  Serial.println("[BTN] Presence queue full — dropped");
+  return false;
+}
 
 static void flashDeveloperModeLed()
 {
@@ -380,6 +414,13 @@ static void pollButtonToggle()
   bool pressed = (digitalRead(DEV_MODE_BUTTON_PIN) == LOW);
   uint32_t now = millis();
 
+  if (g_buttonSuppressUntilRelease)
+  {
+    if (!pressed)
+      g_buttonSuppressUntilRelease = false;
+    return;
+  }
+
   switch (g_btnState)
   {
   case BTN_IDLE:
@@ -391,7 +432,16 @@ static void pollButtonToggle()
     break;
 
   case BTN_WAIT_RELEASE1:
-    if (!pressed)
+    if (pressed && now - g_btnTimestamp >= DEV_MODE_LONG_PRESS_MS)
+    {
+      if (now - g_lastButtonPresenceMs > 1500U)
+      {
+        if (queuePresencePing("button hold", true))
+          g_lastButtonPresenceMs = now;
+      }
+      g_btnState = BTN_WAIT_RELEASE_LONG;
+    }
+    else if (!pressed)
     {
       g_btnState = BTN_WAIT_PRESS2;
       g_btnTimestamp = now;
@@ -399,6 +449,13 @@ static void pollButtonToggle()
     else if (now - g_btnTimestamp > 2000)
     {
       g_btnState = BTN_IDLE; // held too long, reset
+    }
+    break;
+
+  case BTN_WAIT_RELEASE_LONG:
+    if (!pressed)
+    {
+      g_btnState = BTN_IDLE;
     }
     break;
 
@@ -435,11 +492,18 @@ static void handleButtonWakeGesture()
   Serial.println("[BTN] User button woke collar — waiting briefly for second click");
 
   uint32_t pressStart = millis();
-  uint32_t releaseDeadline = millis() + 2000U;
   while (digitalRead(DEV_MODE_BUTTON_PIN) == LOW &&
-         (int32_t)(releaseDeadline - millis()) > 0)
+         millis() - pressStart < DEV_MODE_LONG_PRESS_MS)
     delay(10);
   uint32_t heldMs = millis() - pressStart;
+
+  if (digitalRead(DEV_MODE_BUTTON_PIN) == LOW)
+  {
+    g_buttonSuppressUntilRelease = true;
+    Serial.printf("[BTN] Sleep wake held for %lu ms — forced presence cycle starts now\n",
+                  (unsigned long)heldMs);
+    return;
+  }
 
   uint32_t secondPressDeadline = millis() + DEV_MODE_DOUBLE_PRESS_MS;
   while ((int32_t)(secondPressDeadline - millis()) > 0)
@@ -466,6 +530,16 @@ static void handleButtonWakeGesture()
   {
     Serial.printf("[BTN] Short wake press (%lu ms) — starting forced presence/wake cycle\n",
                   (unsigned long)heldMs);
+  }
+}
+
+void TaskButton(void *pv)
+{
+  (void)pv;
+  for (;;)
+  {
+    pollButtonToggle();
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
@@ -947,6 +1021,7 @@ static TaskHandle_t hGPS = nullptr;
 static TaskHandle_t hBLE = nullptr;
 static TaskHandle_t hLoRa = nullptr;
 static TaskHandle_t hPower = nullptr;
+static TaskHandle_t hButton = nullptr;
 static bool g_gpsStartedThisWake = false;
 
 // ─────────────────────────────────────────────
@@ -1169,6 +1244,7 @@ void setup()
   Serial.println("[BLE] stack init done");
 
   // Create tasks
+  xTaskCreatePinnedToCore(TaskButton, "button", 3072, nullptr, 2, &hButton, APP_CPU_NUM);
   xTaskCreatePinnedToCore(TaskBLE, "ble", 4096, nullptr, 1, &hBLE, APP_CPU_NUM); // BLE on APP CPU
   xTaskCreatePinnedToCore(TaskLoRa, "lora", 4096, nullptr, 2, &hLoRa, PRO_CPU_NUM);
   xTaskCreatePinnedToCore(TaskPower, "power", 4096, nullptr, 3, &hPower, PRO_CPU_NUM);
@@ -1281,6 +1357,7 @@ void loop()
     }
     Serial.printf("[MAIN] Listen window closed after %lu ms — sleeping\n",
                   (unsigned long)(millis() - listenStart));
+    if (hButton){ vTaskDelete(hButton);hButton = nullptr; }
 
     // ── stop the radio SAFELY ──
     // Ask TaskLoRa to self-delete at its next IDLE point — it finishes any
@@ -2033,7 +2110,6 @@ void TaskPower(void *)
       // Don't break - continue scanning for LoRa commands
     }
 
-    pollButtonToggle();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
@@ -2131,8 +2207,6 @@ void TaskPower(void *)
       break;
     }
 
-    pollButtonToggle();
-
     // Check for GPS fix
     if (xQueueReceive(gpsFixQ, &fix, pdMS_TO_TICKS(200)) == pdTRUE)
     {
@@ -2215,7 +2289,6 @@ void TaskPower(void *)
           vTaskSuspend(nullptr);
           return;
         }
-        pollButtonToggle();
         vTaskDelay(pdMS_TO_TICKS(100));
       }
     }
